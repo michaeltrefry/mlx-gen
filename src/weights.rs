@@ -104,6 +104,9 @@ mod tests {
     #[test]
     fn to_dtype_casts_to_bf16() {
         let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
-        assert_eq!(to_dtype(&a, Dtype::Bfloat16).unwrap().dtype(), Dtype::Bfloat16);
+        assert_eq!(
+            to_dtype(&a, Dtype::Bfloat16).unwrap().dtype(),
+            Dtype::Bfloat16
+        );
     }
 }
