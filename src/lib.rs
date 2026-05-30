@@ -15,6 +15,7 @@ pub mod adapters;
 pub mod error;
 pub mod models;
 pub mod quant;
+pub mod tokenizer;
 pub mod weights;
 
 pub use error::{Error, Result};

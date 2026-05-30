@@ -12,3 +12,6 @@ readme = "README.md"
 [dependencies]
 mlx-rs = "0.25"
 thiserror = "2"
+# HF tokenizers (same Rust core `transformers` wraps) — loads tokenizer.json directly.
+# onig only (no progressbar/http): byte-level BPE for Qwen/CLIP/T5 needs just the regex.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
