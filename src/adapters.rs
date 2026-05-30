@@ -154,6 +154,27 @@ impl AdaptableLinear {
         &self.adapters
     }
 
+    /// `true` once the base has been quantized (Q4/Q8).
+    pub fn is_quantized(&self) -> bool {
+        matches!(self.base, LinearBase::Quantized(_))
+    }
+
+    /// Quantize the dense base in place to Q4/Q8 (`group_size` defaults to 64), the mlx-rs
+    /// equivalent of `nn.quantize` over this Linear. No-op if already quantized. Adapters are
+    /// forward-time residuals over the (now quantized) base, so they are unaffected — this is
+    /// why the base is never fused: fusing would force re-quantization on every adapter swap.
+    pub fn quantize(&mut self, bits: i32, group_size: Option<i32>) -> Result<()> {
+        if let LinearBase::Dense(l) = &self.base {
+            let q = QuantizedLinear::try_from_linear(
+                l.clone(),
+                group_size.unwrap_or(crate::quant::DEFAULT_GROUP_SIZE),
+                bits,
+            )?;
+            self.base = LinearBase::Quantized(q);
+        }
+        Ok(())
+    }
+
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let mut out = self.base.forward(x)?;
         for adapter in &self.adapters {

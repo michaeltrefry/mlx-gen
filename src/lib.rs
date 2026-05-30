@@ -13,4 +13,5 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 
 pub mod adapters;
 pub mod models;
+pub mod quant;
 pub mod weights;
