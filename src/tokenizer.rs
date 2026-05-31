@@ -29,6 +29,12 @@ pub enum ChatTemplate {
     /// `enable_thinking=True`, which adds no `<think>` block):
     /// `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
     QwenInstruct,
+    /// Qwen-Image's T2I prompt template (the fork's `LanguageTokenizer` `template=`): a fixed
+    /// system instruction + the user prompt + generation prompt. The text encoder later drops the
+    /// leading 34 template tokens (`prompt_drop_idx`), keeping the prompt + trailing
+    /// `<|im_end|>\n<|im_start|>assistant\n` as conditioning. Verified token-for-token against the
+    /// fork's `Qwen2Tokenizer` (the system prefix tokenizes to exactly 34 tokens).
+    QwenImage,
 }
 
 impl ChatTemplate {
@@ -38,6 +44,11 @@ impl ChatTemplate {
             ChatTemplate::QwenInstruct => {
                 format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n")
             }
+            ChatTemplate::QwenImage => format!(
+                "<|im_start|>system\nDescribe the image by detailing the color, shape, size, \
+                 texture, quantity, text, spatial relationships of the objects and \
+                 background:<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            ),
         }
     }
 }
@@ -128,5 +139,12 @@ mod tests {
     #[test]
     fn none_template_is_passthrough() {
         assert_eq!(ChatTemplate::None.render("hello"), "hello");
+    }
+
+    #[test]
+    fn qwen_image_template_wraps_system_and_user() {
+        let r = ChatTemplate::QwenImage.render("a red fox");
+        assert!(r.starts_with("<|im_start|>system\nDescribe the image by detailing"));
+        assert!(r.ends_with("<|im_start|>user\na red fox<|im_end|>\n<|im_start|>assistant\n"));
     }
 }
