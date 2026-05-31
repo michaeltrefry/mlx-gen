@@ -8,11 +8,11 @@ use mlx_rs::{
     Array,
 };
 
-use crate::adapters::{AdaptableHost, AdaptableLinear};
-use crate::models::z_image::attention::ZImageAttention;
-use crate::models::z_image::feed_forward::FeedForward;
-use crate::weights::Weights;
-use crate::Result;
+use crate::attention::ZImageAttention;
+use crate::feed_forward::FeedForward;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 /// Shape of one Z-Image transformer block.
 #[derive(Debug, Clone, Copy)]

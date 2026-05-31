@@ -5,9 +5,9 @@ use mlx_rs::fast::scaled_dot_product_attention;
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
-use crate::nn::{group_norm, linear};
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::nn::{group_norm, linear};
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-6;

@@ -3,8 +3,8 @@
 //! (small decoder mirroring `Decoder.__call__`: conv_in → mid → 2 up-blocks → norm-out →
 //! SiLU → conv_out). Tol 1e-2 (Metal fp32 convs).
 
-use mlx_gen::models::z_image::vae::{Decoder, Vae, VaeDecoderConfig};
 use mlx_gen::weights::Weights;
+use mlx_gen_z_image::vae::{Decoder, Vae, VaeDecoderConfig};
 use mlx_rs::ops::{add, all_close, multiply};
 use mlx_rs::Array;
 

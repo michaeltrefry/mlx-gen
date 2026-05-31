@@ -7,8 +7,8 @@
 //! precision on Metal, so matmul chains agree to ~3–4 sig figs, not bit-exactly.
 
 use mlx_gen::adapters::{install_adapter, Adapter};
-use mlx_gen::models::z_image::{ZImageBlockConfig, ZImageTransformerBlock};
 use mlx_gen::weights::Weights;
+use mlx_gen_z_image::{ZImageBlockConfig, ZImageTransformerBlock};
 use mlx_rs::ops::{all_close, array_eq};
 use mlx_rs::Array;
 

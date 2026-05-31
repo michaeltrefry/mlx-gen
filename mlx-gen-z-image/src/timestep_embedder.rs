@@ -4,9 +4,9 @@
 use mlx_rs::ops::multiply;
 use mlx_rs::Array;
 
-use crate::nn::{linear, silu};
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::nn::{linear, silu};
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 pub struct TimestepEmbedder {
     l1_w: Array,

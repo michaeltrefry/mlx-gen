@@ -1,0 +1,15 @@
+[package]
+name = "mlx-gen-z-image"
+version = "0.0.0"
+edition = "2021"
+description = "Z-Image (Tongyi Z-Image-turbo) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "z-image", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+mlx-rs = "0.25"
+# Link-time self-registration into mlx-gen's model registry.
+inventory = "0.3"

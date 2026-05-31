@@ -3,8 +3,8 @@
 //! Fixture `tests/fixtures/vae_submodules.safetensors` ← `tools/dump_vae_submodules.py`.
 //! Tol 1e-2 (Metal fp32 convs).
 
-use mlx_gen::models::z_image::vae::{ResnetBlock2D, UpSampler, VaeAttention};
 use mlx_gen::weights::Weights;
+use mlx_gen_z_image::vae::{ResnetBlock2D, UpSampler, VaeAttention};
 use mlx_rs::ops::all_close;
 use mlx_rs::Array;
 

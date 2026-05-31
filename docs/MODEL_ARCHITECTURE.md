@@ -216,6 +216,14 @@ linked** — `mlx-gen` has no central match to edit (additive). A third party li
 sees exactly one registration. (`Transform`s register the same way into a parallel registry.)
 Maps onto the worker's `payload.model` → `MODEL_TARGETS` → load.
 
+> **Linkage nuance (verified in the z-image split):** "linked" means the provider's objects are
+> actually pulled into the final binary. A dependency that is declared but *never referenced*
+> can have its link-section statics dropped by the linker, so its `inventory::submit!` never
+> runs. A consumer that uses the provider (constructs requests, names a type, etc.) links it
+> automatically; to depend on a provider purely for its registration side-effect, force the link
+> with `use mlx_gen_z_image as _;`. This is the "the DI container has to know about the assembly"
+> detail — in Rust it's a link-time, not runtime, fact.
+
 ---
 
 ## 5. How consumers use it

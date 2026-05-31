@@ -8,8 +8,8 @@ use mlx_rs::Array;
 
 use super::attention::ZImageAttention;
 use super::feed_forward::FeedForward;
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 pub struct ZImageContextBlock {
     pub attention: ZImageAttention,

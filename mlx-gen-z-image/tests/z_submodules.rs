@@ -3,8 +3,8 @@
 //! Tolerance 1e-2 for matmul-bearing modules (Metal fp32); the weightless RoPE table is
 //! pure trig + gather, so it's checked tight at 1e-4.
 
-use mlx_gen::models::z_image::{FinalLayer, RopeEmbedder, TimestepEmbedder, ZImageContextBlock};
 use mlx_gen::weights::Weights;
+use mlx_gen_z_image::{FinalLayer, RopeEmbedder, TimestepEmbedder, ZImageContextBlock};
 use mlx_rs::ops::all_close;
 use mlx_rs::Array;
 

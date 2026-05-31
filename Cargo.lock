@@ -484,6 +484,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-z-image"
+version = "0.0.0"
+dependencies = [
+ "inventory",
+ "mlx-gen",
+ "mlx-rs",
+]
+
+[[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

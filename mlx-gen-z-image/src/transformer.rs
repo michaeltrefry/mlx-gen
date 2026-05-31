@@ -17,9 +17,9 @@ use super::final_layer::FinalLayer;
 use super::rope_embedder::RopeEmbedder;
 use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
-use crate::nn::linear;
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::nn::linear;
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 /// Shape/hyperparameters of a Z-Image transformer.
 #[derive(Debug, Clone)]

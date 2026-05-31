@@ -3,8 +3,8 @@
 //! (tiny synthetic model: dim=96, 4 heads, 1 refiner + 2 main layers, in_ch=4, patch=2).
 //! Tol 1e-2 — Metal fp32 across a 30+-matmul forward.
 
-use mlx_gen::models::z_image::{ZImageTransformer, ZImageTransformerConfig};
 use mlx_gen::weights::Weights;
+use mlx_gen_z_image::{ZImageTransformer, ZImageTransformerConfig};
 use mlx_rs::ops::all_close;
 
 const FIXTURE: &str = concat!(

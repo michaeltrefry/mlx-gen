@@ -79,7 +79,7 @@ y_ref = model(x, timestep, sigmas, cap_feats)
 assert mx.allclose(-output, y_ref, atol=1e-5).item(), "staged replication diverged from __call__"
 out["out.y"] = y_ref.astype(mx.float32)
 
-path = "/Users/michael/repos/mlx-gen/tests/fixtures/z_transformer.safetensors"
+path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/z_transformer.safetensors"
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors)")
 print("out.y:", y_ref.shape, "| x_tokens:", out["mid.x_tokens"].shape, "| unified:", out["mid.unified"].shape)

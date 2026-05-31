@@ -4,8 +4,8 @@
 use mlx_rs::Array;
 
 use super::{ResnetBlock2D, UpSampler};
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 pub struct UpDecoderBlock {
     resnets: Vec<ResnetBlock2D>,

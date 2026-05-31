@@ -6,7 +6,7 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
-use crate::Result;
+use mlx_gen::Result;
 
 pub struct RopeEmbedder {
     /// One `(axes_lens[i], axes_dims[i]/2, 2)` cos/sin table per axis.

@@ -6,9 +6,9 @@ use mlx_rs::{
     Array,
 };
 
-use crate::adapters::{AdaptableHost, AdaptableLinear};
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 pub struct FeedForward {
     pub w1: AdaptableLinear,

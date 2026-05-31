@@ -44,7 +44,7 @@ out["in.t_emb"] = t_emb.astype(mx.float32)
 out["in.freqs_cis"] = freqs_cis.astype(mx.float32)
 out["out.y"] = y.astype(mx.float32)
 
-path = "/Users/michael/repos/mlx-gen/tests/fixtures/zblock_small.safetensors"
+path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/zblock_small.safetensors"
 mx.save_safetensors(path, out)
 print(f"wrote {path}  ({len(out)} tensors, dim={DIM} heads={N_HEADS} seq={SEQ})")
 print("y shape:", y.shape, "y dtype:", y.dtype)

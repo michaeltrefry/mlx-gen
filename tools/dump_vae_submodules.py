@@ -61,7 +61,7 @@ up_x = mx.random.normal((1, 32, 8, 8))
 out["up.in"] = up_x.astype(mx.float32)
 out["up.out"] = up(up_x).astype(mx.float32)
 
-path = "/Users/michael/repos/mlx-gen/tests/fixtures/vae_submodules.safetensors"
+path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/vae_submodules.safetensors"
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors)")
 for k in ("rb.out", "attn.out", "up.out"):

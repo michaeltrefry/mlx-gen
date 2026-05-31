@@ -1,5 +1,5 @@
 //! Z-Image VAE decoder. The image side of the pipeline — latents → RGB. Built from the core
-//! convolutional primitives in [`crate::nn`] (`conv2d` + pytorch-compatible `group_norm` +
+//! convolutional primitives in [`mlx_gen::nn`] (`conv2d` + pytorch-compatible `group_norm` +
 //! `upsample_nearest`), validated against the fork in the sub-module parity tests.
 //!
 //! Modules take/return NCHW (mirroring the fork's per-module transpose convention) and work

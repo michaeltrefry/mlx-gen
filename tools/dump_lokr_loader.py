@@ -68,8 +68,8 @@ assert applied == 2, f"expected 2 applied, got {applied}"
 y = block(x, None, freqs_cis, t_emb)
 base["out.y"] = y.astype(mx.float32)
 
-base_path = "/Users/michael/repos/mlx-gen/tests/fixtures/lokr_loader.safetensors"
-adapter_path = "/Users/michael/repos/mlx-gen/tests/fixtures/lokr_adapter.safetensors"
+base_path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/lokr_loader.safetensors"
+adapter_path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/lokr_adapter.safetensors"
 mx.save_safetensors(base_path, base)
 mx.save_safetensors(adapter_path, {k: v.astype(mx.float32) for k, v in adapter.items()}, metadata=meta)
 print(f"wrote {base_path} ({len(base)} tensors)")

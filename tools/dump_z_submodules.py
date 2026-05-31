@@ -75,7 +75,7 @@ out["cb.in_x"] = cb_x.astype(mx.float32)
 out["cb.in_freqs_cis"] = cb_fc.astype(mx.float32)
 out["cb.out"] = cb(cb_x, None, cb_fc).astype(mx.float32)
 
-path = "/Users/michael/repos/mlx-gen/tests/fixtures/z_submodules.safetensors"
+path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/z_submodules.safetensors"
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors)")
 for k in ("te.out", "rope.out", "fl.out", "cb.out"):

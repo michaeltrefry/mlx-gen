@@ -1,3 +1,7 @@
+[workspace]
+members = ["mlx-gen-z-image"]
+resolver = "2"
+
 [package]
 name = "mlx-gen"
 version = "0.0.0"

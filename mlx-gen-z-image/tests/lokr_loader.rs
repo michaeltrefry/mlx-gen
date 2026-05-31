@@ -7,8 +7,8 @@
 //! same adapter file and must reproduce the fork's post-adapter output (tol 1e-2 — Metal fp32).
 
 use mlx_gen::adapters::loader::{apply_lokr, is_lokr};
-use mlx_gen::models::z_image::{ZImageBlockConfig, ZImageTransformerBlock};
 use mlx_gen::weights::Weights;
+use mlx_gen_z_image::{ZImageBlockConfig, ZImageTransformerBlock};
 use mlx_rs::ops::all_close;
 
 const BASE: &str = concat!(

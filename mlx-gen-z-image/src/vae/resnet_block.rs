@@ -4,9 +4,9 @@
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
-use crate::nn::{conv2d, group_norm, silu};
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::nn::{conv2d, group_norm, silu};
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-6;

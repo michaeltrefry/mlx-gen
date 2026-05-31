@@ -70,7 +70,7 @@ y = conv_out(h)
 out["in.latent"] = latent.astype(mx.float32)
 out["out.image"] = y.astype(mx.float32)
 
-path = "/Users/michael/repos/mlx-gen/tests/fixtures/vae_decoder.safetensors"
+path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/vae_decoder.safetensors"
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors)")
 print("latent:", latent.shape, "-> image:", y.shape)

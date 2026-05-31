@@ -3,8 +3,8 @@
 use mlx_rs::Array;
 
 use super::{ResnetBlock2D, VaeAttention};
-use crate::weights::Weights;
-use crate::Result;
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
 
 pub struct UNetMidBlock {
     resnet0: ResnetBlock2D,
