@@ -20,6 +20,8 @@ use mlx_rs::{
 
 use crate::Result;
 
+pub mod loader;
+
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
 }
@@ -157,6 +159,19 @@ impl AdaptableLinear {
     /// `true` once the base has been quantized (Q4/Q8).
     pub fn is_quantized(&self) -> bool {
         matches!(self.base, LinearBase::Quantized(_))
+    }
+
+    /// The base weight's logical `[out, in]` shape — what a LoKr delta must reshape to.
+    /// For a quantized base the packed weight is opaque, so recover it from the scales grid
+    /// (`[out, in/group_size]`) times the group size.
+    pub fn base_shape(&self) -> Vec<i32> {
+        match &self.base {
+            LinearBase::Dense(l) => l.weight.value.shape().to_vec(),
+            LinearBase::Quantized(q) => {
+                let s = q.scales.value.shape();
+                vec![s[0], s[1] * q.group_size]
+            }
+        }
     }
 
     /// Quantize the dense base in place to Q4/Q8 (`group_size` defaults to 64), the mlx-rs
