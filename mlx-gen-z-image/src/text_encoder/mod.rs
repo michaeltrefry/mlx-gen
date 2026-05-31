@@ -7,11 +7,13 @@
 //! `EncoderLayer` parity test; the full `TextEncoder` assembly + prompt encoding follow.
 
 pub mod attention;
+pub mod encoder;
 pub mod layer;
 pub mod mlp;
 pub mod rope;
 
 pub use attention::TextAttention;
+pub use encoder::{TextEncoder, ZTextEncoderConfig};
 pub use layer::EncoderLayer;
 pub use mlp::TextMlp;
 pub use rope::TextRope;
