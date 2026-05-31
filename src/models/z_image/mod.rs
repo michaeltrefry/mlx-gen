@@ -10,6 +10,7 @@ pub mod rope_embedder;
 pub mod timestep_embedder;
 pub mod transformer;
 pub mod transformer_block;
+pub mod vae;
 
 pub use context_block::ZImageContextBlock;
 pub use final_layer::FinalLayer;
