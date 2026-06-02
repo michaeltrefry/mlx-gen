@@ -1,0 +1,17 @@
+[package]
+name = "mlx-gen-flux"
+version = "0.0.0"
+edition = "2021"
+description = "FLUX.1 provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "flux", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "ecda3f4661ad7f7510b5568f1799d6092a424952" }
+# Link-time self-registration into mlx-gen's model registry.
+inventory = "0.3"

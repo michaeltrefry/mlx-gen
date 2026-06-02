@@ -11,6 +11,9 @@
 use std::path::Path;
 
 use mlx_rs::Array;
+use tokenizers::models::bpe::BPE;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::processors::template::TemplateProcessing;
 use tokenizers::Tokenizer;
 
 use crate::{Error, Result};
@@ -79,6 +82,41 @@ impl TextTokenizer {
     /// Load from a `tokenizer.json` (the fast-tokenizer file shipped in every HF repo).
     pub fn from_file(path: impl AsRef<Path>, config: TokenizerConfig) -> Result<Self> {
         let inner = Tokenizer::from_file(path.as_ref()).map_err(tok_err)?;
+        Ok(Self { inner, config })
+    }
+
+    /// Load a CLIP/GPT-2-style byte-level BPE tokenizer from the split HF files
+    /// (`vocab.json` + `merges.txt`) and install the CLIP BOS/EOS post-processor.
+    pub fn from_clip_bpe(
+        vocab: impl AsRef<Path>,
+        merges: impl AsRef<Path>,
+        config: TokenizerConfig,
+    ) -> Result<Self> {
+        let vocab = vocab
+            .as_ref()
+            .to_str()
+            .ok_or_else(|| Error::Msg("tokenizer: vocab path is not UTF-8".into()))?;
+        let merges = merges
+            .as_ref()
+            .to_str()
+            .ok_or_else(|| Error::Msg("tokenizer: merges path is not UTF-8".into()))?;
+        let bpe = BPE::from_file(vocab, merges)
+            .unk_token("<|endoftext|>".into())
+            .build()
+            .map_err(tok_err)?;
+        let mut inner = Tokenizer::new(bpe);
+        inner.with_pre_tokenizer(Some(ByteLevel::default().add_prefix_space(false)));
+        inner.with_decoder(Some(ByteLevel::default()));
+        inner.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("<|startoftext|> $A <|endoftext|>")
+                .map_err(|e| Error::Msg(format!("tokenizer: {e}")))?
+                .try_pair("<|startoftext|> $A <|endoftext|> <|endoftext|> $B:1 <|endoftext|>:1")
+                .map_err(|e| Error::Msg(format!("tokenizer: {e}")))?
+                .special_tokens(vec![("<|startoftext|>", 49406), ("<|endoftext|>", 49407)])
+                .build()
+                .map_err(|e| Error::Msg(format!("tokenizer: {e}")))?,
+        ));
         Ok(Self { inner, config })
     }
 
