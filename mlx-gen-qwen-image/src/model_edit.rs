@@ -91,6 +91,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
+    if !spec.adapters.is_empty() {
+        return Err(Error::Msg(
+            "qwen_image_edit: LoRA/LoKr adapter application is not yet wired into load() — the core \
+             seam (LoadSpec.adapters → adapters::loader::apply_adapter_specs) exists, but the \
+             Qwen key→module map lands in sc-2528"
+                .into(),
+        ));
+    }
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {

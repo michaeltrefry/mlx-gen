@@ -107,7 +107,6 @@ most fields optional, a model reads what it supports, `validate()` rejects the r
 | Core | `prompt`, `negative_prompt: Option`, `width`, `height`, `count` (1–8) |
 | Sampling | `seed`/`seeds`, `steps`, `guidance`, `true_cfg`, `sampler`, `scheduler`, `scheduler_shift` (all `Option`) |
 | Conditioning | `conditioning: Vec<Conditioning>`, `strength: Option<f32>` |
-| Adapters | `adapters: Vec<AdapterSpec>` (§3.4) |
 | Video | `frames`, `fps`, `duration`, `video_mode`, source-clip handles (all `Option`) |
 | Control | cancel flag |
 
@@ -158,8 +157,7 @@ pub struct TransformRequest {            // Default-able, like GenerationRequest
     pub seed: Option<u64>,               // diffusion restorers (SeedVR2); ignored by deterministic ones
     pub strength: Option<f32>,           // model-defined restoration knob (SeedVR2 "softness", 0..1)
     pub steps: Option<u32>,              // SeedVR2 is 1-step; override only if the model allows
-    pub adapters: Vec<AdapterSpec>,      // uniform with Generator; usually empty
-    pub cancel: CancelFlag,
+    pub cancel: CancelFlag,              // adapters live on LoadSpec (load-time), not the request — §3.4
 }
 
 pub enum TargetSize {
@@ -182,12 +180,16 @@ public model.
 
 Not optional, not per-model-to-decide: the **core supports LoRA + LoKr, multiples of each, and
 mixed stacks** — and it's already implemented. `AdaptableLinear` holds a `Vec` of mixed adapters;
-the loaders stack a new adapter onto whatever is already installed (sc-2339 / sc-2343). The
-request expresses it directly:
+the loaders stack a new adapter onto whatever is already installed (sc-2339 / sc-2343). Adapters
+are applied at **load time** (`generate`/`apply` take `&self`, and the frozen fork applies adapters
+in its initializer), so the *load spec* — not the request — carries them. The load-time seam that
+turns specs into installed adapters is `adapters::loader::apply_adapter_specs` (sc-2534); each
+provider calls it in `load()` with its family's [`AdaptableHost`] key→module map (sc-2602 Z-Image,
+sc-2528 Qwen):
 
 ```rust
 pub struct AdapterSpec { pub path: PathBuf, pub scale: f32, pub kind: AdapterKind /* Lora | Lokr */ }
-// request.adapters: Vec<AdapterSpec>   → multiples + mixed by construction
+// LoadSpec.adapters: Vec<AdapterSpec>   → multiples + mixed by construction, baked on at load
 ```
 
 The only *per-model* question is whether a model's blocks expose adapter **injection points**
@@ -201,7 +203,7 @@ doubt about framework support.
 Construction is per-model (weight layouts differ); discovery is uniform.
 
 ```rust
-pub struct LoadSpec { pub weights: WeightsSource, pub quantize: Option<Quant>, pub dtype: Dtype, pub device: Device }
+pub struct LoadSpec { pub weights: WeightsSource, pub quantize: Option<Quant>, pub precision: Precision, pub control: Option<WeightsSource>, pub adapters: Vec<AdapterSpec> }
 
 pub struct ModelRegistration {                 // ≈ services.AddKeyedSingleton<IGenerator>("id", …)
     pub descriptor: fn() -> ModelDescriptor,

@@ -6,7 +6,7 @@
 //! variant — *not* a per-modality trait split (which breaks on multi-modal models).
 
 use crate::media::{AudioTrack, Image};
-use crate::runtime::{AdapterSpec, CancelFlag, Progress};
+use crate::runtime::{CancelFlag, Progress};
 use crate::Result;
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -67,9 +67,6 @@ pub struct GenerationRequest {
     /// img2img strength when a single `Reference` is supplied without its own strength.
     pub strength: Option<f32>,
 
-    // --- Adapters (multiples + mixed LoRA/LoKr) ---
-    pub adapters: Vec<AdapterSpec>,
-
     // --- Video (Option; consumed by video models at the follow-on port) ---
     pub frames: Option<u32>,
     pub fps: Option<u32>,
@@ -97,7 +94,6 @@ impl Default for GenerationRequest {
             scheduler_shift: None,
             conditioning: Vec::new(),
             strength: None,
-            adapters: Vec::new(),
             frames: None,
             fps: None,
             duration: None,

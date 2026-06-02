@@ -51,9 +51,15 @@ pub struct LoadSpec {
     pub precision: Precision,
     /// Auxiliary control-branch weights overlaid onto the base model at load time — a ControlNet
     /// checkpoint applied on top of `weights` (e.g. Z-Image's Fun-Controlnet-Union safetensors).
-    /// `None` for the plain base model; a control-variant loader requires it. This is a load-time
-    /// model *component* (unlike per-request LoRA/LoKr adapters in [`AdapterSpec`]).
+    /// `None` for the plain base model; a control-variant loader requires it. A load-time model
+    /// *component* (it alters the graph), distinct from [`adapters`](Self::adapters) below, which
+    /// are forward-time residual overlays on existing linears.
     pub control: Option<WeightsSource>,
+    /// LoRA/LoKr adapters baked onto the model at load time. Multiples + mixed LoRA/LoKr stack by
+    /// construction (see [`crate::adapters`]). Applied during `load` on the still-mutable model —
+    /// the seam, since `Generator::generate`/`Transform::apply` take `&self` and the frozen fork
+    /// likewise applies adapters in its initializer. Changing the adapter set means reloading.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 impl LoadSpec {
@@ -64,6 +70,7 @@ impl LoadSpec {
             quantize: None,
             precision: Precision::Bf16,
             control: None,
+            adapters: Vec::new(),
         }
     }
 
@@ -78,10 +85,16 @@ impl LoadSpec {
         self.control = Some(control);
         self
     }
+
+    /// Builder-style LoRA/LoKr adapters to bake on at load time (replaces any already set).
+    pub fn with_adapters(mut self, adapters: Vec<AdapterSpec>) -> Self {
+        self.adapters = adapters;
+        self
+    }
 }
 
-/// A single adapter to stack at generation time. Multiples + mixed LoRA/LoKr are supported by
-/// construction — see [`crate::adapters`].
+/// A single adapter to stack at load time. Multiples + mixed LoRA/LoKr are supported by
+/// construction — see [`crate::adapters`]. Carried by [`LoadSpec::adapters`].
 #[derive(Clone, Debug)]
 pub struct AdapterSpec {
     pub path: PathBuf,

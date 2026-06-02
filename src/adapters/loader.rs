@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use mlx_rs::Array;
 
 use super::{reconstruct_lokr_delta, AdaptableHost, Adapter};
+use crate::runtime::{AdapterKind, AdapterSpec};
 use crate::weights::Weights;
 use crate::Result;
 
@@ -159,10 +160,48 @@ struct LoraParts {
     alpha: Option<f32>,
 }
 
+/// Load and install every adapter in `specs` onto `host`, stacking in order. Each spec's file is
+/// read, dispatched to the LoKr or PEFT-LoRA loader by its [`AdapterKind`], applied at `spec.scale`,
+/// and its [`ApplyReport`] merged into the combined result — unmatched target paths are surfaced,
+/// never silently dropped. `lora_strip_prefix` is the per-family namespace stripped from PEFT-LoRA
+/// keys (e.g. `"transformer."`); it does not apply to LoKr (whose keys are bare module paths).
+///
+/// This is the load-time seam (sc-2534): a provider calls it inside `load()` with its model's
+/// [`AdaptableHost`] while the model is still mutable. Empty `specs` is a no-op (empty report).
+pub fn apply_adapter_specs(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+    lora_strip_prefix: Option<&str>,
+) -> Result<ApplyReport> {
+    let mut combined = ApplyReport::default();
+    for spec in specs {
+        let w = Weights::from_file(&spec.path)?;
+        let report = match spec.kind {
+            AdapterKind::Lokr => apply_lokr(host, &w, spec.scale)?,
+            AdapterKind::Lora => {
+                // The file's metadata is authoritative; a kind/metadata mismatch is a caller error
+                // (the PEFT-LoRA loader would find no `lora_A/B` keys and apply nothing) — surface it.
+                if is_lokr(&w) {
+                    return Err(format!(
+                        "adapter {} declared Lora but its metadata says networkType=lokr",
+                        spec.path.display()
+                    )
+                    .into());
+                }
+                apply_lora_peft(host, &w, spec.scale, lora_strip_prefix)?
+            }
+        };
+        combined.applied += report.applied;
+        combined.unmatched_paths.extend(report.unmatched_paths);
+    }
+    Ok(combined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::adapters::{AdaptableLinear, Adapter};
+    use crate::runtime::{AdapterKind, AdapterSpec};
     use mlx_rs::ops::all_close;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -264,5 +303,158 @@ mod tests {
         let report = apply_lokr(&mut host, &w, 1.0).unwrap();
         assert_eq!(report.applied, 0);
         assert_eq!(report.unmatched_paths, vec!["missing.path".to_string()]);
+    }
+
+    /// The load-time connector stacks a mixed LoRA + LoKr spec list and is equivalent to calling
+    /// the underlying loaders directly, in order.
+    #[test]
+    fn apply_specs_stacks_mixed_lora_and_lokr() {
+        // base [out=4, in=2].
+        let base_vals: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
+        let weight = Array::from_slice(&base_vals, &[4, 2]);
+
+        // PEFT LoRA file targeting ["lin"]: lora_A [r=2, in=2], lora_B [out=4, r=2].
+        let a_raw = Array::from_slice(&[0.1f32, 0.2, -0.1, -0.2], &[2, 2]);
+        let b_raw = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
+        let lora_path = tmp("specs_lora.safetensors");
+        Array::save_safetensors(
+            vec![("lin.lora_A.weight", &a_raw), ("lin.lora_B.weight", &b_raw)],
+            None,
+            &lora_path,
+        )
+        .unwrap();
+
+        // LoKr file targeting ["lin"]: kron(w1[2,1], w2[2,2]) -> [4,2]; alpha==rank -> factor 1.
+        let w1 = Array::from_slice(&[1.0f32, 0.5], &[2, 1]);
+        let w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
+        let mut meta = HashMap::new();
+        meta.insert("networkType".to_string(), "lokr".to_string());
+        meta.insert("alpha".to_string(), "1.0".to_string());
+        meta.insert("rank".to_string(), "1".to_string());
+        let lokr_path = tmp("specs_lokr.safetensors");
+        Array::save_safetensors(
+            vec![("lin.lokr_w1", &w1), ("lin.lokr_w2", &w2)],
+            Some(&meta),
+            &lokr_path,
+        )
+        .unwrap();
+
+        let specs = vec![
+            AdapterSpec {
+                path: lora_path.clone(),
+                scale: 0.5,
+                kind: AdapterKind::Lora,
+            },
+            AdapterSpec {
+                path: lokr_path.clone(),
+                scale: 1.0,
+                kind: AdapterKind::Lokr,
+            },
+        ];
+
+        let mut via_specs = OneLinear {
+            lin: AdaptableLinear::dense(weight.clone(), None),
+        };
+        let report = apply_adapter_specs(&mut via_specs, &specs, None).unwrap();
+        assert_eq!(report.applied, 2);
+        assert!(report.unmatched_paths.is_empty());
+
+        // Reference: the same files through the underlying loaders directly, in order.
+        let mut via_loaders = OneLinear {
+            lin: AdaptableLinear::dense(weight, None),
+        };
+        apply_lora_peft(
+            &mut via_loaders,
+            &Weights::from_file(&lora_path).unwrap(),
+            0.5,
+            None,
+        )
+        .unwrap();
+        apply_lokr(
+            &mut via_loaders,
+            &Weights::from_file(&lokr_path).unwrap(),
+            1.0,
+        )
+        .unwrap();
+
+        let x = Array::from_slice(&[1.0f32, -2.0], &[1, 2]);
+        let got = via_specs.lin.forward(&x).unwrap();
+        let want = via_loaders.lin.forward(&x).unwrap();
+        assert!(all_close(&got, &want, 1e-5, 1e-5, false)
+            .unwrap()
+            .item::<bool>());
+
+        // Both adapters actually moved the output off the bare base.
+        let base = AdaptableLinear::dense(Array::from_slice(&base_vals, &[4, 2]), None)
+            .forward(&x)
+            .unwrap();
+        assert!(!all_close(&got, &base, 1e-5, 1e-5, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    fn apply_specs_empty_is_noop() {
+        let weight = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let mut host = OneLinear {
+            lin: AdaptableLinear::dense(weight.clone(), None),
+        };
+        let report = apply_adapter_specs(&mut host, &[], None).unwrap();
+        assert_eq!(report, ApplyReport::default());
+
+        let x = Array::from_slice(&[1.0f32, -1.0], &[1, 2]);
+        let got = host.lin.forward(&x).unwrap();
+        let want = AdaptableLinear::dense(weight, None).forward(&x).unwrap();
+        assert!(all_close(&got, &want, 1e-6, 1e-6, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    fn apply_specs_reports_unmatched_paths() {
+        let dummy = Array::from_slice(&[1.0f32], &[1, 1]);
+        let mut meta = HashMap::new();
+        meta.insert("networkType".to_string(), "lokr".to_string());
+        meta.insert("alpha".to_string(), "1.0".to_string());
+        meta.insert("rank".to_string(), "1".to_string());
+        let path = tmp("specs_miss.safetensors");
+        Array::save_safetensors(
+            vec![("nope.here.lokr_w1", &dummy), ("nope.here.lokr_w2", &dummy)],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+
+        let specs = vec![AdapterSpec {
+            path,
+            scale: 1.0,
+            kind: AdapterKind::Lokr,
+        }];
+        let mut host = OneLinear {
+            lin: AdaptableLinear::dense(Array::from_slice(&[1.0f32], &[1, 1]), None),
+        };
+        let report = apply_adapter_specs(&mut host, &specs, None).unwrap();
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.unmatched_paths, vec!["nope.here".to_string()]);
+    }
+
+    #[test]
+    fn apply_specs_kind_metadata_mismatch_errors() {
+        let dummy = Array::from_slice(&[1.0f32], &[1, 1]);
+        let mut meta = HashMap::new();
+        meta.insert("networkType".to_string(), "lokr".to_string());
+        let path = tmp("specs_mismatch.safetensors");
+        Array::save_safetensors(vec![("lin.lokr_w1", &dummy)], Some(&meta), &path).unwrap();
+
+        // Declared Lora but the file's metadata says LoKr -> a loud error, not a silent no-op.
+        let specs = vec![AdapterSpec {
+            path,
+            scale: 1.0,
+            kind: AdapterKind::Lora,
+        }];
+        let mut host = OneLinear {
+            lin: AdaptableLinear::dense(Array::from_slice(&[1.0f32], &[1, 1]), None),
+        };
+        assert!(apply_adapter_specs(&mut host, &specs, None).is_err());
     }
 }

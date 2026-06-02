@@ -7,7 +7,7 @@
 //! embedding). Scope is image→image; a video restorer would extend this later, not now.
 
 use crate::media::Image;
-use crate::runtime::{AdapterSpec, CancelFlag, Progress};
+use crate::runtime::{CancelFlag, Progress};
 use crate::Result;
 
 /// A non-prompt image→image transform (super-resolution / restoration).
@@ -29,8 +29,6 @@ pub struct TransformRequest {
     pub strength: Option<f32>,
     /// SeedVR2 is 1-step; override only if the model allows it.
     pub steps: Option<u32>,
-    /// Uniform with `Generator`; usually empty.
-    pub adapters: Vec<AdapterSpec>,
     pub cancel: CancelFlag,
 }
 
