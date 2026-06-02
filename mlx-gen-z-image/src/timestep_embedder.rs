@@ -4,7 +4,7 @@
 use mlx_rs::ops::multiply;
 use mlx_rs::Array;
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -62,5 +62,18 @@ impl TimestepEmbedder {
         let cos = mlx_rs::ops::cos(&args)?;
         let sin = mlx_rs::ops::sin(&args)?;
         Ok(mlx_rs::ops::concatenate_axis(&[&cos, &sin], 1)?)
+    }
+}
+
+impl AdaptableHost for TimestepEmbedder {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // Trained-file naming follows the fork's `t_embedder.mlp.{0,2}` (diffusers `Sequential`
+        // indices) — index 0 is the first Linear (`linear1`), index 2 the second (`linear2`); the
+        // SiLU at index 1 has no weights.
+        match path {
+            ["mlp", "0"] => Some(&mut self.linear1),
+            ["mlp", "2"] => Some(&mut self.linear2),
+            _ => None,
+        }
     }
 }

@@ -19,7 +19,7 @@ use super::final_layer::FinalLayer;
 use super::rope_embedder::RopeEmbedder;
 use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -340,4 +340,38 @@ pub(crate) fn pad_rows(a: &Array, pad: i32) -> Result<Array> {
     let d = a.shape()[1];
     let zeros = Array::from_slice(&vec![0f32; (pad * d) as usize], &[pad, d]);
     Ok(concatenate_axis(&[a, &zeros], 0)?)
+}
+
+/// The Z-Image adapter key→module map — the Rust analog of the fork's `ZImageLoRAMapping`. Adapter
+/// files address modules by their **trained (diffusers) path**; this routes those paths to the
+/// crate's module tree, covering the full fork target surface: the three per-layer stacks
+/// (`layers` / `noise_refiner` / `context_refiner`) and the six global targets. Per-block routing
+/// is delegated to the block hosts (`attention.to_q/k/v`, `attention.to_out.0`,
+/// `feed_forward.w1/w2/w3`, `adaLN_modulation.0`). Trained-file vs internal naming differences are
+/// reconciled here (`all_x_embedder.{p}-{pf}`→`x_embedder`, `cap_embedder.1`→`cap_linear`,
+/// `t_embedder.mlp.{0,2}`→`linear{1,2}`, `all_final_layer.{p}-{pf}.{linear,adaLN_modulation.1}`).
+impl AdaptableHost for ZImageTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["layers", n, rest @ ..] => self
+                .layers
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["noise_refiner", n, rest @ ..] => self
+                .noise_refiner
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["context_refiner", n, rest @ ..] => self
+                .context_refiner
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            // Global targets. The `all_x_embedder` / `all_final_layer` patch-size suffix (e.g.
+            // `2-1`) is matched as a wildcard segment.
+            ["all_x_embedder", _] => Some(&mut self.x_embedder),
+            ["cap_embedder", "1"] => Some(&mut self.cap_linear),
+            ["t_embedder", rest @ ..] => self.t_embedder.adaptable_mut(rest),
+            ["all_final_layer", _, rest @ ..] => self.final_layer.adaptable_mut(rest),
+            _ => None,
+        }
+    }
 }

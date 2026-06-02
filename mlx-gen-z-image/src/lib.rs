@@ -14,6 +14,7 @@
 //! pipeline, including img2img (VAE-encode an init image + noise blend, sc-2533) and whole-model
 //! Q4/Q8 quantization (sc-2532).
 
+pub mod adapters;
 pub mod attention;
 pub mod context_block;
 pub mod control_transformer;
@@ -31,6 +32,7 @@ pub mod transformer;
 pub mod transformer_block;
 pub mod vae;
 
+pub use adapters::apply_z_image_adapters;
 pub use context_block::ZImageContextBlock;
 pub use control_transformer::{ZImageControlTransformer, CONTROL_IN_DIM};
 pub use control_transformer_block::ZImageControlBlock;

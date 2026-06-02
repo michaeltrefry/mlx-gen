@@ -22,7 +22,7 @@ use mlx_rs::{Array, Dtype};
 
 use crate::control_transformer_block::ZImageControlBlock;
 use crate::transformer::{apply_pad, row_indices, ZImageTransformer};
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -312,6 +312,15 @@ impl ZImageControlTransformer {
             hints.push(block.after_proj().forward(&c)?);
         }
         Ok((hints, c))
+    }
+}
+
+impl AdaptableHost for ZImageControlTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // Adapters target the base DiT — the fork trains LoRA/LoKr on the base transformer, not the
+        // control branch (`control_x_embedder` / `control_layers` / `control_noise_refiner` are
+        // ControlNet weights, never adapter targets). Delegate the whole path to the composed base.
+        self.base.adaptable_mut(path)
     }
 }
 

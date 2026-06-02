@@ -89,14 +89,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "z_image_turbo_control: LoRA/LoKr adapter application is not yet wired into load() — \
-             the core seam (LoadSpec.adapters → adapters::loader::apply_adapter_specs) exists, but \
-             the Z-Image key→module map lands in sc-2602"
-                .into(),
-        ));
-    }
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => return Err(Error::Msg(
@@ -124,6 +116,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         transformer.quantize(bits)?;
         text_encoder.quantize(bits)?;
         vae.quantize(bits)?;
+    }
+    // LoRA/LoKr (sc-2602): install onto the composed base DiT (the control branch is not an adapter
+    // target). Same load-time, post-quantize, residual-over-base path as the plain turbo. No-op when
+    // `spec.adapters` is empty.
+    if !spec.adapters.is_empty() {
+        crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
     }
     Ok(Box::new(ZImageTurboControl {
         descriptor: descriptor(),

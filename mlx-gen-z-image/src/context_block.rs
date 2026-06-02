@@ -8,6 +8,7 @@ use mlx_rs::Array;
 
 use super::attention::ZImageAttention;
 use super::feed_forward::FeedForward;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -67,5 +68,18 @@ impl ZImageContextBlock {
             .feed_forward
             .forward(&rms_norm(&x, &self.ffn_norm1, self.eps)?)?;
         Ok(add(&x, &rms_norm(&ffn_out, &self.ffn_norm2, self.eps)?)?)
+    }
+}
+
+impl AdaptableHost for ZImageContextBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // Context blocks carry no timestep, so there is no `adaLN_modulation` target (the fork's
+        // mapping lists one uniformly across layer types, but the context-refiner file never
+        // populates it → it simply resolves to None here and the loader reports it unmatched).
+        match path {
+            ["attention", rest @ ..] => self.attention.adaptable_mut(rest),
+            ["feed_forward", rest @ ..] => self.feed_forward.adaptable_mut(rest),
+            _ => None,
+        }
     }
 }
