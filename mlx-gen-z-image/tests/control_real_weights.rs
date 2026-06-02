@@ -255,6 +255,7 @@ fn control_denoise_loop_matches_golden() {
 ///     that ~8× quantized-kernel residual is a base-model property (sc-2532), accumulated here over
 ///     8 steps + the deeper control stack. (NOT the activation dtype: the fork's own Q8 bf16-vs-f32
 ///     is only 0.24% — see `probe_z_control_q8_dtype.py`.)
+///
 /// The dense control path is pixel-faithful (`control_full_pipeline_matches_fork`, 0.166%).
 #[test]
 #[ignore = "needs real Z-Image + control weights and the local Q8 control golden \
