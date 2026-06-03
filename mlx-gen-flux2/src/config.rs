@@ -71,9 +71,10 @@ impl Flux2Variant {
                 supports_guidance: true,
                 supports_true_cfg: false,
                 conditioning,
-                // Transformer-only LoRA/LoKr is a separable capability (sc-2646); not in S0.
-                supports_lora: false,
-                supports_lokr: false,
+                // Transformer-only LoRA/LoKr (sc-2646): both variants share the `Flux2Transformer`,
+                // which hosts the adapters; the VAE + Qwen3 TE are not adapter targets.
+                supports_lora: true,
+                supports_lokr: true,
                 samplers: Vec::new(),
                 schedulers: vec!["flow_match_euler"],
                 min_size: 256,

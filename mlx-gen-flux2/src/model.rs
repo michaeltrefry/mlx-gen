@@ -66,12 +66,6 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
             )))
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(format!(
-            "{}: LoRA/LoKr adapters are sc-2646",
-            variant.id()
-        )));
-    }
 
     let mut text_encoder = loader::load_text_encoder(root)?;
     let mut transformer = loader::load_transformer(root)?;
@@ -88,6 +82,12 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         transformer.quantize(bits)?;
         text_encoder.quantize(bits)?;
         vae.quantize(bits)?;
+    }
+
+    // LoRA/LoKr (sc-2646): applied AFTER quantization, as forward-time residuals over the
+    // (possibly quantized) transformer — fork-faithful, transformer-only. No-op when empty.
+    if !spec.adapters.is_empty() {
+        crate::adapters::apply_flux2_adapters(&mut transformer, &spec.adapters)?;
     }
 
     Ok(Box::new(Flux2 {

@@ -17,6 +17,7 @@
 //! latent/text id builders. `load()`/`generate()` are guarded with a clear error until the
 //! text-encoder (S1), VAE (S2), and transformer (S3) modules land.
 
+pub mod adapters;
 pub mod config;
 pub mod loader;
 pub mod model;
@@ -26,6 +27,7 @@ pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
 
+pub use adapters::apply_flux2_adapters;
 pub use config::{
     Flux2Config, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_HEIGHT, DEFAULT_STEPS, DEFAULT_WIDTH,
     FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID,
