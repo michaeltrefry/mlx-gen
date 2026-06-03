@@ -3,11 +3,11 @@
 //! output AdaLayerNorm.
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::silu;
+use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::nn::{gelu, gelu_approximate};
+use mlx_rs::nn::gelu;
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::{Array, Dtype};
 
@@ -266,7 +266,7 @@ impl FluxTransformer {
         let b = &self.single_blocks[0];
         let (normed, _gate) = b.norm.forward_three(&joint, text_embeddings)?;
         let attn = b.attn.forward(&normed, &rope)?;
-        let ff = gelu_approximate(b.proj_mlp.forward(&normed)?)?;
+        let ff = gelu_tanh(&b.proj_mlp.forward(&normed)?)?;
         Ok(vec![
             ("sb0_norm".into(), normed),
             ("sb0_attn".into(), attn),
@@ -439,7 +439,7 @@ impl SingleBlock {
         let residual = hidden;
         let (normed, gate) = self.norm.forward_three(hidden, emb)?;
         let attn = self.attn.forward(&normed, rope)?;
-        let ff = gelu_approximate(self.proj_mlp.forward(&normed)?)?;
+        let ff = gelu_tanh(&self.proj_mlp.forward(&normed)?)?;
         let out = concatenate_axis(&[&attn, &ff], 2)?;
         let out = multiply(&gate.expand_dims(1)?, &self.proj_out.forward(&out)?)?;
         Ok(add(residual, &out)?)
@@ -680,7 +680,9 @@ impl FeedForward {
         let x = self.linear1.forward(x)?;
         let x = match self.activation {
             Activation::Gelu => gelu(x)?,
-            Activation::GeluApprox => gelu_approximate(x)?,
+            // Dtype-preserving, golden-bit-exact tanh-GELU (sc-2779), replacing
+            // `mlx_rs::nn::gelu_approximate` (1-ULP f32 `√(2/π)` + bf16→f32 promotion).
+            Activation::GeluApprox => gelu_tanh(&x)?,
         };
         self.linear2.forward(&x)
     }

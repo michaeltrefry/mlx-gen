@@ -3,11 +3,12 @@
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::{host_i32, scalar};
+use mlx_gen::nn::gelu_tanh;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, broadcast_to, dequantize, matmul, multiply, power, quantize, sigmoid, softmax_axis, tanh,
+    add, broadcast_to, dequantize, matmul, multiply, power, quantize, sigmoid, softmax_axis,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -439,7 +440,10 @@ impl T5FeedForward {
 
     fn forward(&self, hidden: &Array) -> Result<Array> {
         let normed = t5_rms_norm(hidden, &self.ln_w, 1e-6)?;
-        let gelu = new_gelu(&self.wi0.forward(&normed)?)?;
+        // Shared dtype-preserving tanh-GELU (sc-2779). Replaces the local `new_gelu`, whose f32
+        // `√(2/π)` constant was 1 ULP off the fork's f64-host value (see [[mlx-rs-gelu-approx-f64-constant]]);
+        // `gelu_tanh` computes the constant in f64 and preserves the input dtype.
+        let gelu = gelu_tanh(&self.wi0.forward(&normed)?)?;
         let linear = self.wi1.forward(&normed)?;
         let ff = self.wo.forward(&multiply(&gelu, &linear)?)?;
         Ok(add(hidden, &ff)?)
@@ -455,14 +459,6 @@ impl T5FeedForward {
 
 fn quick_gelu(x: &Array) -> Result<Array> {
     Ok(multiply(x, &sigmoid(&multiply(x, scalar(1.702))?)?)?)
-}
-
-fn new_gelu(x: &Array) -> Result<Array> {
-    let x3 = power(x, Array::from_slice(&[3.0_f32], &[1]))?;
-    let inner = add(x, &multiply(&x3, scalar(0.044_715))?)?;
-    let inner = multiply(&inner, scalar((2.0_f32 / std::f32::consts::PI).sqrt()))?;
-    let gate = add(&tanh(&inner)?, scalar(1.0))?;
-    Ok(multiply(&multiply(x, scalar(0.5))?, &gate)?)
 }
 
 /// T5's `T5LayerNorm` — RMS-normalize over the last axis with NO mean subtraction.

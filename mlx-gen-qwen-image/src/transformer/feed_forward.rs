@@ -2,10 +2,10 @@
 //! Port of the fork's `QwenFeedForward`. Both Linears are [`AdaptableLinear`] so the transformer
 //! can be quantized (Q8) without changing the forward.
 
-use mlx_rs::nn::gelu_approximate;
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::nn::gelu_tanh;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -43,7 +43,10 @@ impl FeedForward {
     }
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let h = gelu_approximate(self.mlp_in.forward(x)?)?;
+        // Dtype-preserving, golden-bit-exact tanh-GELU (sc-2779). `mlx_rs::nn::gelu_approximate`
+        // uses an f32 `√(2/π)` (1 ULP off the fork's f64-host const) and promotes a bf16 input to
+        // f32; `gelu_tanh` matches `nn.GELU(approx="tanh")` and preserves the input dtype.
+        let h = gelu_tanh(&self.mlp_in.forward(x)?)?;
         self.mlp_out.forward(&h)
     }
 
