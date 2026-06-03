@@ -12,14 +12,17 @@
 //! This crate self-registers `wan2_2_ti2v_5b` into the `mlx-gen` model registry; load it with
 //! `mlx_gen::load("wan2_2_ti2v_5b", spec)`.
 //!
-//! ## Status (S0–S1)
+//! ## Status (S0–S1, S3)
 //! S0 — foundation: registry + config (`config.json`-driven, all Wan presets) + the three
 //! flow-match solvers (Euler / DPM++2M / UniPC default) with the shifted-sigma schedule + integer
 //! timesteps + 3-axis factorized 3-D RoPE (θ=10000) + 3-D patchify/unpatchify.
 //! S1 — the [`Umt5Encoder`] UMT5-XXL text encoder (f32) + `_clean_text`-faithful prompt cleaning,
-//! parity-gated against the `mlx_video` reference.
-//! The denoise pipeline (z48 VAE → DiT → video) lands across S2–S5; `Generator::generate` errors
-//! until then.
+//! parity-gated against the `mlx_video` reference (bit-exact).
+//! S3 — the [`WanTransformer`] Wan DiT (5B: 30 blocks, qk-RMSNorm self-attn + 3-axis RoPE,
+//! text cross-attn, adaLN-6vec modulation, gated-GELU FFN, modulated head). f32 activations,
+//! parity-gated f32-against-f32 vs the reference (patch-embed bit-exact).
+//! The denoise pipeline (z48 VAE → DiT loop → video) lands across S2/S4/S5; `Generator::generate`
+//! errors until then.
 
 pub mod config;
 pub mod model;
@@ -27,6 +30,7 @@ pub mod patchify;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod transformer;
 
 pub use config::{GuideScale, WanModelConfig, SAMPLE_NEG_PROMPT};
 pub use model::{descriptor, load, Wan, MODEL_ID};
@@ -36,3 +40,4 @@ pub use scheduler::{
     WanScheduler,
 };
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};
+pub use transformer::WanTransformer;

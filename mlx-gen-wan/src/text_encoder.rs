@@ -272,7 +272,7 @@ fn linear(x: &Array, w: &Array) -> Result<Array> {
 /// in f64 here collapses it: with this form the per-op floor (matmul / rms_norm / softmax / gelu)
 /// is all 0.0, so the encoder is bit-exact to the reference. (`x³` via integer-exponent `power`, as
 /// both the reference and mlx-rs do.)
-fn gelu_tanh(x: &Array) -> Result<Array> {
+pub(crate) fn gelu_tanh(x: &Array) -> Result<Array> {
     let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
     let x3 = power(x, Array::from_int(3))?;
     let inner = multiply(&add(x, &multiply(&x3, scalar(0.044_715))?)?, scalar(c))?;
