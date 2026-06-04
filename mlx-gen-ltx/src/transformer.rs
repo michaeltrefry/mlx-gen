@@ -22,7 +22,7 @@
 
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, concatenate_axis, dequantize, multiply, quantized_matmul, sigmoid, subtract,
+    add, concatenate_axis, dequantize, divide, multiply, quantized_matmul, sigmoid, subtract,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -45,8 +45,10 @@ pub enum Precision {
     /// f32 activations, Q8 weights **dequantized** to dense f32 — the S3a block math gate (small).
     F32,
     /// **f32 activations × Q8 `quantized_matmul`** (dense weights f32) — the production path and the
-    /// port's quality target. A single block is bit-exact to the reference (mlx 0.31.2); the bf16
-    /// alternative drifts ~3e-2 over the 48-layer residual stream, amplified by the output LayerNorm.
+    /// port's quality target. The **full 48-layer velocity is bit-exact** to the reference (mlx
+    /// 0.31.2) — required because the distilled stage-1 sampler is chaos-sensitive (any per-forward
+    /// seed amplifies to a large latent divergence; sc-2842). The bf16 alternative drifts ~3e-2 over
+    /// the 48-layer residual stream, amplified by the output LayerNorm.
     F32Q8,
     /// bf16 activations × Q8 `quantized_matmul` (dense bf16 elsewhere) — matches the reference's own
     /// compute dtype; retained for reference/diagnostics.
@@ -378,15 +380,23 @@ impl VideoBlock {
 
 /// PixArt sinusoidal timestep embedding (`flip_sin_to_cos`, `downscale_freq_shift = 0`, max_period
 /// 10000): `concat([cos(t·f), sin(t·f)])` with `f[i] = exp(−ln(10000)·i/half)`. `timesteps` is `(N,)`
-/// f32; returns `(N, TIME_PROJ_DIM)` f32. The log-spaced freqs are host-computed (fed into bf16
-/// downstream, so sub-f32 differences wash out).
+/// f32; returns `(N, TIME_PROJ_DIM)` f32.
+///
+/// The log-spaced freqs are computed in **MLX float32** (`arange → ×(−ln θ) → ÷half → exp`), mirroring
+/// the reference `get_timestep_embedding` op-for-op. A host-f64 table (the obvious shortcut) diverges
+/// ~1e-7 per element from the MLX-f32 kernels (88/128 freqs differ; the projection differs up to
+/// ~5e-5 after ×1000 + cos/sin) — invisible in bf16 but, in the F32Q8 path, this adaLN timestep
+/// embedding modulates **every** block and the sub-ULP seed compounds across the 48-layer residual
+/// stream into a percent-level velocity divergence that the distilled stage-1 sampler then amplifies.
+/// (RoPE, by contrast, follows the reference's own numpy-f64 path — see [`crate::rope`].)
 fn timestep_embedding(timesteps: &Array) -> Result<Array> {
-    let half = (TIME_PROJ_DIM / 2) as usize;
-    let ln = (10000f64).ln();
-    let freqs: Vec<f32> = (0..half)
-        .map(|i| (-ln * i as f64 / half as f64).exp() as f32)
-        .collect();
-    let freq = Array::from_slice(&freqs, &[1, half as i32]);
+    let half = TIME_PROJ_DIM / 2; // 128
+    let neg_ln = -(10000f64).ln() as f32;
+    let exponent = divide(
+        &multiply(&Array::arange::<_, f32>(None, half, None)?, scalar(neg_ln))?,
+        scalar(half as f32),
+    )?;
+    let freq = exponent.exp()?.reshape(&[1, half])?; // (1, half)
     let emb = multiply(&timesteps.reshape(&[-1, 1])?, &freq)?; // (N, half)
     Ok(concatenate_axis(&[&emb.cos()?, &emb.sin()?], 1)?) // (N, dim), cos first
 }

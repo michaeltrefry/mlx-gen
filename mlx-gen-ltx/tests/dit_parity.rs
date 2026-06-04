@@ -6,11 +6,12 @@
 //! weights (kept quantized → `quantized_matmul`) and checks the Rust `LtxDiT` reproduces it.
 //!
 //! **The golden MUST be mlx 0.31.2** (the Rust build): `quantized_matmul` changed 0.31.0→0.31.2, so
-//! a 0.31.0 golden mismatches by ~5e-4/op. At matched 0.31.2 a single block is **bit-exact** (0.0,
-//! verified during bring-up); the full-velocity residual is f32 accumulation over the 48-layer
-//! residual stream (the FF `gelu` floor ~4e-5/block) amplified by the output LayerNorm's
-//! massive-activation channels — hence `mean_rel` (broad) is the primary gate. Honors "divergence is
-//! not rounding": the per-block bit-exactness + output-head check below localize the residual.
+//! a 0.31.0 golden mismatches by ~5e-4/op. At matched 0.31.2 the **full 48-layer velocity is
+//! bit-exact** (peak_rel = mean_rel = 0.0). It was not until sc-2842: the adaLN timestep sinusoid was
+//! tabulated on the host in f64 then cast to f32 (the reference `get_timestep_embedding` builds it in
+//! MLX f32), a ~1e-7/elem seed that — fed into the f32 adaLN modulating every block — compounded over
+//! the 48-layer residual to ~0.9% mean_rel. Building the table in MLX f32 makes it bit-exact. Honors
+//! "divergence is not rounding": the residual was a real, named, fixed op, not f32 accumulation.
 //!
 //! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test dit_parity -- --ignored --nocapture`
 
@@ -80,8 +81,16 @@ fn dit_velocity_matches_reference() {
     assert_eq!(got.shape(), want.shape(), "velocity shape");
     let (pr, mr) = (peak_rel(&got, want), mean_rel(&got, want));
     eprintln!("dit velocity peak_rel = {pr:.3e} mean_rel = {mr:.3e}");
-    assert!(mr < 2e-2, "dit velocity mean_rel {mr:.3e} too high");
-    assert!(pr < 3e-2, "dit velocity peak_rel {pr:.3e} too high");
+    // The per-forward DiT is bit-exact at matched mlx 0.31.2 (sc-2842 fixed the last seed, the
+    // host-f64 timestep table). A non-zero residual here means a per-op divergence has crept back.
+    assert!(
+        pr == 0.0,
+        "dit velocity peak_rel {pr:.3e} must be bit-exact"
+    );
+    assert!(
+        mr == 0.0,
+        "dit velocity mean_rel {mr:.3e} must be bit-exact"
+    );
 }
 
 /// Sanity that the output head is exact: feed the reference post-block hidden through the Rust head

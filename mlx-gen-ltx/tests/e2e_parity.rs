@@ -8,19 +8,19 @@
 //!     only the Gemma `tokenizer.json` (`$LTX_GEMMA_DIR` / HF cache), no model weights.
 //!  2. `e2e_frames_match_reference` (`#[ignore]`, ~22 GB) — the pipeline from the reference's
 //!     **injected** `video_embeddings` + noise (the Gemma backbone need not be reloaded; the text
-//!     encoder is gated by S1 `te_parity`, the tokenizer by gate 1). **GATES** the verified-correct
-//!     components (position grid bit-exact, 2× upsample + re-noise bit-exact, stage-2 denoise from
-//!     the reference's exact input tight) and **REPORTS** the full 2-stage F32Q8 e2e (final latents +
-//!     frames px>8) without gating it — see below.
+//!     encoder is gated by S1 `te_parity`, the tokenizer by gate 1). **GATES** the full 2-stage
+//!     F32Q8 e2e (position grid + 2× upsample + re-noise bit-exact, stage-2 from the reference's exact
+//!     input bit-exact, full final latents bit-exact, frames px>8 = 0.00% — the sc-2679 S6 acceptance).
 //!
 //! **Golden is mlx 0.31.2** (the Q8 path), f32 regime (`Precision::F32Q8`). The distilled **stage-1**
-//! (8 steps from pure noise) is **chaos-sensitive** (like SDXL's ancestral sampler): it amplifies the
-//! sub-ULP/op f32-accumulation seed of the 48-layer DiT (after 1 block 3.5e-6 → after 48 blocks 0.9%;
-//! every op verified faithful — RoPE/gelu/rms/addmm/Q8-scales all bit-exact) into a large latent
-//! divergence (final ~27% mean_rel, frames ~31% px>8 @256²). The reference is **byte-deterministic**,
-//! so pixel-parity IS achievable — but only with a fully bit-exact per-forward DiT (an SDXL-style
-//! op-by-op hunt, tracked as a follow-up). Honors "divergence is not rounding": localized per-stage,
-//! mechanism named; the full px>8 is reported (visible), not silently gated-as-passing.
+//! (8 steps from pure noise) is **chaos-sensitive** (like SDXL's ancestral sampler): any per-forward
+//! seed is amplified into a large latent divergence. sc-2842 drove the per-forward DiT to **bit-exact**
+//! by fixing the last seed — the adaLN timestep sinusoid was built on the host in f64 then cast to f32,
+//! while the reference `get_timestep_embedding` builds it in MLX f32 (~1e-7/elem; invisible in bf16 but
+//! it modulates every block in F32Q8, compounding over 48 layers to ~0.9% → chaos-amplified to ~31%).
+//! With the table in MLX f32 the per-forward is bit-exact, stage-1 deterministic-identical, and the
+//! e2e **pixel-exact**. Honors "divergence is not rounding": the gap was a real, named, fixed op — not
+//! irreducible f32 accumulation.
 //!
 //! Run: `LTX_BASE_DIR=… LTX_GEMMA_DIR=… cargo test -p mlx-gen-ltx --test e2e_parity -- --ignored --nocapture`
 
@@ -168,8 +168,9 @@ fn e2e_frames_match_reference() {
         "renoise bit-exact"
     );
 
-    // Stage-2 denoise (3 steps) from the reference's exact `renoised` input — tight (the refinement
-    // stage is not chaos-sensitive). This is the strong per-stage correctness gate.
+    // Stage-2 denoise (3 steps) from the reference's exact `renoised` input — **bit-exact** now that
+    // the per-forward DiT is bit-exact (sc-2842: the timestep freq table runs in MLX f32, not host
+    // f64). Was 0.16% when the host-f64 seed accumulated over the 3 steps.
     let s2 = denoise(
         &dit,
         g.require("renoised").unwrap(),
@@ -182,17 +183,18 @@ fn e2e_frames_match_reference() {
     let s2_mr = mean_rel(&s2, g.require("final_latents").unwrap());
     eprintln!("stage2 (from ref input) mean_rel = {s2_mr:.3e}");
     assert!(
-        s2_mr < 1e-2,
-        "stage2 denoise from correct input diverged: {s2_mr:.3e}"
+        s2_mr == 0.0,
+        "stage2 denoise from correct input must be bit-exact: {s2_mr:.3e}"
     );
 
-    // --- REPORTED (NOT a parity gate): the full 2-stage F32Q8 e2e. ---
-    // The distilled stage-1 (8 steps from pure noise) is **chaos-sensitive**: it amplifies the sub-
-    // ULP/op f32-accumulation seed of the 48-layer DiT (after 1 block 3.5e-6, after 48 blocks 0.9%;
-    // every op verified faithful — RoPE/gelu/rms/addmm/scales bit-exact) into a large latent
-    // divergence, exactly like the SDXL ancestral sampler. The reference is byte-deterministic, so
-    // pixel-parity IS achievable, but only with a fully bit-exact per-forward DiT — an SDXL-style
-    // op-by-op hunt tracked as a follow-up. Reported here, not gated, so the residual stays visible.
+    // --- GATED: the full 2-stage F32Q8 e2e — the sc-2679 S6 / task #2701 acceptance. ---
+    // The distilled stage-1 (8 steps from pure noise) is chaos-sensitive (the SDXL ancestral-sampler
+    // phenomenon), so it requires a fully **bit-exact** per-forward DiT. sc-2842 found and fixed the
+    // last seed: the adaLN timestep sinusoid was tabulated on the host in f64 then cast to f32, while
+    // the reference `get_timestep_embedding` builds it in MLX f32 — a ~1e-7/elem mismatch that, fed
+    // into the f32 adaLN modulating every block, compounded over 48 layers to ~0.9% and then chaos-
+    // amplified to ~31% px>8. With the table in MLX f32 the per-forward is bit-exact, stage-1 is
+    // deterministic-identical, and the e2e is **pixel-exact** (px>8 = 0.00%). Acceptance: px>8 < 1%.
     let latents = generate_t2v_latents(
         &dit,
         &up,
@@ -213,7 +215,16 @@ fn e2e_frames_match_reference() {
     assert_eq!(frames.dtype(), Dtype::Uint8);
     let px = px_gt8(&frames, want_frames);
     eprintln!(
-        "FULL e2e (chaos-amplified, NOT gated): final latents mean_rel = {fmr:.3e}, frames px>8 = {:.2}%",
+        "FULL e2e: final latents mean_rel = {fmr:.3e}, frames px>8 = {:.2}%",
+        px * 100.0
+    );
+    assert!(
+        fmr == 0.0,
+        "full e2e final latents must be bit-exact (per-forward is bit-exact): {fmr:.3e}"
+    );
+    assert!(
+        px < 1e-2,
+        "e2e frames px>8 {:.2}% exceeds the 1% acceptance (sc-2679 S6)",
         px * 100.0
     );
 }
