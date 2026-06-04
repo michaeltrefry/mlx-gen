@@ -29,7 +29,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, cos, multiply, sigmoid, sin, split};
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, cos, multiply, sigmoid, sin, split};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{WanModelConfig, WanQuant};
@@ -126,25 +126,28 @@ impl SelfAttention {
         Ok(())
     }
 
-    /// `x_mod`: `[1, L, dim]` (f32). `cos`/`sin`: `[L, 1, half_d]` (bf16). Returns `[1, L, dim]` bf16.
+    /// `x_mod`: `[B, L, dim]` (f32). `cos`/`sin`: `[L, 1, half_d]` (bf16). Returns `[B, L, dim]` bf16.
+    /// Batched over `B` (the CFG cond/uncond branches) — attention never mixes batch elements, so the
+    /// `B=2` result is bit-identical to two `B=1` calls (the cos/sin broadcast across batch + heads).
     fn forward(&self, x_mod: &Array, cos: &Array, sin: &Array) -> Result<Array> {
         // Matmuls run bf16 (the reference's `x.astype(w_dtype)`); the f32 residual is restored by the
         // block's modulation. q/k get full-dim bf16 RMSNorm before the head split; RoPE applies in
         // f32 on bf16 cos/sin then casts back to bf16 for the bf16 SDPA.
         let xw = bf16(x_mod)?;
         let (n, d) = (self.num_heads as i32, self.head_dim as i32);
+        let b = x_mod.shape()[0];
         let s = x_mod.shape()[1];
 
         let q = rms_norm(&self.q.forward(&xw)?, &self.norm_q, self.eps)?;
         let k = rms_norm(&self.k.forward(&xw)?, &self.norm_k, self.eps)?;
         let q = bf16(&crate::rope::rope_apply(
-            &f32(&q.reshape(&[1, s, n, d])?)?,
+            &f32(&q.reshape(&[b, s, n, d])?)?,
             cos,
             sin,
         )?)?
         .transpose_axes(&[0, 2, 1, 3])?;
         let k = bf16(&crate::rope::rope_apply(
-            &f32(&k.reshape(&[1, s, n, d])?)?,
+            &f32(&k.reshape(&[b, s, n, d])?)?,
             cos,
             sin,
         )?)?
@@ -152,11 +155,11 @@ impl SelfAttention {
         let v = self
             .v
             .forward(&xw)?
-            .reshape(&[1, s, n, d])?
+            .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let out = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
-        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[1, s, n * d])?;
+        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
 }
@@ -201,30 +204,34 @@ impl CrossAttention {
         Ok(())
     }
 
-    /// Cached K/V from the (bf16) text context `[1, L_ctx, dim]` — computed once, reused per step.
+    /// Cached K/V from the (bf16) text context `[B, L_ctx, dim]` — computed once, reused per step.
+    /// `B` is the forward batch (2 for CFG cond+uncond, 1 otherwise); returns `(k, v)` each
+    /// `[B, n, L_ctx, d]`.
     fn prepare_kv(&self, context: &Array) -> Result<(Array, Array)> {
         let (n, d) = (self.num_heads as i32, self.head_dim as i32);
+        let b = context.shape()[0];
         let ctx = bf16(context)?;
         let k = rms_norm(&self.k.forward(&ctx)?, &self.norm_k, self.eps)?
-            .reshape(&[1, -1, n, d])?
+            .reshape(&[b, -1, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
         let v = self
             .v
             .forward(&ctx)?
-            .reshape(&[1, -1, n, d])?
+            .reshape(&[b, -1, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
         Ok((k, v))
     }
 
-    /// `x`: `[1, L, dim]` (f32). `(k, v)`: cached (bf16). Returns `[1, L, dim]` bf16.
+    /// `x`: `[B, L, dim]` (f32). `(k, v)`: cached `[B, n, L_ctx, d]` (bf16). Returns `[B, L, dim]` bf16.
     fn forward(&self, x: &Array, kv: &(Array, Array)) -> Result<Array> {
         let (n, d) = (self.num_heads as i32, self.head_dim as i32);
+        let b = x.shape()[0];
         let s = x.shape()[1];
         let q = rms_norm(&self.q.forward(&bf16(x)?)?, &self.norm_q, self.eps)?
-            .reshape(&[1, s, n, d])?
+            .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
         let out = scaled_dot_product_attention(&q, &kv.0, &kv.1, self.scale, None, None)?;
-        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[1, s, n * d])?;
+        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
 }
@@ -269,7 +276,9 @@ impl Block {
         self.cross_attn.prepare_kv(context)
     }
 
-    /// `x`: `[1, L, dim]` (f32). `e`: `[1, 1, 6, dim]` f32 time modulation.
+    /// `x`: `[B, L, dim]` (f32). `e`: `[1, 1, 6, dim]` f32 time modulation (the timestep is shared
+    /// across the CFG batch, so `e` broadcasts over `B` — every modulation/residual op below is
+    /// batch-broadcast, only the self/cross attention reshape to `B`).
     fn forward(
         &self,
         x: &Array,
@@ -446,33 +455,119 @@ impl WanTransformer {
         Ok(vec![x_embed, e, e0, x_block0, x, x_head])
     }
 
-    /// Full DiT forward for a single latent (B=1, the cfg-disabled path). `latent`: `[C, F, H, W]`
-    /// (f32). `t`: integer-valued timestep. `context_embed`: `[1, text_len, dim]` (bf16) from
-    /// [`embed_text`](Self::embed_text). Returns the denoised `[out_dim, F, H, W]` (f32).
+    /// The patchify grid `(f, h, w)` for a latent `[C, F, H, W]` — constant across denoise steps (the
+    /// channel count is irrelevant, so the I2V channel-concat `y` doesn't change it). Used to size the
+    /// per-generate RoPE cache ([`prepare_rope`](Self::prepare_rope)).
+    pub fn patch_grid(&self, latent: &Array) -> (usize, usize, usize) {
+        let sh = latent.shape(); // [C, F, H, W]
+        let (pt, ph, pw) = self.cfg.patch_size;
+        (
+            sh[1] as usize / pt,
+            sh[2] as usize / ph,
+            sh[3] as usize / pw,
+        )
+    }
+
+    /// Precompute the **bf16** RoPE `(cos, sin)` for a constant grid — call once per generate, reuse
+    /// across every denoise step (mirrors the reference's `prepare_rope`). The cos/sin depend only on
+    /// the grid (not the weights), so they are identical for both MoE experts.
+    pub fn prepare_rope(&self, grid: (usize, usize, usize)) -> Result<(Array, Array)> {
+        let (cos_t, sin_t) = self.rope.precompute_cos_sin(grid)?;
+        Ok((bf16(&cos_t)?, bf16(&sin_t)?))
+    }
+
+    /// Precompute every block's cross-attention K/V from the (CFG-batched) embedded context — call
+    /// once per generate, reuse across all steps (mirrors the reference's `prepare_cross_kv`).
+    /// `context_batch`: `[B, text_len, dim]` (bf16) from [`embed_text`](Self::embed_text), with the
+    /// cond/uncond contexts stacked on the batch axis when CFG is on. Returns one `(k, v)` per block,
+    /// each `[B, n, text_len, d]`.
+    pub fn prepare_cross_kv(&self, context_batch: &Array) -> Result<Vec<(Array, Array)>> {
+        self.blocks
+            .iter()
+            .map(|block| block.prepare_kv(context_batch))
+            .collect()
+    }
+
+    /// Full DiT forward over a **single** latent shared across the CFG batch, reusing the per-generate
+    /// RoPE + cross-K/V caches. `latent`: `[C, F, H, W]` (f32, already channel-concatenated with the
+    /// I2V `y` by the caller). `t`: integer-valued timestep. `cross_kv`: per-block `(k, v)` from
+    /// [`prepare_cross_kv`](Self::prepare_cross_kv) (`[batch, n, text_len, d]`). `cos`/`sin`: from
+    /// [`prepare_rope`](Self::prepare_rope). `batch` is the cross-K/V batch width (2 for CFG, 1 for the
+    /// cfg-disabled path). Returns one denoised `[out_dim, F, H, W]` (f32) **per batch element**
+    /// (`[cond, uncond]` for CFG).
     ///
-    /// The CFG B=2 path (S4) calls this once per branch — bit-identical to the reference's batched
-    /// forward, since attention/matmuls never mix batch elements.
-    pub fn forward(&self, latent: &Array, t: f32, context_embed: &Array) -> Result<Array> {
-        // Patchify + embed; cast to bf16 to start the block stream (reference casts patches to w_dtype).
+    /// The single latent is patchified once and broadcast to `batch` (the reference's `all_same`
+    /// path) — the cond/uncond branches diverge only at the first cross-attention (different context
+    /// K/V), so the `B=2` forward is bit-identical to two `B=1` forwards but launches each GPU kernel
+    /// once instead of twice (the small-seq CFG win, sc-2853).
+    pub fn forward_cached(
+        &self,
+        latent: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        batch: usize,
+    ) -> Result<Vec<Array>> {
+        // Patchify + embed once; cast to bf16 to start the block stream (reference casts to w_dtype).
         let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
-        let mut x = bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[
-            1,
-            (grid.0 * grid.1 * grid.2) as i32,
-            self.cfg.dim as i32,
-        ])?;
+        let l = (grid.0 * grid.1 * grid.2) as i32;
+        let dim = self.cfg.dim as i32;
+        let x1 = bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[1, l, dim])?;
+        // Broadcast the shared patch embedding across the CFG batch (the reference's `broadcast_to`).
+        let mut x = if batch > 1 {
+            broadcast_to(&x1, &[batch as i32, l, dim])?
+        } else {
+            x1
+        };
 
         let (e, e0) = self.time_embed(t)?;
-        let (cos_t, sin_t) = self.rope.precompute_cos_sin(grid)?;
-        let (cos_t, sin_t) = (bf16(&cos_t)?, bf16(&sin_t)?);
 
-        for block in &self.blocks {
-            let kv = block.prepare_kv(context_embed)?;
-            x = block.forward(&x, &e0, &kv, &cos_t, &sin_t)?;
+        for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
+            x = block.forward(&x, &e0, kv, cos, sin)?;
         }
 
-        let x = self.apply_head(&x, &e)?; // [1, L, out_dim·∏patch] f32
-        let l = x.shape()[1];
-        let x = x.reshape(&[l, x.shape()[2]])?;
-        unpatchify(&x, grid, self.cfg.out_dim, self.cfg.patch_size)
+        let x = self.apply_head(&x, &e)?; // [batch, L, out_dim·∏patch] f32
+        let op = x.shape()[2];
+
+        // Unpatchify each batch element back to [out_dim, F, H, W].
+        if batch == 1 {
+            let xb = x.reshape(&[l, op])?;
+            return Ok(vec![unpatchify(
+                &xb,
+                grid,
+                self.cfg.out_dim,
+                self.cfg.patch_size,
+            )?]);
+        }
+        let mut out = Vec::with_capacity(batch);
+        for part in split(&x, batch as i32, 0)? {
+            let xb = part.reshape(&[l, op])?;
+            out.push(unpatchify(
+                &xb,
+                grid,
+                self.cfg.out_dim,
+                self.cfg.patch_size,
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// Full DiT forward for a single latent (B=1). `latent`: `[C, F, H, W]` (f32). `t`: integer-valued
+    /// timestep. `context_embed`: `[1, text_len, dim]` (bf16) from [`embed_text`](Self::embed_text).
+    /// Returns the denoised `[out_dim, F, H, W]` (f32).
+    ///
+    /// A convenience wrapper that builds the RoPE + cross-K/V caches on the fly and runs the B=1
+    /// [`forward_cached`](Self::forward_cached) path — bit-identical to the cached denoise loop for a
+    /// single branch. The denoise loops ([`denoise`](crate::pipeline::denoise) /
+    /// [`denoise_moe`](crate::pipeline::denoise_moe)) build the caches once per generate instead.
+    pub fn forward(&self, latent: &Array, t: f32, context_embed: &Array) -> Result<Array> {
+        let grid = self.patch_grid(latent);
+        let (cos_t, sin_t) = self.prepare_rope(grid)?;
+        let cross_kv = self.prepare_cross_kv(context_embed)?;
+        let mut preds = self.forward_cached(latent, t, &cross_kv, &cos_t, &sin_t, 1)?;
+        Ok(preds
+            .pop()
+            .expect("forward_cached yields one output for batch=1"))
     }
 }
