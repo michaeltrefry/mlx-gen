@@ -14,7 +14,7 @@
 use mlx_rs::ops::{add, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{Image, Result};
 
 use crate::scheduler::{make_scheduler, SolverKind};
 use crate::transformer::WanTransformer;
@@ -182,6 +182,28 @@ pub fn decode_to_frames(vae: &WanVae, latents: &Array) -> Result<Array> {
     let scaled = multiply(&add(&chw, scalar(1.0))?, scalar(127.5))?;
     let clamped = minimum(&maximum(&scaled, scalar(0.0))?, scalar(255.0))?;
     Ok(clamped.as_dtype(mlx_rs::Dtype::Uint8)?)
+}
+
+/// Split a `[F, H, W, 3]` `uint8` video tensor (the [`decode_to_frames`] output) into one
+/// [`Image`] per frame. The tensor is transpose-strided, so a raw `as_slice` would read the
+/// physical (pre-transpose) buffer — `reshape` first re-materializes it in logical C-order, then we
+/// chunk the contiguous bytes `H·W·3` at a time (see [[mlx_rs_as_slice_physical_buffer]]).
+pub fn frames_to_images(frames_u8: &Array) -> Result<Vec<Image>> {
+    let sh = frames_u8.shape(); // [F, H, W, 3]
+    let (f, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
+    let total: i32 = f * h * w * c;
+    let flat = frames_u8.reshape(&[total])?; // materialize logical NHWC order
+    let bytes = flat.as_slice::<u8>();
+    let per = (h * w * c) as usize;
+    let mut out = Vec::with_capacity(f as usize);
+    for i in 0..f as usize {
+        out.push(Image {
+            width: w as u32,
+            height: h as u32,
+            pixels: bytes[i * per..(i + 1) * per].to_vec(),
+        });
+    }
+    Ok(out)
 }
 
 /// `[d0, d1, ...]` → `[1, d0, d1, ...]` (prepend a batch axis).

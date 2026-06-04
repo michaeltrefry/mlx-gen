@@ -9,10 +9,12 @@
 //! patchify, the flow-match solvers, the T2V pipeline) is the Wan core (sc-2678); the dense/MoE
 //! 14B variants reuse it via additional configs + dual-expert routing.
 //!
-//! This crate self-registers `wan2_2_ti2v_5b` into the `mlx-gen` model registry; load it with
-//! `mlx_gen::load("wan2_2_ti2v_5b", spec)`.
+//! This crate self-registers two models into the `mlx-gen` registry: **`wan2_2_t2v_14b`** (the
+//! dual-expert MoE T2V, fully wired — `mlx_gen::load("wan2_2_t2v_14b", spec)` runs the complete
+//! pipeline) and **`wan2_2_ti2v_5b`** (the dense 5B, whose z48 VAE + dense denoise are sc-2680, so
+//! its `generate` still stubs).
 //!
-//! ## Status (S0–S5)
+//! ## Status (S0–S6)
 //! S0 — foundation: registry + config (`config.json`-driven, all Wan presets) + the three
 //! flow-match solvers (Euler / DPM++2M / UniPC default) with the shifted-sigma schedule + integer
 //! timesteps + 3-axis factorized 3-D RoPE (θ=10000) + 3-D patchify/unpatchify.
@@ -30,9 +32,12 @@
 //! S5 — dual-expert **MoE** routing ([`pipeline::denoise_moe`] + [`Expert`]): a per-step boundary
 //! swap (`t ≥ boundary·num_train`) between the high/low-noise experts, each with its own contexts,
 //! cross-KV, and guidance. Parity-gated e2e on two tiny seeded experts (both fired across the
-//! boundary). Live `Generator::generate` + the real-weight Wan2.2-T2V-A14B e2e remain (the cached
-//! `-Diffusers` checkpoint needs the original-layout checkpoint or a diffusers converter); it
-//! errors until then.
+//! boundary).
+//! S6 — the live `wan2_2_t2v_14b` [`Generator::generate`] ([`model::Wan14b`]): the staged product
+//! pipeline (UMT5 encode → two real 40-layer experts → `denoise_moe` → z16 VAE decode → RGB8
+//! frames), verified end-to-end on the **real converted Wan2.2-T2V-A14B checkpoint** against a
+//! `mlx_video`-reference golden on matched injected noise (`tests/s6_real_parity.rs`, `#[ignore]` —
+//! the 54 GB weights live outside CI; the tiny S1–S5 gates carry CI).
 
 pub mod config;
 pub mod model;
@@ -45,8 +50,8 @@ pub mod transformer;
 pub mod vae;
 
 pub use config::{GuideScale, WanModelConfig, SAMPLE_NEG_PROMPT};
-pub use model::{descriptor, load, Wan, MODEL_ID};
-pub use pipeline::{decode_to_frames, denoise, denoise_moe, Expert};
+pub use model::{descriptor, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID, MODEL_ID_T2V_14B};
+pub use pipeline::{decode_to_frames, denoise, denoise_moe, frames_to_images, Expert};
 pub use rope::{rope_apply, RopeTable};
 pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,
