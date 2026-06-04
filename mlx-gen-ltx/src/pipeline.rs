@@ -23,8 +23,10 @@
 use mlx_rs::ops::{add, broadcast_to, divide, maximum, minimum, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::Result;
+use mlx_gen::image::resize_lanczos_u8;
+use mlx_gen::{Error, Image, Result};
 
+use crate::conditioning::{apply_conditioning, apply_denoise_mask, I2vConditioning};
 use crate::transformer::{to_denoised, LtxDiT};
 use crate::upsampler::{upsample_latents, LatentUpsampler};
 use crate::vae::LtxVideoVae;
@@ -63,12 +65,16 @@ pub fn euler_step(x: &Array, denoised: &Array, sigma: f32, sigma_next: f32) -> R
     Ok(add(denoised, &step)?)
 }
 
-/// One stage's denoise loop. T2V distilled: **no CFG**, **legacy Euler**, no I2V state.
+/// One stage's denoise loop. Distilled: **no CFG**, **legacy Euler**.
 ///
-/// * `latents` — `(B, 128, F, H, W)` NCFHW, the stage's dtype (f32 here, S5 gate).
+/// * `latents` — `(B, 128, F, H, W)` NCFHW, the stage's dtype (f32 here, S5 gate). For I2V this is
+///   the conditioned + noised [`I2vConditioning::latent`].
 /// * `context` — `(B, ctx, inner)` text embeddings (the connector output / S6's text encoder).
 /// * `positions` — `(B, 3, S, 2)` position grid for this stage's latent dims.
 /// * `sigmas` — the stage schedule; `sigmas.len() − 1` denoise steps.
+/// * `state` — `None` for T2V (uniform per-token σ); `Some` for I2V (per-token `σ·mask`, with the
+///   denoised output blended toward the clean conditioning each step — the reference `denoise(...,
+///   state=...)` path that pins the conditioned frame).
 /// * `on_step` — progress callback, fired once per completed step.
 pub fn denoise(
     dit: &LtxDiT,
@@ -76,6 +82,7 @@ pub fn denoise(
     context: &Array,
     positions: &Array,
     sigmas: &[f32],
+    state: Option<&I2vConditioning>,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let dt = latents.dtype();
@@ -88,15 +95,23 @@ pub fn denoise(
         let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
         // (B, C, F, H, W) → (B, C, S) → (B, S, C) packed tokens.
         let flat = lat.reshape(&[b, c, -1])?.transpose_axes(&[0, 2, 1])?;
-        // Per-token timesteps = σ (uniform for T2V), shape (B, num_tokens) — matches the reference.
-        let ts = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[b, num_tokens])?;
+        // Per-token timesteps, shape (B, num_tokens): T2V → uniform σ; I2V → σ·mask (conditioned
+        // tokens get 0). Matches the reference `denoise`.
+        let ts = match state {
+            Some(st) => st.token_timesteps(sigma, h, w)?,
+            None => broadcast_to(&scalar(sigma).as_dtype(dt)?, &[b, num_tokens])?,
+        };
         let velocity = dit.forward(&flat, &ts, context, None, positions)?;
         // (B, S, C) → (B, C, S) → (B, C, F, H, W).
         let velocity = velocity
             .transpose_axes(&[0, 2, 1])?
             .reshape(&[b, c, f, h, w])?;
         let sig = scalar(sigma).as_dtype(dt)?;
-        let denoised = to_denoised(&lat, &velocity, &sig)?;
+        let mut denoised = to_denoised(&lat, &velocity, &sig)?;
+        // I2V: pin the conditioned frame(s) to the clean image latent (reference `apply_denoise_mask`).
+        if let Some(st) = state {
+            denoised = apply_denoise_mask(&denoised, &st.clean_latent, &st.denoise_mask)?;
+        }
         lat = euler_step(&lat, &denoised, sigma, sigma_next)?;
         mlx_rs::transforms::eval([&lat])?;
         on_step(i + 1);
@@ -140,6 +155,39 @@ pub fn to_uint8_frames(video: &Array) -> Result<Array> {
     contiguous(&scaled.as_dtype(Dtype::Uint8)?)
 }
 
+/// Prepare an I2V conditioning image for VAE encoding (reference `prepare_image_for_encoding` ∘
+/// `load_image`): PIL-LANCZOS scale the RGB8 image to the stage pixel resolution `(target_height,
+/// target_width)` (a no-op when already sized), normalize `[0,255] → [-1,1]`, and lay out as **NCFHW**
+/// `[1, 3, 1, H, W]` f32 — the single-frame video the [`LtxVideoVae::encode`](crate::vae::LtxVideoVae)
+/// expects. The reference resizes the *original* image directly to each stage's pixel resolution, so
+/// the caller passes `height/2 × width/2` for stage 1 and `height × width` for stage 2.
+pub fn preprocess_conditioning_image(
+    image: &Image,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Array> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    let (tw, th) = (target_width as usize, target_height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(Error::Msg(format!(
+            "I2V conditioning image pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    // PIL LANCZOS on the uint8 image (no-op when already at target size), matching `load_image`.
+    let resized: Vec<f32> = if (ih, iw) == (th, tw) {
+        image.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+    };
+    // /255 then [-1,1], as NHWC.
+    let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
+    let nhwc = Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]);
+    // NHWC → NCHW → insert the singleton temporal axis → (1, 3, 1, H, W).
+    let nchw = nhwc.transpose_axes(&[0, 3, 1, 2])?; // (1, 3, H, W)
+    Ok(nchw.reshape(&[1, 3, 1, th as i32, tw as i32])?)
+}
+
 /// The full 2-stage distilled T2V latent pipeline: stage-1 denoise → 2× upsample → re-noise →
 /// stage-2 denoise. `stage1_noise`/`stage2_noise` are the (injected) initial + re-noise samples,
 /// `context` the shared text embeddings, `*_positions` each stage's grid, `latent_{mean,std}` the VAE
@@ -163,6 +211,7 @@ pub fn generate_t2v_latents(
         context,
         stage1_positions,
         &STAGE1_SIGMAS,
+        None,
         on_step,
     )?;
     let lat = upsample_latents(&lat, upsampler, latent_mean, latent_std)?;
@@ -173,6 +222,74 @@ pub fn generate_t2v_latents(
         context,
         stage2_positions,
         &STAGE2_SIGMAS,
+        None,
+        on_step,
+    )
+}
+
+/// The full 2-stage distilled **I2V** latent pipeline (reference `generate.py` / `generate_av.py`
+/// video path with `state`): stage-1 condition + noise + conditioned denoise → 2× upsample → stage-2
+/// condition + re-noise + conditioned denoise. Differs from [`generate_t2v_latents`] only in the
+/// conditioning state: each stage injects its VAE-encoded image latent at `frame_idx` (clean latent +
+/// per-frame `1 − strength` mask), seeds the loop via the [`I2vConditioning::noised`] noiser (so the
+/// conditioned frame is pinned and the rest gets the stage's noise), and runs the conditioned denoise.
+///
+/// * `stage1_image_latent` `(B, 128, 1, h1, w1)` / `stage2_image_latent` `(B, 128, 1, h2, w2)` — the
+///   conditioning image VAE-encoded at each stage's latent resolution.
+/// * `stage1_noise` / `stage2_noise` — the stage noise (the reference draws fresh `normal`; the
+///   parity seam injects the reference samples). The conditioned frame ignores it (mask).
+/// * `frame_idx` / `strength` — single-image I2V uses `frame_idx = 0`; `strength = 1.0` fully pins
+///   the conditioned frame.
+///
+/// Returns the final full-res latents `(B, 128, F, h2, w2)`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_i2v_latents(
+    dit: &LtxDiT,
+    upsampler: &LatentUpsampler,
+    stage1_image_latent: &Array,
+    stage1_noise: &Array,
+    stage1_positions: &Array,
+    stage2_image_latent: &Array,
+    stage2_noise: &Array,
+    stage2_positions: &Array,
+    context: &Array,
+    latent_mean: &Array,
+    latent_std: &Array,
+    frame_idx: i32,
+    strength: f32,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<Array> {
+    // Stage 1: condition over a zero base, noise (σ₀ = 1.0), conditioned denoise. The image latent is
+    // cast to the base/noise dtype (the f32 VAE encoder feeds a bf16 path with a sub-ULP cast — the
+    // same post-encode quality island as the VAE decode; a no-op when both are already f32/bf16).
+    let zeros1 = Array::zeros::<f32>(stage1_noise.shape())?.as_dtype(stage1_noise.dtype())?;
+    let cond1 = stage1_image_latent.as_dtype(zeros1.dtype())?;
+    let st1 = apply_conditioning(&zeros1, &cond1, frame_idx, strength)?;
+    let st1 = st1.noised(stage1_noise, STAGE1_SIGMAS[0])?;
+    let lat = denoise(
+        dit,
+        &st1.latent,
+        context,
+        stage1_positions,
+        &STAGE1_SIGMAS,
+        Some(&st1),
+        on_step,
+    )?;
+
+    // Upsample 2×.
+    let lat = upsample_latents(&lat, upsampler, latent_mean, latent_std)?;
+
+    // Stage 2: condition over the upscaled latent, re-noise (σ₀ = STAGE2_SIGMAS[0]), conditioned denoise.
+    let cond2 = stage2_image_latent.as_dtype(lat.dtype())?;
+    let st2 = apply_conditioning(&lat, &cond2, frame_idx, strength)?;
+    let st2 = st2.noised(stage2_noise, STAGE2_SIGMAS[0])?;
+    denoise(
+        dit,
+        &st2.latent,
+        context,
+        stage2_positions,
+        &STAGE2_SIGMAS,
+        Some(&st2),
         on_step,
     )
 }
@@ -213,6 +330,33 @@ mod tests {
 
     fn arr(v: &[f32], shape: &[i32]) -> Array {
         Array::from_slice(v, shape)
+    }
+
+    #[test]
+    fn preprocess_conditioning_image_layout_and_norm() {
+        // 1×2 RGB image, white pixel then black pixel (HWC). No-op resize (target == source).
+        let image = Image {
+            width: 2,
+            height: 1,
+            pixels: vec![255, 255, 255, 0, 0, 0],
+        };
+        let got = preprocess_conditioning_image(&image, 2, 1).unwrap();
+        // NCFHW (1, 3, 1, 1, 2): 255 → 1.0, 0 → -1.0; each channel holds [w0=1, w1=-1].
+        assert_eq!(got.shape(), &[1, 3, 1, 1, 2]);
+        let c = mlx_rs::ops::reshape(&got, &[-1]).unwrap();
+        assert_eq!(c.as_slice::<f32>(), &[1.0, -1.0, 1.0, -1.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn preprocess_conditioning_image_resizes_to_target() {
+        // 4×4 → 2×2: LANCZOS path (values gated by core image tests); just check the output layout.
+        let image = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![128u8; 4 * 4 * 3],
+        };
+        let got = preprocess_conditioning_image(&image, 2, 2).unwrap();
+        assert_eq!(got.shape(), &[1, 3, 1, 2, 2]);
     }
 
     #[test]

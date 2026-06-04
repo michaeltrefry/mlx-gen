@@ -183,6 +183,7 @@ fn e2e_frames_match_reference() {
         ctx,
         &pos2,
         &STAGE2_SIGMAS,
+        None,
         &mut |_| {},
     )
     .expect("stage2");
@@ -287,6 +288,7 @@ fn e2e_frames_match_reference_bf16() {
         ctx,
         &pos2,
         &STAGE2_SIGMAS,
+        None,
         &mut |_| {},
     )
     .expect("stage2");

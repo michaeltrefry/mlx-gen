@@ -98,6 +98,7 @@ fn pipeline_matches_reference() {
         g.require("context").unwrap(),
         g.require("stage1_positions").unwrap(),
         &STAGE1_SIGMAS,
+        None,
         &mut |_| {},
     )
     .expect("stage1 denoise");
