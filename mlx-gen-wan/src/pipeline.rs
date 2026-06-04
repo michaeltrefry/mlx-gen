@@ -6,10 +6,13 @@
 //! expert runs (the MoE adds only the per-step boundary swap) and what the 5B runs (sc-2680, with
 //! its z48 VAE). The concrete `Generator::generate` wiring lands in `model.rs`.
 //!
-//! Shapes are channels-first **`[C, F, H, W]`** (no batch dim) throughout — matching
-//! [`WanTransformer::forward`] (one sample per call) and [`WanScheduler::step`]. CFG runs cond +
-//! uncond as two B=1 forwards (bit-identical to the reference's batched B=2, since attention never
-//! mixes batch elements — see the `forward` docs).
+//! Shapes are channels-first **`[C, F, H, W]`** (no batch dim) for the latents + scheduler. CFG runs
+//! cond + uncond as a **single batched B=2 forward** ([`WanTransformer::forward_cached`]) — the shared
+//! latent is patchified once and broadcast across the batch, so each per-step GPU kernel launches once
+//! instead of twice (the small-seq win, sc-2853); it stays bit-identical to two B=1 forwards since
+//! attention never mixes batch elements. The per-block cross-attention K/V and the RoPE cos/sin are
+//! **precomputed once per expert** before the loop (the reference's `prepare_cross_kv` / `prepare_rope`)
+//! and reused across all steps, instead of recomputed every forward.
 
 use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
@@ -94,9 +97,51 @@ fn cfg_combine(cond: &Array, uncond: &Array, gs: f32) -> Result<Array> {
     )?)
 }
 
-/// One denoise prediction: the CFG batched forward (`uncond + gs·(cond − uncond)`) when
-/// `ctx_uncond` is `Some`, else the B=1 cond-only forward. `ctx_*` are
-/// [`WanTransformer::embed_text`] outputs (`[1, text_len, dim]`, bf16).
+/// Per-generate caches for one transformer/expert, constant across every denoise step: the bf16 RoPE
+/// `(cos, sin)` for the (fixed) grid + each block's cross-attention K/V for the (CFG-batched) context.
+/// Mirrors the reference's `prepare_rope` / `prepare_cross_kv`, computed once before the loop.
+struct StepCache {
+    /// Per-block cross-attention `(k, v)`, each `[batch, n, text_len, d]` (bf16).
+    cross_kv: Vec<(Array, Array)>,
+    cos: Array,
+    sin: Array,
+    /// Forward batch width: 2 when CFG is on (cond+uncond stacked), else 1.
+    batch: usize,
+}
+
+/// Build the per-expert [`StepCache`] from the embedded contexts + the (constant) RoPE grid. When CFG
+/// is on (`ctx_uncond = Some`) the cond/uncond contexts are stacked on the batch axis so the cross-K/V
+/// is `B=2`; otherwise `B=1`. The caches are evaluated once here (the reference's `mx.eval(cross_kv,
+/// rope_cos_sin)`) so each per-step graph reuses them instead of recomputing.
+fn build_cache(
+    transformer: &WanTransformer,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    grid: (usize, usize, usize),
+) -> Result<StepCache> {
+    let (context_batch, batch) = match ctx_uncond {
+        Some(uncond) => (concatenate_axis(&[ctx_cond, uncond], 0)?, 2),
+        None => (ctx_cond.clone(), 1),
+    };
+    let cross_kv = transformer.prepare_cross_kv(&context_batch)?;
+    let (cos, sin) = transformer.prepare_rope(grid)?;
+    let mut to_eval: Vec<&Array> = vec![&cos, &sin];
+    for (k, v) in &cross_kv {
+        to_eval.push(k);
+        to_eval.push(v);
+    }
+    mlx_rs::transforms::eval(to_eval)?;
+    Ok(StepCache {
+        cross_kv,
+        cos,
+        sin,
+        batch,
+    })
+}
+
+/// One denoise prediction reusing the precomputed [`StepCache`]: a single batched forward yielding
+/// `[cond, uncond]`, combined as `uncond + gs·(cond − uncond)` when CFG is on, else the B=1 cond-only
+/// forward.
 ///
 /// `y` is the optional I2V channel-concat conditioning `[20, F, H, W]` (mirrors `WanModel.__call__`'s
 /// `y`): when `Some`, it is concatenated **onto the channel axis after** the `[16, …]` noise latent —
@@ -107,8 +152,7 @@ fn predict(
     transformer: &WanTransformer,
     latents: &Array,
     t: f32,
-    ctx_cond: &Array,
-    ctx_uncond: Option<&Array>,
+    cache: &StepCache,
     guidance: f32,
     y: Option<&Array>,
 ) -> Result<Array> {
@@ -116,13 +160,16 @@ fn predict(
         Some(y) => concatenate_axis(&[latents, y], 0)?,
         None => latents.clone(),
     };
-    match ctx_uncond {
-        Some(uncond_ctx) => {
-            let cond = transformer.forward(&x, t, ctx_cond)?;
-            let uncond = transformer.forward(&x, t, uncond_ctx)?;
-            cfg_combine(&cond, &uncond, guidance)
-        }
-        None => transformer.forward(&x, t, ctx_cond),
+    let preds =
+        transformer.forward_cached(&x, t, &cache.cross_kv, &cache.cos, &cache.sin, cache.batch)?;
+    if cache.batch == 2 {
+        // preds[0] = cond (context row 0), preds[1] = uncond (row 1).
+        cfg_combine(&preds[0], &preds[1], guidance)
+    } else {
+        Ok(preds
+            .into_iter()
+            .next()
+            .expect("B=1 forward yields one output"))
     }
 }
 
@@ -147,17 +194,13 @@ pub fn denoise(
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
+    // Precompute the RoPE + cross-K/V caches once (grid + context are constant across steps).
+    let grid = transformer.patch_grid(init_noise);
+    let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
+
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
-        let pred = predict(
-            transformer,
-            &latents,
-            t,
-            ctx_cond,
-            ctx_uncond,
-            guidance,
-            None,
-        )?;
+        let pred = predict(transformer, &latents, t, &cache, guidance, None)?;
         latents = sched.step(&pred, &latents)?;
         // Force evaluation each step to bound the lazy graph's peak memory (the reference's
         // per-step `mx.eval(latents)`).
@@ -206,18 +249,30 @@ pub fn denoise_moe(
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
+    // Precompute each expert's RoPE + cross-K/V caches once (the grid is shared — the channel-concat
+    // `y` doesn't change F/H/W — and each expert's contexts are constant across steps).
+    let grid = low.transformer.patch_grid(init_noise);
+    let low_cache = build_cache(
+        low.transformer,
+        &low.ctx_cond,
+        low.ctx_uncond.as_ref(),
+        grid,
+    )?;
+    let high_cache = build_cache(
+        high.transformer,
+        &high.ctx_cond,
+        high.ctx_uncond.as_ref(),
+        grid,
+    )?;
+
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
-        let e = if t >= boundary_timestep { high } else { low };
-        let pred = predict(
-            e.transformer,
-            &latents,
-            t,
-            &e.ctx_cond,
-            e.ctx_uncond.as_ref(),
-            e.guidance,
-            y,
-        )?;
+        let (e, cache) = if t >= boundary_timestep {
+            (high, &high_cache)
+        } else {
+            (low, &low_cache)
+        };
+        let pred = predict(e.transformer, &latents, t, cache, e.guidance, y)?;
         latents = sched.step(&pred, &latents)?;
         mlx_rs::transforms::eval([&latents])?;
         on_step(i + 1);
