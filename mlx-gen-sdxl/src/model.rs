@@ -13,9 +13,9 @@
 //! is wired and parity-proven.
 
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Result, WeightsSource,
+    default_seed, AlphaSchedule, Capabilities, Conditioning, ConditioningKind, DiffusionSampler,
+    Error, GenerationOutput, GenerationRequest, Generator, Image, LcmSampler, LightningSampler,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, TcdSampler, WeightsSource,
 };
 use mlx_rs::Dtype;
 
@@ -24,7 +24,7 @@ use crate::loader;
 use crate::pipeline::{
     decode_image, denoise, encode_conditioning, encode_init_latents, text_time_ids, Denoiser,
 };
-use crate::sampler::EulerSampler;
+use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
 use crate::tokenizer::ClipBpeTokenizer;
 use crate::unet::UNet2DConditionModel;
@@ -40,6 +40,30 @@ const DEFAULT_STRENGTH: f32 = 0.8;
 pub(crate) const DEFAULT_STEPS: u32 = 30;
 #[allow(dead_code)]
 pub(crate) const DEFAULT_GUIDANCE: f32 = 7.0;
+
+/// The few-step acceleration samplers (sc-2769). Selected per request via `req.sampler`; each is
+/// paired with its acceleration LoRA at load (`spec.adapters`) by the caller (the SceneWorks
+/// variant manifest, epic 2755) — selecting one without its LoRA loaded yields undertrained noise.
+pub(crate) const ACCEL_SAMPLERS: [&str; 3] = ["lcm", "lightning", "hyper"];
+
+/// `original_inference_steps` for the LCM/TCD timestep selection (diffusers' default).
+const LCM_ORIGINAL_STEPS: usize = 50;
+
+/// Per-variant few-step defaults `(steps, CFG, TCD eta)`, applied when the request omits `steps`/
+/// `guidance`. These are the **documented public** defaults — the sc-2758 A/B characterization that
+/// *locks* the per-variant table was not done at implementation time, so they live here as a
+/// one-line-per-variant re-tune (sc-2907). CFG is ≈1 for all three (Lightning/Hyper are trained
+/// CFG-free; LCM-LoRA runs at low/no CFG). Lightning's step count must match the loaded LoRA (2/4/8).
+fn accel_defaults(sampler: &str) -> (u32, f32, f32) {
+    match sampler {
+        "lcm" => (4, 1.0, 0.0),
+        "lightning" => (4, 1.0, 0.0),
+        // Hyper-SD: TCD, deterministic (eta=0) by default — works for the 1/2/4/8-step LoRAs; the
+        // unified LoRA's stochastic eta (~0.3) is a sc-2907 re-tune knob.
+        "hyper" => (4, 1.0, 0.0),
+        _ => (DEFAULT_STEPS, DEFAULT_GUIDANCE, 0.0),
+    }
+}
 
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TARGETS["sdxl"]`).
 pub const MODEL_ID: &str = "sdxl";
@@ -63,11 +87,11 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference],
             supports_lora: true,
             supports_lokr: true,
-            // Only the wired + parity-proven sampler is advertised. The fork's SDXL path uses the
-            // ancestral Euler step exclusively (there is no plain-`euler` SDXL golden), so a request
-            // naming any other sampler is rejected in `validate_request` rather than silently
-            // downgraded — same no-false-capability principle as the rest of this descriptor.
-            samplers: vec!["euler_ancestral"],
+            // `euler_ancestral` is the production default (full-CFG, 30-step); `lcm`/`lightning`/
+            // `hyper` are the few-step acceleration samplers (sc-2769), each driven by its diffusers-
+            // faithful schedule and paired with an acceleration LoRA at load. A request naming any
+            // other sampler is rejected in `validate_request` rather than silently downgraded.
+            samplers: vec!["euler_ancestral", "lcm", "lightning", "hyper"],
             schedulers: vec!["discrete"],
             min_size: 512,
             max_size: 2048,
@@ -79,8 +103,9 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// A loaded SDXL generator: the dual CLIP encoders + tokenizer, the U-Net, the VAE, and the
-/// Euler-Ancestral sampler, assembled from a snapshot directory.
+/// A loaded SDXL generator: the dual CLIP encoders + tokenizer, the U-Net, the VAE, the
+/// Euler-Ancestral sampler (production default), and the `alphas_cumprod` schedule the few-step
+/// acceleration samplers (LCM/Lightning/Hyper) build on — assembled from a snapshot directory.
 pub struct Sdxl {
     descriptor: ModelDescriptor,
     tokenizer: ClipBpeTokenizer,
@@ -89,6 +114,9 @@ pub struct Sdxl {
     unet: UNet2DConditionModel,
     vae: Autoencoder,
     sampler: EulerSampler,
+    /// DDPM `alphas_cumprod` from the SDXL `scaled_linear` betas — shared by the acceleration
+    /// samplers (sc-2769). Built once at load (the ancestral `sampler` keeps its own σ table).
+    alpha_schedule: AlphaSchedule,
 }
 
 /// Construct an [`Sdxl`] from a [`LoadSpec`].
@@ -166,6 +194,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         te2.quantize(bits)?;
     }
 
+    let cfg = DiffusionConfig::sdxl_base();
+    let alpha_schedule =
+        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end)?;
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
@@ -173,7 +204,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         te2,
         unet,
         vae,
-        sampler: EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, dtype),
+        sampler: EulerSampler::new_with_dtype(&cfg, true, dtype),
+        alpha_schedule,
     }))
 }
 
@@ -193,20 +225,37 @@ impl Generator for Sdxl {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
 
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
-        let cfg = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let sampler_name = req.sampler.as_deref().unwrap_or("euler_ancestral");
+        let is_accel = ACCEL_SAMPLERS.contains(&sampler_name);
+        // Per-variant defaults for the few-step samplers; the production defaults otherwise.
+        let (def_steps, def_cfg, eta) = if is_accel {
+            accel_defaults(sampler_name)
+        } else {
+            (DEFAULT_STEPS, DEFAULT_GUIDANCE, 0.0)
+        };
+        let steps = req.steps.unwrap_or(def_steps) as usize;
+        let cfg = req.guidance.unwrap_or(def_cfg);
         let cfg_on = cfg > 1.0;
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let reference = self.resolve_reference(req)?;
         let max_time = self.sampler.max_time();
 
+        // Acceleration variants are txt2img-only in v1 (epic 2755 "Image-only v1"); reject an init
+        // image rather than silently ignoring it.
+        if is_accel && reference.is_some() {
+            return Err(Error::Msg(format!(
+                "sdxl: the {sampler_name:?} acceleration sampler is txt2img-only (no img2img \
+                 reference) in this build"
+            )));
+        }
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             // One image per iteration (the vendored `_run_one`, n_images=1), each with its own seed.
             let seed = base_seed.wrapping_add(i as u64);
             // Seed the global RNG up front. Conditioning + VAE-encode draw no RNG, so the first draw
-            // is the init noise (txt2img prior / img2img add_noise) — matching the reference stream.
+            // is the init noise (the prior / img2img add_noise) — matching the reference stream.
             mlx_rs::random::seed(seed)?;
 
             let tokens = self
@@ -215,38 +264,42 @@ impl Generator for Sdxl {
             let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens)?;
             let time_ids = text_time_ids(pooled.shape()[0]);
 
-            // Init latents + the denoise start time/step count.
-            let (latents, start_time, eff_steps) = match reference {
-                Some((image, strength)) => {
-                    // img2img (the vendored `generate_latents_from_image`): VAE-encode the init image,
-                    // start at `max_time·strength`, run `int(steps·strength)` steps. Higher strength →
-                    // later start → fewer steps → output stays closer to the init.
-                    let strength = strength.unwrap_or(DEFAULT_STRENGTH).clamp(0.0, 1.0);
-                    let x_0 = encode_init_latents(&self.vae, image, req.width, req.height)?;
-                    let start_step = max_time * strength;
-                    let x_t = self.sampler.add_noise(&x_0, start_step)?;
-                    // Faithful to the reference's `int(num_steps · strength)` — NO min-1 floor.
-                    // strength ≤ 1/steps ⇒ 0 steps ⇒ the init latents are returned unchanged. A floor
-                    // here would force a denoise step at start_time 0, where σ = 0 makes the ancestral
-                    // `σ_up = sqrt(σ_prev²·(σ²−σ_prev²)/σ²)` divide 0/0 → NaN (a real strength=0 bug).
-                    let eff = (steps as f32 * strength) as usize;
-                    (x_t, start_step, eff)
-                }
-                None => {
-                    // txt2img: seeded prior.
-                    let prior = self.sampler.sample_prior(&[
-                        1,
-                        (req.height / 8) as i32,
-                        (req.width / 8) as i32,
-                        4,
-                    ])?;
-                    (prior, max_time, steps)
-                }
+            // Build the run's sampler + its seeded init latents. The denoise loop is driven entirely
+            // by the sampler's own schedule (`sampler.num_steps()`), so the trait owns the per-step
+            // timestep, the input scaling, and the step math.
+            let latent_shape = [1, (req.height / 8) as i32, (req.width / 8) as i32, 4];
+            let (latents, sampler): (mlx_rs::Array, Box<dyn DiffusionSampler + '_>) = if is_accel {
+                // Few-step acceleration (txt2img): unit-noise prior scaled into the sampler's space.
+                let s = self.build_accel_sampler(sampler_name, steps, eta);
+                let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
+                let lat = s.scale_initial_noise(&noise)?;
+                (lat, s)
+            } else if let Some((image, strength)) = reference {
+                // img2img (ancestral; the vendored `generate_latents_from_image`): VAE-encode the
+                // init, start at `max_time·strength`, run `int(steps·strength)` steps — NO min-1
+                // floor (strength ≤ 1/steps ⇒ 0 steps ⇒ init returned unchanged, dodging the σ=0
+                // ancestral `σ_up` 0/0 → NaN).
+                let strength = strength.unwrap_or(DEFAULT_STRENGTH).clamp(0.0, 1.0);
+                let x_0 = encode_init_latents(&self.vae, image, req.width, req.height)?;
+                let start_step = max_time * strength;
+                let x_t = self.sampler.add_noise(&x_0, start_step)?;
+                let eff = (steps as f32 * strength) as usize;
+                (
+                    x_t,
+                    Box::new(AncestralEuler::new(&self.sampler, eff, start_step)),
+                )
+            } else {
+                // txt2img (ancestral): seeded prior.
+                let prior = self.sampler.sample_prior(&latent_shape)?;
+                (
+                    prior,
+                    Box::new(AncestralEuler::new(&self.sampler, steps, max_time)),
+                )
             };
 
             let d = Denoiser {
                 unet: &self.unet,
-                sampler: &self.sampler,
+                sampler: sampler.as_ref(),
             };
             let latents = denoise(
                 &d,
@@ -254,8 +307,6 @@ impl Generator for Sdxl {
                 &conditioning,
                 &pooled,
                 &time_ids,
-                eff_steps,
-                start_time,
                 cfg,
                 &req.cancel,
                 on_progress,
@@ -269,6 +320,40 @@ impl Generator for Sdxl {
 }
 
 impl Sdxl {
+    /// Build the per-run few-step acceleration sampler (sc-2769). `name` is one of
+    /// [`ACCEL_SAMPLERS`]; `steps` is the inference step count (Lightning must match the loaded
+    /// LoRA's 2/4/8); `eta` is the TCD stochasticity (Hyper-SD). The samplers cast the U-Net input to
+    /// fp16 (the loaded compute dtype) and run their step math in f32.
+    fn build_accel_sampler(&self, name: &str, steps: usize, eta: f32) -> Box<dyn DiffusionSampler> {
+        let n_train = self.alpha_schedule.alphas_cumprod.len();
+        let sched = self.alpha_schedule.clone();
+        match name {
+            "lcm" => Box::new(LcmSampler::new(
+                sched,
+                n_train,
+                LCM_ORIGINAL_STEPS,
+                steps,
+                Dtype::Float16,
+            )),
+            "lightning" => Box::new(LightningSampler::new(
+                &sched,
+                n_train,
+                steps,
+                Dtype::Float16,
+            )),
+            "hyper" => Box::new(TcdSampler::new(
+                sched,
+                n_train,
+                LCM_ORIGINAL_STEPS,
+                steps,
+                eta,
+                Dtype::Float16,
+            )),
+            // `generate` only calls this for `name ∈ ACCEL_SAMPLERS`.
+            _ => unreachable!("build_accel_sampler: {name:?} is not an acceleration sampler"),
+        }
+    }
+
     /// Extract the single img2img init image + its strength from the request's conditioning (the
     /// per-reference strength wins over `req.strength`). SDXL img2img conditions on exactly one init
     /// image, so more than one `Reference` is an error.
@@ -431,16 +516,21 @@ mod tests {
             prompt: "a fox".into(),
             ..Default::default()
         };
-        // The wired sampler is accepted; an unset sampler is accepted (defaults to ancestral).
+        // The default + every wired sampler is accepted (an unset sampler defaults to ancestral).
         assert!(validate_request(&caps, &base).is_ok());
-        assert!(validate_request(
-            &caps,
-            &GenerationRequest {
-                sampler: Some("euler_ancestral".into()),
-                ..base.clone()
-            }
-        )
-        .is_ok());
+        for ok in ["euler_ancestral", "lcm", "lightning", "hyper"] {
+            assert!(
+                validate_request(
+                    &caps,
+                    &GenerationRequest {
+                        sampler: Some(ok.into()),
+                        ..base.clone()
+                    }
+                )
+                .is_ok(),
+                "sampler {ok:?} should be accepted"
+            );
+        }
         // `euler` (and any unknown sampler) is rejected, not silently downgraded.
         for bad in ["euler", "ddim", "nonsense"] {
             let err = validate_request(

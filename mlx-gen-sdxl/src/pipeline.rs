@@ -12,7 +12,7 @@ use mlx_rs::{random, Array};
 
 use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::{CancelFlag, Error, Image, Progress, Result};
+use mlx_gen::{CancelFlag, DiffusionSampler, Error, Image, Progress, Result};
 
 use crate::sampler::EulerSampler;
 use crate::text_encoder::ClipTextEncoder;
@@ -51,16 +51,19 @@ pub fn encode_conditioning(
     Ok((conditioning, o2.pooled))
 }
 
-/// Components needed for one denoise run (borrowed from the loaded model).
+/// Components needed for one denoise run (borrowed from the loaded model). `sampler` is any
+/// [`DiffusionSampler`] — SDXL's production ancestral [`crate::sampler::AncestralEuler`] or a
+/// few-step acceleration sampler (`mlx_gen::{LcmSampler, LightningSampler, TcdSampler}`, sc-2769).
 pub struct Denoiser<'a> {
     pub unet: &'a UNet2DConditionModel,
-    pub sampler: &'a EulerSampler,
+    pub sampler: &'a dyn DiffusionSampler,
 }
 
-/// Run the Euler-Ancestral denoise loop with CFG over `steps` from `start_time` down to 0 — txt2img
-/// passes `start_time = sampler.max_time()`, img2img passes `max_time · strength` (sc-2638).
-/// `latents` is the seeded init `[1, h, w, 4]`; `conditioning`/`pooled`/`time_ids` carry the CFG
-/// batch (B = 2 when `cfg > 1`). Returns the final latents; progress per step; `cancel` between steps.
+/// Run the denoise loop with CFG, driven entirely by the sampler's own schedule
+/// (`sampler.num_steps()` iterations). `latents` is the seeded init `[1, h, w, 4]`;
+/// `conditioning`/`pooled`/`time_ids` carry the CFG batch (B = 2 when `cfg > 1`). Returns the final
+/// latents; progress per step; `cancel` between steps. Each iteration:
+/// `x_in = scale_model_input(latents)` → U-Net eps → (CFG) → `latents = sampler.step(eps, latents)`.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise(
     d: &Denoiser,
@@ -68,35 +71,39 @@ pub fn denoise(
     conditioning: &Array,
     pooled: &Array,
     time_ids: &Array,
-    steps: usize,
-    start_time: f32,
     cfg: f32,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    let steps = d.sampler.num_steps();
     // A zero-step denoise (img2img at strength ≤ 1/steps) is a no-op: return the init latents
     // unchanged, matching the reference's `int(num_steps · strength)` loop count. Guards the
-    // degenerate `timesteps(0, ·)` (0/0) and the σ=0 ancestral step that would otherwise NaN.
+    // degenerate schedule and the σ=0 ancestral step that would otherwise NaN.
     if steps == 0 {
         return Ok(latents);
     }
     let cfg_on = cfg > 1.0;
     let total = steps as u32;
-    for (i, (t, t_prev)) in d
-        .sampler
-        .timesteps(steps, start_time)
-        .into_iter()
-        .enumerate()
-    {
+    for i in 0..steps {
         if cancel.is_cancelled() {
             return Err(Error::Msg("generation cancelled".into()));
         }
+        // Scale the latents into the model's input space: identity for the ancestral sampler (which
+        // folds the renormalization into its step → bit-identical to the pre-trait loop), `x/√(σ²+1)`
+        // for the Lightning Euler sampler. Acceleration samplers also cast to the U-Net compute dtype.
+        let x_in = d.sampler.scale_model_input(&latents, i)?;
         let x_unet = if cfg_on {
-            concatenate_axis(&[&latents, &latents], 0)?
+            concatenate_axis(&[&x_in, &x_in], 0)?
         } else {
-            latents.clone()
+            x_in
         };
-        let eps = d.unet.forward(&x_unet, t, conditioning, pooled, time_ids)?;
+        let eps = d.unet.forward(
+            &x_unet,
+            d.sampler.timestep(i),
+            conditioning,
+            pooled,
+            time_ids,
+        )?;
         let eps = if cfg_on {
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
             let eps_text = row(0)?;
@@ -113,7 +120,7 @@ pub fn denoise(
         } else {
             eps
         };
-        latents = d.sampler.step(&eps, &latents, t, t_prev)?;
+        latents = d.sampler.step(&eps, &latents, i)?;
         // Force evaluation each step (the reference's per-step `mx.eval`). Beyond bounding the lazy
         // graph, this materializes the global-RNG state split between steps so the ancestral noise
         // stream is byte-identical to the reference — leaving it lazy across all steps perturbs the

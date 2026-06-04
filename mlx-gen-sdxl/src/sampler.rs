@@ -13,7 +13,7 @@ use mlx_rs::ops::multiply;
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::array::scalar;
-use mlx_gen::Result;
+use mlx_gen::{DiffusionSampler, Result};
 
 use crate::config::{BetaSchedule, DiffusionConfig};
 
@@ -178,14 +178,22 @@ impl EulerSampler {
     /// The host `powf(-0.5)`→MLX `rsqrt` swap matters for the same reason. (The per-step `step()` math
     /// stays host f32 — already bit-exact, proven by `denoise_per_step_matches_golden`.)
     pub fn sample_prior(&self, shape: &[i32]) -> Result<Array> {
-        use mlx_rs::ops::{add, rsqrt, square};
         let noise = random::normal::<f32>(shape, None, None, None)?;
+        self.scale_prior_noise(&noise)
+    }
+
+    /// Scale already-drawn unit-normal `noise` into the prior latent space — the scaling half of
+    /// [`Self::sample_prior`], split out so the generic [`mlx_gen::DiffusionSampler`] denoise loop
+    /// can draw the noise itself and still reproduce the reference's exact op order. The two are
+    /// bit-identical (`sample_prior` = draw + `scale_prior_noise`).
+    ///
+    /// `(noise · σ_last) · rsqrt(σ_last²+1)` — reference order, in f32, then cast to the compute
+    /// dtype (the reference's `.astype(dtype)`), so a `float16=True` denoise starts from f16 latents.
+    pub fn scale_prior_noise(&self, noise: &Array) -> Result<Array> {
+        use mlx_rs::ops::{add, rsqrt, square};
         let s = scalar(*self.sigmas.last().unwrap());
         let factor = rsqrt(&add(&square(&s)?, scalar(1.0))?)?;
-        // (noise · σ_last) · rsqrt(…) — reference order, computed in f32, then cast to the compute
-        // dtype (the reference's `sample_prior(..., dtype=self.dtype)` `.astype(dtype)`), so the
-        // `float16=True` denoise starts from f16 latents. No-op for the f32 path.
-        let prior = multiply(&multiply(&noise, &s)?, &factor)?;
+        let prior = multiply(&multiply(noise, &s)?, &factor)?;
         Ok(prior.as_dtype(self.dtype)?)
     }
 
@@ -262,6 +270,49 @@ impl EulerSampler {
             let x = scaled_x(&subtract(&sigma_prev, &sigma)?)?;
             Ok(multiply(&x, &renorm)?)
         }
+    }
+}
+
+/// Adapts the SDXL ancestral [`EulerSampler`] to the generic [`mlx_gen::DiffusionSampler`] seam by
+/// baking in one run's schedule (`num_steps` from `start_time` down to 0). This is SDXL's production
+/// default sampler. [`DiffusionSampler::scale_model_input`] is the trait default (identity) because
+/// the ancestral step folds the input renormalization into itself — so routing the ancestral path
+/// through the trait is bit-identical to the pre-trait denoise loop (preserves the e2e 0.00%-px>8
+/// gate, sc-2400 S5). The few-step acceleration samplers (`LcmSampler`/`LightningSampler`/
+/// `TcdSampler`) live in `mlx_gen::sampler` and slot into the same loop.
+pub struct AncestralEuler<'a> {
+    inner: &'a EulerSampler,
+    /// `(t, t_prev)` per step — `EulerSampler::timesteps(num_steps, start_time)`.
+    schedule: Vec<(f32, f32)>,
+}
+
+impl<'a> AncestralEuler<'a> {
+    /// Bake in one run's schedule. `start_time` is `max_time` for txt2img, `max_time·strength` for
+    /// img2img; `num_steps` is the effective step count (img2img runs `int(steps·strength)`).
+    pub fn new(inner: &'a EulerSampler, num_steps: usize, start_time: f32) -> Self {
+        Self {
+            inner,
+            schedule: inner.timesteps(num_steps, start_time),
+        }
+    }
+}
+
+impl DiffusionSampler for AncestralEuler<'_> {
+    fn num_steps(&self) -> usize {
+        self.schedule.len()
+    }
+
+    fn timestep(&self, i: usize) -> f32 {
+        self.schedule[i].0
+    }
+
+    fn scale_initial_noise(&self, noise: &Array) -> Result<Array> {
+        self.inner.scale_prior_noise(noise)
+    }
+
+    fn step(&self, model_output: &Array, x: &Array, i: usize) -> Result<Array> {
+        let (t, t_prev) = self.schedule[i];
+        self.inner.step(model_output, x, t, t_prev)
     }
 }
 

@@ -21,6 +21,7 @@ pub mod nn;
 pub mod quant;
 pub mod registry;
 pub mod runtime;
+pub mod sampler;
 pub mod scheduler;
 pub mod tiling;
 pub mod tokenizer;
@@ -37,6 +38,7 @@ pub use registry::{load, load_transform, ModelRegistration, TransformRegistratio
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, Precision, Progress, Quant, WeightsSource,
 };
+pub use sampler::{AlphaSchedule, DiffusionSampler, LcmSampler, LightningSampler, TcdSampler};
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling};
 pub use transform::{

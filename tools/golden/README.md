@@ -72,6 +72,17 @@ See each script's module docstring for its exact env vars / arguments.
 | `flux2_e2e.safetensors` | `dump_flux2_e2e_golden.py` | `tests/e2e_real_weights.rs` | sc-2346 S4 txt2img e2e (256², 4 steps, guidance 1.0), f32. Gates: seeded noise byte-match, step-0 velocity (real-weights transformer, chaos-free) mean_rel ~4e-4, full `generate()` render ~0.9% px>8 vs the fork's f32 image (the residual is the NAX-vs-wheel build delta over the sampler). |
 | `flux2_edit.safetensors` | `dump_flux2_edit_golden.py` | `tests/edit_real_weights.rs` | sc-2346 S5 single-reference edit e2e (256², 4 steps), f32. Gates: reference-encoding chain (VAE-encode → patchify → BN-normalize → pack) mean_rel ~4e-4, full edit `generate()` render **0.00% px>8** vs the fork's f32 image (the dense ref conditioning makes the sampler even more stable than txt2img). Includes the 256²-resized `ref_u8` so the Rust test feeds byte-identical reference pixels. |
 
+### SDXL acceleration samplers (`mlx-gen-sdxl`, sc-2769)
+
+The few-step samplers (LCM / SDXL-Lightning / Hyper-SD) exist only in **diffusers**, so unlike the
+other SDXL goldens (vendored Apple `mlx_sd`) these are dumped from diffusers — run the script from a
+torch+diffusers venv (e.g. `/Users/michael/Repos/mflux/.venv` after `uv pip install diffusers`).
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `sdxl_accel_sched_golden.safetensors` | `dump_sdxl_accel_golden.py` (default) | `tests/accel_sampler_parity.rs` (core crate) | **Scheduler-math isolation:** per-step deterministic outputs of `LCMScheduler` / `EulerDiscreteScheduler(trailing)` / `TCDScheduler` on fixed synthetic tensors. Validates the Rust `mlx_gen::sampler` port to ~1e-6 (torch-f32 vs MLX-f32), no model needed. Small + fast. |
+| `sdxl_accel_render_{ancestral,lightning,hyper,lcm}.safetensors` (+ implied `.png` via the test) | `dump_sdxl_accel_golden.py render` | `mlx-gen-sdxl/tests/accel_real_weights.rs` (`lightning_hyper_match_torch_teacher_forced`) | **Deterministic e2e:** torch initial latent + final RGB8 per variant. The Rust test teacher-forces the init latent and reports px>8 vs the torch render (a *qualitative* torch↔MLX backend gap, NOT bit-exact). Needs the full fp16 SDXL pipeline + accel LoRAs. |
+
 ### Weight-independent
 
 | golden | dump script | consumed by | notes |
