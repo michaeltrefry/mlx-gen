@@ -142,9 +142,57 @@ fn wan_a14b_per_step_cached_vs_legacy() {
         }
     }
 
+    // --- cached + compiled glue (sc-2957): identical B=2 cached path, but the fusable elementwise
+    // chains (adaLN affine, gated residual, gated-GELU FFN activation, RoPE rotation) run through
+    // `mx.compile` so MLX fuses each into one kernel. Measured +14.1%/step at 480p×25f (23.07→19.81,
+    // bit-exact) — which MATCHES / beats the Python whole-model `mx.compile` ceiling (20.36 s/step,
+    // `tools/bench_wan_a14b.py`): per-chain compile closes the eager-vs-compiled gap; whole-graph
+    // compile would buy nothing further (sc-2957 finding — the "needs whole-graph" hunch was falsified). ---
+    mlx_gen_wan::transformer::set_compile_glue(true);
+    // Bit-exactness vs the eager cached path (the parity contract; batched_forward.rs CI-gates it).
+    let comp0 = dit
+        .forward_cached(&latent, t, &cross_kv, &cos, &sin, 2)
+        .unwrap();
+    let eag0 = {
+        mlx_gen_wan::transformer::set_compile_glue(false);
+        let e = dit
+            .forward_cached(&latent, t, &cross_kv, &cos, &sin, 2)
+            .unwrap();
+        mlx_gen_wan::transformer::set_compile_glue(true);
+        e
+    };
+    let max_diff: f32 = comp0
+        .iter()
+        .zip(eag0.iter())
+        .map(|(c, e)| {
+            let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(c, e).unwrap()).unwrap();
+            mlx_rs::ops::max(d, None).unwrap().item::<f32>()
+        })
+        .fold(0.0f32, f32::max);
+
+    let mut compiled = Vec::new();
+    for i in 0..(warmup + iters) {
+        let start = Instant::now();
+        let preds = dit
+            .forward_cached(&latent, t, &cross_kv, &cos, &sin, 2)
+            .unwrap();
+        let dt = timed(&[&preds[0], &preds[1]], start);
+        if i >= warmup {
+            compiled.push(dt);
+        }
+    }
+    mlx_gen_wan::transformer::set_compile_glue(false);
+
     let leg = median(legacy);
     let cac = median(cached);
+    let cmp = median(compiled);
     println!("[warm s/step] legacy(2×B1+recompute)={leg:.4}  cached(B2+stepcache)={cac:.4}  speedup={:.3}×", leg / cac);
+    println!(
+        "[warm s/step] cached(eager)={cac:.4}  cached(compiled-glue)={cmp:.4}  speedup={:.3}×  \
+         (recovers {:.1}% of step)  max|Δ| compiled-vs-eager={max_diff:.3e}",
+        cac / cmp,
+        (cac - cmp) / cac * 100.0
+    );
 
     // NOTE (sc-2853 measured finding): at the A14B's production geometries a single B=1 forward
     // already saturates the GPU, so batching B=2 buys no throughput and the cross-KV/RoPE recompute

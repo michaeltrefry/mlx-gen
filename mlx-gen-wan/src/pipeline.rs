@@ -194,6 +194,11 @@ pub fn denoise(
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
+    // sc-2957: run the DiT's fusable elementwise glue (adaLN affine, gated residual, gated-GELU FFN,
+    // RoPE rotation) through `mx.compile` — bit-exact (proven `max|Δ|=0` real + tiny, perf.rs /
+    // compile_parity.rs) and ~14% faster/step at production geometry. Process-global, idempotent.
+    crate::transformer::set_compile_glue(true);
+
     // Precompute the RoPE + cross-K/V caches once (grid + context are constant across steps).
     let grid = transformer.patch_grid(init_noise);
     let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
@@ -248,6 +253,9 @@ pub fn denoise_moe(
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
+
+    // sc-2957: compiled elementwise glue (bit-exact, ~14% faster/step) — see `denoise`.
+    crate::transformer::set_compile_glue(true);
 
     // Precompute each expert's RoPE + cross-K/V caches once (the grid is shared — the channel-concat
     // `y` doesn't change F/H/W — and each expert's contexts are constant across steps).

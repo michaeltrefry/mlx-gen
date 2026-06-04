@@ -24,18 +24,86 @@
 //! is **0.31.2** (which reworked the NAX bf16 kernels), so bf16 parity is exact only up to that
 //! cross-version kernel difference (f32 is bit-exact across the two) until the pin moves to 0.31.2.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
+use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, cos, multiply, sigmoid, sin, split};
+use mlx_rs::ops::{
+    add, broadcast_to, concatenate_axis, cos, multiply, power, sigmoid, sin, split, tanh,
+};
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{WanModelConfig, WanQuant};
 use crate::patchify::{patchify, unpatchify};
 use crate::rope::RopeTable;
 use crate::text_encoder::gelu_tanh;
+
+/// sc-2957: when on, the Wan DiT's fusable elementwise *glue* (adaLN affine, gated residual,
+/// gated-GELU FFN activation, RoPE rotation) runs through `mx.compile` so MLX fuses each chain into a
+/// single kernel (vs one Metal kernel per primitive op when eager) — **bit-exact** and **+14.1% /
+/// step** at production geometry (480p×25f A14B: 23.07→19.81 s/step, matching Python's whole-model
+/// `mx.compile` ceiling; `tests/perf.rs`). **Enabled by the production denoise loops** ([`denoise`](
+/// crate::pipeline::denoise) / [`denoise_moe`](crate::pipeline::denoise_moe)); left **off by default**
+/// so the tiny reference-parity gates run the eager form and `compile_parity.rs` can A/B both.
+static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable compiled elementwise glue (sc-2957). Process-global; set before the denoise loop.
+pub fn set_compile_glue(on: bool) {
+    COMPILE_GLUE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn compile_glue() -> bool {
+    COMPILE_GLUE.load(Ordering::Relaxed)
+}
+
+/// adaLN affine `m·(1+e_scale)+e_shift` — one fused kernel when compiled, else 2 eager ops. The
+/// `mx.compile` graph is bit-exact to the eager form (proven `max|Δ|=0`, `tests/compile_micro.rs`).
+fn modulate(m: &Array, e_scale: &Array, e_shift: &Array) -> Result<Array> {
+    let f = |(m, s, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(&multiply(m, &add(s, scalar(1.0))?)?, sh)
+    };
+    if compile_glue() {
+        Ok(compile(f, true)((m, e_scale, e_shift))?)
+    } else {
+        Ok(f((m, e_scale, e_shift))?)
+    }
+}
+
+/// Gated residual `x + y·gate` — one fused kernel when compiled.
+fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
+    let f = |(x, y, g): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(x, &multiply(y, g)?)
+    };
+    if compile_glue() {
+        Ok(compile(f, true)((x, y, gate))?)
+    } else {
+        Ok(f((x, y, gate))?)
+    }
+}
+
+/// Gated-GELU FFN activation. Body mirrors [`mlx_gen::nn::gelu_tanh`] exactly (bit-exact, dtype-
+/// preserving); when compiled, MLX fuses its ~8 elementwise ops into one kernel (the single biggest
+/// per-step glue cost — ~600 MB bf16 tensor × 40 layers, sc-2957). Off ⇒ defers to core `gelu_tanh`.
+fn gelu_ffn(x: &Array) -> Result<Array> {
+    if !compile_glue() {
+        return gelu_tanh(x);
+    }
+    let f = |x_: &Array| -> std::result::Result<Array, Exception> {
+        let dt = x_.dtype();
+        let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+        let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+        let x3 = power(x_, Array::from_int(3))?;
+        let inner = multiply(&add(x_, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+        let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+        multiply(&multiply(x_, &s(0.5)?)?, &gate)
+    };
+    Ok(compile(f, true)(x)?)
+}
 
 /// Load a biased `[out, in]` Linear as a core [`AdaptableLinear`] (every Wan DiT `nn.Linear` is
 /// biased). The dense base mirrors MLX's `nn.Linear` exactly — a **fused** `addmm(bias, x, Wᵀ)`
@@ -297,19 +365,19 @@ impl Block {
         let (e3, e4, e5) = (v(3)?, v(4)?, v(5)?);
 
         // Self-attention.
-        let x_mod = add(&multiply(&ln(x, self.eps)?, &add(&e1, scalar(1.0))?)?, &e0)?;
+        let x_mod = modulate(&ln(x, self.eps)?, &e1, &e0)?;
         let y = self.self_attn.forward(&x_mod, cos, sin)?;
-        let x = add(x, &multiply(&y, &e2)?)?;
+        let x = gated(x, &y, &e2)?;
 
         // Cross-attention (affine LayerNorm on context-side query, no modulation).
         let x_cross = layer_norm(&x, Some(&self.norm3_w), Some(&self.norm3_b), self.eps)?;
         let x = add(&x, &self.cross_attn.forward(&x_cross, kv)?)?;
 
         // Gated-GELU FFN (bf16 matmuls; the reference's `x.astype(w_dtype)`).
-        let x_mod = add(&multiply(&ln(&x, self.eps)?, &add(&e4, scalar(1.0))?)?, &e3)?;
-        let y = gelu_tanh(&self.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
+        let x_mod = modulate(&ln(&x, self.eps)?, &e4, &e3)?;
+        let y = gelu_ffn(&self.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
         let y = self.ffn_fc2.forward(&y)?;
-        Ok(add(&x, &multiply(&y, &e5)?)?)
+        gated(&x, &y, &e5)
     }
 }
 

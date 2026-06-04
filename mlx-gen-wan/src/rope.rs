@@ -16,10 +16,33 @@
 //! and RoPE is applied in **f32** in the attention path. Pairs are **interleaved**:
 //! `x.reshape(..., d/2, 2)` rotates `(x[2k], x[2k+1])` by `(cos[k], sin[k])`.
 
+use mlx_rs::error::Exception;
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 use mlx_gen::Result;
+
+/// The complex RoPE rotation `(a+bi)·(cos+sin·i)` → `(out_real, out_imag)`. When the sc-2957 compile
+/// toggle is on, MLX fuses the 4 multiplies + add/sub into one kernel (vs 6 eager ops on ~200 MB f32
+/// tensors, applied to both q and k every block). Bit-exact to the eager form.
+fn rope_rotate(x_real: &Array, x_imag: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
+    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
+        let (xr, xi, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+        let out_real = subtract(&multiply(xr, cos)?, &multiply(xi, sin)?)?;
+        let out_imag = add(&multiply(xr, sin)?, &multiply(xi, cos)?)?;
+        Ok(vec![out_real, out_imag])
+    };
+    let args = [x_real.clone(), x_imag.clone(), cos.clone(), sin.clone()];
+    let mut out = if crate::transformer::compile_glue() {
+        compile(f, true)(&args)?
+    } else {
+        f(&args)?
+    };
+    let imag = out.pop().unwrap();
+    let real = out.pop().unwrap();
+    Ok((real, imag))
+}
 
 const MAX_SEQ_LEN: usize = 1024;
 const ROPE_THETA: f64 = 10000.0;
@@ -161,8 +184,7 @@ pub fn rope_apply(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     let x_imag = parts[1].reshape(&[b, seq_len, n, half_d])?;
 
     // (a + bi)·(cos + sin·i) = (a·cos − b·sin) + (a·sin + b·cos)i.
-    let out_real = subtract(&multiply(&x_real, cos)?, &multiply(&x_imag, sin)?)?;
-    let out_imag = add(&multiply(&x_real, sin)?, &multiply(&x_imag, cos)?)?;
+    let (out_real, out_imag) = rope_rotate(&x_real, &x_imag, cos, sin)?;
 
     // Interleave back: concat on a new trailing axis → [b, seq_len, n, half_d, 2] → [b, seq_len, n, d].
     let real5 = out_real.reshape(&[b, seq_len, n, half_d, 1])?;
