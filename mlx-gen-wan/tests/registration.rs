@@ -413,6 +413,7 @@ fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
         path: dir.join("x.safetensors"),
         scale: 1.0,
         kind: AdapterKind::Lora,
+        pass_scales: None,
     }];
     assert!(registry::load(
         MODEL_ID_I2V_14B,
