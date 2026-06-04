@@ -12,7 +12,7 @@
 //! This crate self-registers `wan2_2_ti2v_5b` into the `mlx-gen` model registry; load it with
 //! `mlx_gen::load("wan2_2_ti2v_5b", spec)`.
 //!
-//! ## Status (S0–S4)
+//! ## Status (S0–S5)
 //! S0 — foundation: registry + config (`config.json`-driven, all Wan presets) + the three
 //! flow-match solvers (Euler / DPM++2M / UniPC default) with the shifted-sigma schedule + integer
 //! timesteps + 3-axis factorized 3-D RoPE (θ=10000) + 3-D patchify/unpatchify.
@@ -25,11 +25,14 @@
 //! text cross-attn, adaLN-6vec modulation, gated-GELU FFN, modulated head). f32 activations,
 //! parity-gated f32-against-f32 vs the reference (patch-embed bit-exact).
 //! S4 — the [`pipeline`] dense **T2V** machinery: resolution/seq-len math + the CFG denoise loop
-//! (`pipeline::denoise`) + VAE decode → uint8 frames (`pipeline::decode_to_frames`). The same loop
-//! each MoE expert runs (S5 adds boundary switching) and the 5B runs (sc-2680). Parity-gated e2e
-//! against the reference on a tiny seeded model (injected noise+context).
-//! `Generator::generate` is wired to a runnable model at S5 (real Wan2.2-T2V-A14B weights) / sc-2680
-//! (5B); it errors until then.
+//! (`pipeline::denoise`) + VAE decode → uint8 frames (`pipeline::decode_to_frames`). Parity-gated
+//! e2e against the reference on a tiny seeded model (injected noise+context).
+//! S5 — dual-expert **MoE** routing ([`pipeline::denoise_moe`] + [`Expert`]): a per-step boundary
+//! swap (`t ≥ boundary·num_train`) between the high/low-noise experts, each with its own contexts,
+//! cross-KV, and guidance. Parity-gated e2e on two tiny seeded experts (both fired across the
+//! boundary). Live `Generator::generate` + the real-weight Wan2.2-T2V-A14B e2e remain (the cached
+//! `-Diffusers` checkpoint needs the original-layout checkpoint or a diffusers converter); it
+//! errors until then.
 
 pub mod config;
 pub mod model;
@@ -43,7 +46,7 @@ pub mod vae;
 
 pub use config::{GuideScale, WanModelConfig, SAMPLE_NEG_PROMPT};
 pub use model::{descriptor, load, Wan, MODEL_ID};
-pub use pipeline::{decode_to_frames, denoise};
+pub use pipeline::{decode_to_frames, denoise, denoise_moe, Expert};
 pub use rope::{rope_apply, RopeTable};
 pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,

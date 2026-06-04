@@ -1,11 +1,10 @@
-//! S4 — the dense **T2V generation pipeline**: the denoise loop + CFG + VAE decode + frame
-//! assembly that turns a prompt into video frames. Port of `generate_wan.py`'s `generate_video`
-//! (the single-model, non-MoE path).
+//! S4/S5 — the **T2V generation pipeline**: the denoise loop + CFG + VAE decode + frame assembly
+//! that turns latents into video. Port of `generate_wan.py`'s `generate_video` — both the
+//! single-model dense path ([`denoise`], S4) and the dual-expert MoE path ([`denoise_moe`], S5).
 //!
-//! This is **reusable machinery**, not a model: the dense loop here is exactly what each expert of
-//! the Wan2.2-A14B dual-expert MoE runs (S5 adds the per-step boundary swap on top) and what the 5B
-//! runs (sc-2680, with its z48 VAE). The concrete `Generator::generate` wiring for a runnable model
-//! lands with those slices; S4 delivers + parity-gates the shared loop.
+//! This is **reusable machinery**, not a model: the dense loop is exactly what each Wan2.2-A14B MoE
+//! expert runs (the MoE adds only the per-step boundary swap) and what the 5B runs (sc-2680, with
+//! its z48 VAE). The concrete `Generator::generate` wiring lands in `model.rs`.
 //!
 //! Shapes are channels-first **`[C, F, H, W]`** (no batch dim) throughout — matching
 //! [`WanTransformer::forward`] (one sample per call) and [`WanScheduler::step`]. CFG runs cond +
@@ -62,11 +61,31 @@ fn cfg_combine(cond: &Array, uncond: &Array, gs: f32) -> Result<Array> {
     )?)
 }
 
-/// The dense denoise loop. `ctx_cond`/`ctx_uncond` are [`WanTransformer::embed_text`] outputs
-/// (`[1, text_len, dim]`, bf16); pass `ctx_uncond = None` for the CFG-disabled B=1 fast path.
-/// `init_noise` is `[C, F, H, W]` f32. Returns the denoised latents `[out_dim, F, H, W]` (f32).
-///
-/// `on_step(i)` is called after each completed step (progress reporting).
+/// One denoise prediction: the CFG batched forward (`uncond + gs·(cond − uncond)`) when
+/// `ctx_uncond` is `Some`, else the B=1 cond-only forward. `ctx_*` are
+/// [`WanTransformer::embed_text`] outputs (`[1, text_len, dim]`, bf16).
+fn predict(
+    transformer: &WanTransformer,
+    latents: &Array,
+    t: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    guidance: f32,
+) -> Result<Array> {
+    match ctx_uncond {
+        Some(uncond_ctx) => {
+            let cond = transformer.forward(latents, t, ctx_cond)?;
+            let uncond = transformer.forward(latents, t, uncond_ctx)?;
+            cfg_combine(&cond, &uncond, guidance)
+        }
+        None => transformer.forward(latents, t, ctx_cond),
+    }
+}
+
+/// The dense denoise loop (single model). `ctx_cond`/`ctx_uncond` are
+/// [`WanTransformer::embed_text`] outputs; pass `ctx_uncond = None` for the CFG-disabled B=1 fast
+/// path. `init_noise` is `[C, F, H, W]` f32. Returns the denoised latents `[out_dim, F, H, W]`
+/// (f32). `on_step(i)` is called after each completed step.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise(
     transformer: &WanTransformer,
@@ -86,17 +105,62 @@ pub fn denoise(
 
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
-        let pred = match ctx_uncond {
-            Some(uncond_ctx) => {
-                let cond = transformer.forward(&latents, t, ctx_cond)?;
-                let uncond = transformer.forward(&latents, t, uncond_ctx)?;
-                cfg_combine(&cond, &uncond, guidance)?
-            }
-            None => transformer.forward(&latents, t, ctx_cond)?,
-        };
+        let pred = predict(transformer, &latents, t, ctx_cond, ctx_uncond, guidance)?;
         latents = sched.step(&pred, &latents)?;
         // Force evaluation each step to bound the lazy graph's peak memory (the reference's
         // per-step `mx.eval(latents)`).
+        mlx_rs::transforms::eval([&latents])?;
+        on_step(i + 1);
+    }
+    Ok(latents)
+}
+
+/// One MoE expert: a full transformer + its own (per-model) embedded contexts + guidance scale.
+/// Wan2.2-A14B's "MoE" is two complete checkpoints, not token routing — each carries its own
+/// `text_embedding`, so contexts are embedded per expert.
+pub struct Expert<'a> {
+    pub transformer: &'a WanTransformer,
+    /// `embed_text` output for this expert (cond).
+    pub ctx_cond: Array,
+    /// `embed_text` output for this expert (uncond); `None` ⇒ CFG disabled for this expert.
+    pub ctx_uncond: Option<Array>,
+    /// This expert's guidance scale (the `low`/`high` of the dual `sample_guide_scale`).
+    pub guidance: f32,
+}
+
+/// The dual-expert MoE denoise loop (Wan2.2-A14B). Each step picks the **high-noise** expert while
+/// the integer timestep is `≥ boundary_timestep` (`config.boundary · num_train_timesteps`, e.g.
+/// `0.875 · 1000 = 875`) and the **low-noise** expert below it — switching the transformer, the
+/// per-expert contexts, and the per-expert guidance together. Reduces to [`denoise`] when both
+/// experts are the same model.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_moe(
+    low: &Expert,
+    high: &Expert,
+    boundary_timestep: f32,
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    init_noise: &Array,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<Array> {
+    let mut sched = make_scheduler(kind, num_train_timesteps);
+    sched.set_timesteps(steps, shift);
+    let timesteps: Vec<f32> = sched.timesteps().to_vec();
+
+    let mut latents = init_noise.clone();
+    for (i, &t) in timesteps.iter().enumerate() {
+        let e = if t >= boundary_timestep { high } else { low };
+        let pred = predict(
+            e.transformer,
+            &latents,
+            t,
+            &e.ctx_cond,
+            e.ctx_uncond.as_ref(),
+            e.guidance,
+        )?;
+        latents = sched.step(&pred, &latents)?;
         mlx_rs::transforms::eval([&latents])?;
         on_step(i + 1);
     }
