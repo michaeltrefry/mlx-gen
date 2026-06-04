@@ -23,6 +23,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource};
 use mlx_gen_qwen_image::{
     create_noise, decoded_to_image, denoise_with_progress, loader, qwen_scheduler, unpack_latents,
+    FlowMatchSampler,
 };
 use mlx_rs::Array;
 
@@ -103,13 +104,13 @@ fn transformer_pipeline_vae_matches_fork() {
     let noise = g.require("noise").unwrap().clone();
     let pos = g.require("prompt_embeds").unwrap();
     let neg = g.require("negative_prompt_embeds").unwrap();
-    let scheduler = qwen_scheduler(STEPS, WIDTH, HEIGHT);
+    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, WIDTH, HEIGHT));
     let latents = denoise_with_progress(
         &transformer,
-        &scheduler,
+        &sampler,
         noise,
         pos,
-        neg,
+        Some(neg),
         GUIDANCE,
         WIDTH,
         HEIGHT,
@@ -180,13 +181,13 @@ fn q_pipeline_matches_fork(golden_path: &str, bits: i32, max_latent_mean: f32, m
     let noise = g.require("noise").unwrap().clone();
     let pos = g.require("prompt_embeds").unwrap();
     let neg = g.require("negative_prompt_embeds").unwrap();
-    let scheduler = qwen_scheduler(STEPS, WIDTH, HEIGHT);
+    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, WIDTH, HEIGHT));
     let latents = denoise_with_progress(
         &transformer,
-        &scheduler,
+        &sampler,
         noise,
         pos,
-        neg,
+        Some(neg),
         GUIDANCE,
         WIDTH,
         HEIGHT,

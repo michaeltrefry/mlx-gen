@@ -22,10 +22,11 @@ use mlx_rs::{Array, Dtype};
 
 use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::loader;
-use crate::model::validate_request;
+use crate::model::{validate_request, LIGHTNING_SAMPLER};
 use crate::pipeline::{
     create_noise, decoded_to_image, denoise_edit_with_progress, qwen_scheduler, unpack_latents,
 };
+use crate::sampler::FlowMatchSampler;
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
 use crate::transformer::QwenTransformer;
@@ -38,6 +39,9 @@ use crate::vl_tokenizer::{
 const DEFAULT_STEPS: u32 = 4;
 /// Qwen-Image-Edit default CFG guidance (the fork's `guidance=4.0`).
 const DEFAULT_GUIDANCE: f32 = 4.0;
+/// Lightning default steps — must match the loaded LoRA variant (4-step / 8-step); 8 is the
+/// higher-quality default (e.g. `lightx2v/Qwen-Image-Edit-2511-Lightning` 8-step). sc-2909.
+const LIGHTNING_DEFAULT_STEPS: u32 = 8;
 
 /// Registry id for Qwen-Image-Edit.
 pub const MODEL_ID: &str = "qwen_image_edit";
@@ -61,7 +65,9 @@ pub fn descriptor() -> ModelDescriptor {
             // LoRA/LoKr wired (sc-2528): shared `QwenTransformer` host; stacked + mixed.
             supports_lora: true,
             supports_lokr: true,
-            samplers: Vec::new(),
+            // `lightning` = the few-step Lightning sampler (sc-2909), e.g.
+            // `lightx2v/Qwen-Image-Edit-2511-Lightning`; an unset sampler is the production path.
+            samplers: vec![LIGHTNING_SAMPLER],
             schedulers: Vec::new(),
             min_size: 256,
             max_size: 2048,
@@ -164,7 +170,16 @@ impl Generator for QwenImageEdit {
         let first = references[0];
         let last = *references.last().expect("validated non-empty");
 
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        // `req.sampler == "lightning"` selects the few-step Lightning recipe (sc-2909): static-shift
+        // schedule + CFG-off single forward + its own step default. Unset = production. The matching
+        // Edit Lightning LoRA must be supplied via `spec.adapters`.
+        let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
+        let default_steps = if is_lightning {
+            LIGHTNING_DEFAULT_STEPS
+        } else {
+            DEFAULT_STEPS
+        };
+        let steps = req.steps.unwrap_or(default_steps) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let (out_w, out_h) = (req.width, req.height);
@@ -188,13 +203,19 @@ impl Generator for QwenImageEdit {
             .collect();
         let vision = self.vl_encoder.encode_vision(&pre.pixel_values, &grids)?;
 
-        // Positive + negative conditioning embeds (f16): only the LM forward runs per prompt.
+        // Positive conditioning embeds (f16): only the LM forward runs per prompt. The negative
+        // branch is built only for true CFG — the Lightning LoRAs are CFG-distilled, so Lightning
+        // runs CFG-off (a single forward/step).
         let pos = self.encode_edit(&req.prompt, pre.n_image_tokens, &vision)?;
-        let neg = self.encode_edit(
-            req.negative_prompt.as_deref().unwrap_or(""),
-            pre.n_image_tokens,
-            &vision,
-        )?;
+        let neg = if is_lightning {
+            None
+        } else {
+            Some(self.encode_edit(
+                req.negative_prompt.as_deref().unwrap_or(""),
+                pre.n_image_tokens,
+                &vision,
+            )?)
+        };
 
         // Dual-latent references (static across steps + samples): VAE-encode **each** reference at
         // the VL resolution, pack, and concatenate over the sequence axis — one `cond_grid` per
@@ -214,19 +235,25 @@ impl Generator for QwenImageEdit {
             concatenate_axis(&packed.iter().collect::<Vec<_>>(), 1)?
         };
 
-        let scheduler = qwen_scheduler(steps, out_w, out_h);
+        // Build the sampler once (seed-independent): the static-shift Lightning schedule, or the
+        // production `qwen_scheduler` (resolution-dependent).
+        let sampler = if is_lightning {
+            FlowMatchSampler::lightning(steps)
+        } else {
+            FlowMatchSampler::new(qwen_scheduler(steps, out_w, out_h))
+        };
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
             let noise = create_noise(seed, out_w, out_h)?;
             let latents = denoise_edit_with_progress(
                 &self.transformer,
-                &scheduler,
+                &sampler,
                 noise,
                 &static_latents,
                 &cond_grids,
                 &pos,
-                &neg,
+                neg.as_ref(),
                 guidance,
                 out_w,
                 out_h,

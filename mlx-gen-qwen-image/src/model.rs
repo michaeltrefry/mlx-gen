@@ -23,6 +23,7 @@ use crate::pipeline::{
     add_noise_by_interpolation, create_noise, decoded_to_image, denoise_with_progress,
     encode_init_latents, init_time_step, qwen_scheduler, unpack_latents,
 };
+use crate::sampler::FlowMatchSampler;
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
@@ -34,13 +35,24 @@ const DEFAULT_GUIDANCE: f32 = 4.0;
 /// Empty/whitespace negative prompts fall back to a single space (the fork's `QwenPromptEncoder`).
 const NEGATIVE_FALLBACK: &str = " ";
 
+/// The few-step **Lightning** acceleration sampler (sc-2909): the official lightx2v
+/// Qwen-Image-Lightning recipe — static flow-match shift 3.0 (no terminal rescale) + CFG-off single
+/// forward. Selected per request via `req.sampler`; requires the matching distillation LoRA (e.g.
+/// `lightx2v/Qwen-Image-Lightning`) supplied via `spec.adapters`. `req.sampler == None` is the
+/// production flow-match path.
+pub(crate) const LIGHTNING_SAMPLER: &str = "lightning";
+/// Lightning default steps — must match the loaded LoRA variant (4-step or 8-step). 8 is the
+/// higher-quality default (the fork README's `--steps 8`); set `req.steps` to match a 4-step LoRA.
+const LIGHTNING_DEFAULT_STEPS: u32 = 8;
+
 /// Registry id for Qwen-Image (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "qwen_image";
 
 /// Qwen-Image's identity + capabilities — constructible without loading weights (registry
 /// introspection). This is the **T2I** variant (`qwen_image`), which also accepts a single init
 /// `Reference` image for **img2img** (sc-2530); Qwen-Image-Edit ships as a separate `qwen_image_edit`
-/// model (sc-2465). LoRA/LoKr is wired (sc-2528).
+/// model (sc-2465). LoRA/LoKr is wired (sc-2528). Few-step **Lightning** acceleration is exposed as
+/// the `lightning` sampler (sc-2909); an unset sampler is the production flow-match path.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -59,7 +71,10 @@ pub fn descriptor() -> ModelDescriptor {
             // transformer's `AdaptableHost`; stacked + mixed via the core seam.
             supports_lora: true,
             supports_lokr: true,
-            samplers: Vec::new(),
+            // `lightning` = the few-step Lightning acceleration sampler (sc-2909); an unset
+            // `req.sampler` is the production flow-match path. Any other name is rejected in
+            // `validate_request` rather than silently downgraded.
+            samplers: vec![LIGHTNING_SAMPLER],
             schedulers: Vec::new(),
             min_size: 256,
             max_size: 2048,
@@ -187,7 +202,15 @@ impl Generator for QwenImage {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
 
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        // `req.sampler == "lightning"` selects the few-step Lightning recipe (sc-2909): a static-shift
+        // schedule + CFG-off single forward + its own step default. An unset sampler is production.
+        let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
+        let default_steps = if is_lightning {
+            LIGHTNING_DEFAULT_STEPS
+        } else {
+            DEFAULT_STEPS
+        };
+        let steps = req.steps.unwrap_or(default_steps) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let base_seed = req.seed.unwrap_or_else(default_seed);
 
@@ -199,18 +222,35 @@ impl Generator for QwenImage {
             None => 0,
         };
         let is_img2img = start_step > 0;
+        // Lightning is the CFG-distilled few-step *txt2img* recipe; an init image (img2img) is out of
+        // scope (its blend seeds a different trajectory than the distillation targets).
+        if is_lightning && is_img2img {
+            return Err(Error::Msg(
+                "qwen_image: the lightning sampler is txt2img-only (no img2img init image)".into(),
+            ));
+        }
 
-        // Positive + negative conditioning (bf16). Empty negative → a single space (fork fallback).
+        // Positive conditioning (bf16) always. The negative branch is only built for true CFG; the
+        // Lightning LoRAs are CFG-distilled, so Lightning runs CFG-off (a single forward/step).
         let pos = self.encode_prompt(&req.prompt)?;
-        let neg_prompt = match req.negative_prompt.as_deref() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => NEGATIVE_FALLBACK,
+        let neg = if is_lightning {
+            None
+        } else {
+            let neg_prompt = match req.negative_prompt.as_deref() {
+                Some(s) if !s.trim().is_empty() => s,
+                _ => NEGATIVE_FALLBACK,
+            };
+            Some(self.encode_prompt(neg_prompt)?)
         };
-        let neg = self.encode_prompt(neg_prompt)?;
 
-        // The schedule is resolution-dependent but seed-independent — build it once. img2img indexes
-        // `sigmas[start_step]` for the blend, so this must match the fork's `config.scheduler.sigmas`.
-        let scheduler = qwen_scheduler(steps, req.width, req.height);
+        // Build the sampler once (seed-independent): the static-shift Lightning schedule, or the
+        // production `qwen_scheduler` (resolution-dependent; img2img indexes `sigma(start_step)` for
+        // the blend, so it must match the fork's `config.scheduler.sigmas`).
+        let sampler = if is_lightning {
+            FlowMatchSampler::lightning(steps)
+        } else {
+            FlowMatchSampler::new(qwen_scheduler(steps, req.width, req.height))
+        };
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -223,17 +263,17 @@ impl Generator for QwenImage {
                 // at `sigma = sigmas[init_time_step]` (the fork's `create_for_txt2img_or_img2img`).
                 let (image, _) = reference.expect("is_img2img implies a reference");
                 let clean = encode_init_latents(&self.vae, image, req.width, req.height)?;
-                let sigma = scheduler.sigmas[start_step];
+                let sigma = sampler.sigma(start_step);
                 add_noise_by_interpolation(&clean, &noise, sigma)?
             } else {
                 noise
             };
             let latents = denoise_with_progress(
                 &self.transformer,
-                &scheduler,
+                &sampler,
                 latents,
                 &pos,
-                &neg,
+                neg.as_ref(),
                 guidance,
                 req.width,
                 req.height,
@@ -291,6 +331,17 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
+    // Reject an unsupported sampler rather than silently downgrading it. An unset sampler is the
+    // production flow-match path; only the advertised names (`lightning`) are accepted.
+    if let Some(s) = &req.sampler {
+        if !caps.samplers.contains(&s.as_str()) {
+            return Err(Error::Msg(format!(
+                "qwen_image: unsupported sampler {s:?} (supported: {:?}, or unset for the \
+                 production flow-match path)",
+                caps.samplers
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -312,6 +363,36 @@ mod tests {
         assert!(d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.supports_true_cfg);
         assert!(d.capabilities.requires_sigma_shift);
+        // Lightning acceleration is advertised (sc-2909).
+        assert!(d.capabilities.samplers.contains(&LIGHTNING_SAMPLER));
+    }
+
+    #[test]
+    fn validate_sampler_selection() {
+        let caps = descriptor().capabilities;
+        // Unset sampler → the production flow-match path.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            ..Default::default()
+        };
+        assert!(validate_request(&caps, &req).is_ok());
+        // The advertised `lightning` sampler is accepted.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            sampler: Some(LIGHTNING_SAMPLER.into()),
+            ..Default::default()
+        };
+        assert!(validate_request(&caps, &req).is_ok());
+        // An unknown sampler is rejected, not silently downgraded.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            sampler: Some("lcm".into()),
+            ..Default::default()
+        };
+        let err = validate_request(&caps, &req)
+            .expect_err("expected an error")
+            .to_string();
+        assert!(err.contains("unsupported sampler"), "got: {err}");
     }
 
     #[test]

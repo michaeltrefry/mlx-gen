@@ -40,6 +40,74 @@ fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/golden")
 }
 
+/// Locate a file inside an HF-cache repo's `snapshots/<hash>/` dir (the first snapshot that has it).
+fn hf_cache_file(repo_dir: &str, filename: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let snaps = PathBuf::from(home).join(format!(".cache/huggingface/hub/{repo_dir}/snapshots"));
+    std::fs::read_dir(&snaps)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join(filename))
+        .find(|p| p.exists())
+}
+
+/// The cached lightx2v Lightning LoRAs to probe — the 8-step T2I and Edit-2511 variants (the 4-step
+/// variants share the identical per-block key structure). Skips any that aren't cached.
+fn lightning_loras() -> Vec<(&'static str, PathBuf)> {
+    let mut v = Vec::new();
+    if let Some(p) = hf_cache_file(
+        "models--lightx2v--Qwen-Image-Lightning",
+        "Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors",
+    ) {
+        v.push(("qwen-image-lightning-8step", p));
+    }
+    if let Some(p) = hf_cache_file(
+        "models--lightx2v--Qwen-Image-Edit-2511-Lightning",
+        "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors",
+    ) {
+        v.push(("qwen-image-edit-2511-lightning-8step", p));
+    }
+    v
+}
+
+/// sc-2909: the acceleration-LoRA **viability** gate the story is gated on. The real lightx2v
+/// Lightning LoRAs (T2I `Qwen-Image-Lightning` + `Qwen-Image-Edit-2511-Lightning`) load through
+/// `apply_qwen_adapters` with **zero silent drops** — every one of the 720 per-block targets
+/// (60 blocks × 12 modules: joint-attention q/k/v/out + add_q/k/v/to_add_out + img/txt MLP in/out)
+/// resolves on the real 60-block tree. The merge math itself is the sc-2528 seam (already proven
+/// bit-exact); this just confirms the Lightning files address modules the host map reaches.
+#[test]
+#[ignore = "needs real Qwen-Image weights + the cached lightx2v Lightning LoRAs"]
+fn lightning_loras_apply_cleanly() {
+    let loras = lightning_loras();
+    assert!(
+        !loras.is_empty(),
+        "no cached Lightning LoRAs found — download e.g. lightx2v/Qwen-Image-Lightning"
+    );
+    for (label, path) in loras {
+        // Fresh transformer per LoRA so each report reflects that file alone (no stacking).
+        let mut t = loader::load_transformer(&snapshot()).unwrap();
+        let report = apply_qwen_adapters(
+            &mut t,
+            &[AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lora)],
+        )
+        .unwrap_or_else(|e| panic!("{label} ({}) failed to apply: {e}", path.display()));
+        println!(
+            "{label}: applied {} module(s), unmatched {:?}",
+            report.applied, report.unmatched_paths
+        );
+        assert!(
+            report.unmatched_paths.is_empty(),
+            "{label}: {} unmatched target(s)",
+            report.unmatched_paths.len()
+        );
+        assert_eq!(
+            report.applied, 720,
+            "{label}: expected 720 per-block modules (60 blocks × 12)"
+        );
+    }
+}
+
 /// (1) The top-level `AdaptableHost` resolves every fork `QwenLoRAMapping` target (all per-block:
 /// the joint attention + the two stream MLPs; no globals) across the real 60-block tree, and
 /// rejects off-surface paths.

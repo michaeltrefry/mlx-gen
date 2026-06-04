@@ -12,7 +12,7 @@ use mlx_rs::{random, Array};
 
 use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Image, Progress, Result};
+use mlx_gen::{CancelFlag, DiffusionSampler, Error, FlowMatchEuler, Image, Progress, Result};
 
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
@@ -195,10 +195,18 @@ fn l2_over_channels(x: &Array) -> Result<Array> {
     Ok(add(&sq, scalar(1e-12))?.sqrt()?)
 }
 
-/// Flow-match Euler denoise loop with classifier-free guidance, progress, and cooperative
-/// cancellation. Each step runs the transformer twice (positive + negative conditioning),
-/// combines via [`compute_guided_noise`], and takes an Euler step. The fork passes the **raw
-/// sigma** (`scheduler.sigmas[t]`) as the transformer timestep. Returns the final packed latents.
+/// Flow-match denoise loop driven by a [`DiffusionSampler`] (the production [`FlowMatchSampler`]
+/// wrapping `qwen_scheduler`, or the few-step Lightning schedule — sc-2909), with progress and
+/// cooperative cancellation. The sampler owns the schedule (`num_steps`/`timestep`/`step`); Qwen
+/// feeds the **raw sigma** ([`DiffusionSampler::timestep`]) as the transformer timestep. Returns
+/// the final packed latents.
+///
+/// `neg_embeds` selects the guidance mode:
+/// - `Some(neg)` → **true CFG**: two forwards/step (positive + negative) combined via
+///   [`compute_guided_noise`] at `guidance` (the production path).
+/// - `None` → **CFG-off**: a single forward/step (the velocity *is* the positive prediction). This
+///   is the Lightning fast path — the distillation LoRAs are CFG-distilled, so the negative forward
+///   and norm-correction are skipped (a 2× saving on top of the few steps); `guidance` is ignored.
 ///
 /// `start_step` is the fork's `Config.init_time_step`: `0` for txt2img (loop over every step), or
 /// [`init_time_step`] for img2img (loop `range(init_time_step, steps)` so the blended init latents
@@ -206,10 +214,10 @@ fn l2_over_channels(x: &Array) -> Result<Array> {
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_with_progress(
     transformer: &QwenTransformer,
-    scheduler: &FlowMatchEuler,
+    sampler: &dyn DiffusionSampler,
     latents: Array,
     pos_embeds: &Array,
-    neg_embeds: &Array,
+    neg_embeds: Option<&Array>,
     guidance: f32,
     width: u32,
     height: u32,
@@ -219,18 +227,23 @@ pub fn denoise_with_progress(
 ) -> Result<Array> {
     let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
-    let total = (scheduler.num_steps() - start_step) as u32;
-    for t in start_step..scheduler.num_steps() {
+    let total = (sampler.num_steps() - start_step) as u32;
+    for t in start_step..sampler.num_steps() {
         if cancel.is_cancelled() {
             return Err(Error::Msg("generation cancelled".into()));
         }
-        let sigma = scheduler.sigmas[t];
+        let sigma = sampler.timestep(t);
         // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
         // proven maskless (see `build_joint_mask`).
         let pos = transformer.forward(&latents, pos_embeds, None, sigma, lh, lw, &[])?;
-        let neg = transformer.forward(&latents, neg_embeds, None, sigma, lh, lw, &[])?;
-        let guided = compute_guided_noise(&pos, &neg, guidance)?;
-        latents = scheduler.step(&latents, &guided, t)?;
+        let velocity = match neg_embeds {
+            Some(neg) => {
+                let neg = transformer.forward(&latents, neg, None, sigma, lh, lw, &[])?;
+                compute_guided_noise(&pos, &neg, guidance)?
+            }
+            None => pos,
+        };
+        latents = sampler.step(&velocity, &latents, t)?;
         on_progress(Progress::Step {
             current: (t - start_step) as u32 + 1,
             total,
@@ -239,19 +252,24 @@ pub fn denoise_with_progress(
     Ok(latents)
 }
 
-/// Qwen-Image-**Edit** dual-latent denoise loop. Each step concatenates the noise latents with the
-/// (static) packed reference latents over the sequence axis, runs the transformer with the
-/// reference `cond_grids` so the RoPE spans `[noise] + references`, slices the velocity back to the
-/// noise prefix, then applies CFG + an Euler step. Port of `QwenImageEdit.generate_image`'s loop.
+/// Qwen-Image-**Edit** dual-latent denoise loop, driven by a [`DiffusionSampler`] (sc-2909). Each
+/// step concatenates the noise latents with the (static) packed reference latents over the sequence
+/// axis, runs the transformer with the reference `cond_grids` so the RoPE spans `[noise] +
+/// references`, slices the velocity back to the noise prefix, then takes an Euler step. Port of
+/// `QwenImageEdit.generate_image`'s loop.
+///
+/// `neg_embeds` selects the guidance mode (as in [`denoise_with_progress`]): `Some(neg)` = true CFG
+/// (two forwards/step), `None` = CFG-off single forward (the Lightning fast path — the velocity is
+/// the positive prediction; `guidance` is ignored).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_edit_with_progress(
     transformer: &QwenTransformer,
-    scheduler: &FlowMatchEuler,
+    sampler: &dyn DiffusionSampler,
     latents: Array,
     static_image_latents: &Array,
     cond_grids: &[(usize, usize)],
     pos_embeds: &Array,
-    neg_embeds: &Array,
+    neg_embeds: Option<&Array>,
     guidance: f32,
     width: u32,
     height: u32,
@@ -260,25 +278,30 @@ pub fn denoise_edit_with_progress(
 ) -> Result<Array> {
     let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
-    let total = scheduler.num_steps() as u32;
-    for t in 0..scheduler.num_steps() {
+    let total = sampler.num_steps() as u32;
+    for t in 0..sampler.num_steps() {
         if cancel.is_cancelled() {
             return Err(Error::Msg("generation cancelled".into()));
         }
         let noise_seq = latents.shape()[1];
-        let sigma = scheduler.sigmas[t];
+        let sigma = sampler.timestep(t);
         let hidden = concatenate_axis(&[&latents, static_image_latents], 1)?;
         // `None` joint mask (as in T2I): the spliced prompt embeds are full-valid.
         let pos = slice_seq(
             &transformer.forward(&hidden, pos_embeds, None, sigma, lh, lw, cond_grids)?,
             noise_seq,
         )?;
-        let neg = slice_seq(
-            &transformer.forward(&hidden, neg_embeds, None, sigma, lh, lw, cond_grids)?,
-            noise_seq,
-        )?;
-        let guided = compute_guided_noise(&pos, &neg, guidance)?;
-        latents = scheduler.step(&latents, &guided, t)?;
+        let velocity = match neg_embeds {
+            Some(neg) => {
+                let neg = slice_seq(
+                    &transformer.forward(&hidden, neg, None, sigma, lh, lw, cond_grids)?,
+                    noise_seq,
+                )?;
+                compute_guided_noise(&pos, &neg, guidance)?
+            }
+            None => pos,
+        };
+        latents = sampler.step(&velocity, &latents, t)?;
         on_progress(Progress::Step {
             current: t as u32 + 1,
             total,

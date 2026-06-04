@@ -10,8 +10,11 @@
 //! sc-2348) and **Qwen-Image-Edit** (`qwen_image_edit`, sc-2465) — the causal-Conv3d VAE, the
 //! Qwen2.5-VL text encoder, the 60-layer dual-stream MMDiT, the Qwen2-VL image processor +
 //! Qwen2.5-VL vision transformer + reference-latent conditioning (Edit), and transformer-only
-//! Q4/Q8 quantization (sc-2565; the fork keeps the text encoder + VAE dense). LoRA/LoKr and
-//! multi-image Edit is not yet wired (sc-2529). LoRA/LoKr is wired (sc-2528).
+//! Q4/Q8 quantization (sc-2565; the fork keeps the text encoder + VAE dense). Also wired: LoRA/LoKr
+//! consumption (sc-2528), multi-image Edit (sc-2529), T2I img2img (sc-2530), and few-step
+//! **Lightning** acceleration — the `lightning` sampler ([`sampler::FlowMatchSampler`], sc-2909): the
+//! official lightx2v recipe (static flow-match shift 3.0, CFG-off single forward) for both T2I and
+//! Edit, requiring the matching distillation LoRA via `spec.adapters`.
 
 pub mod adapters;
 pub mod image_processor;
@@ -19,6 +22,7 @@ pub mod loader;
 pub mod model;
 pub mod model_edit;
 pub mod pipeline;
+pub mod sampler;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
@@ -37,6 +41,7 @@ pub use pipeline::{
     denoise_edit_with_progress, denoise_with_progress, encode_init_latents, init_time_step,
     pack_latents, preprocess_init_image, qwen_scheduler, unpack_latents,
 };
+pub use sampler::{FlowMatchSampler, LIGHTNING_SHIFT};
 pub use text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 pub use transformer::{QwenTransformer, QwenTransformerConfig};
 pub use vae::QwenVae;
