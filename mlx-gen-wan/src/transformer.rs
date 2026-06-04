@@ -344,9 +344,11 @@ impl Block {
         self.cross_attn.prepare_kv(context)
     }
 
-    /// `x`: `[B, L, dim]` (f32). `e`: `[1, 1, 6, dim]` f32 time modulation (the timestep is shared
-    /// across the CFG batch, so `e` broadcasts over `B` — every modulation/residual op below is
-    /// batch-broadcast, only the self/cross attention reshape to `B`).
+    /// `x`: `[B, L, dim]` (f32, `B` = CFG batch). `e`: `[1, L_e, 6, dim]` f32 time modulation —
+    /// `L_e = 1` for the **scalar** timestep (T2V; broadcasts over both tokens and the CFG batch),
+    /// `L_e = L` for the **per-token** timestep (TI2V mask-blend `t_tokens`, sc-2680; broadcasts over
+    /// the CFG batch only). Every modulation/residual op below is broadcast over `B`; only the
+    /// self/cross attention reshapes to `B`.
     fn forward(
         &self,
         x: &Array,
@@ -355,12 +357,13 @@ impl Block {
         cos: &Array,
         sin: &Array,
     ) -> Result<Array> {
-        // adaLN-6vec modulation, f32 (promotes the residual stream). [1,6,dim] + [1,1,6,dim] →
-        // [1,1,6,dim], split into 6 × [1,1,dim] (shift/scale/gate for self-attn, then FFN).
+        // adaLN-6vec modulation, f32 (promotes the residual stream). [1,6,dim] + [1,L_e,6,dim] →
+        // [1,L_e,6,dim], split into 6 × [1,L_e,dim] (shift/scale/gate for self-attn, then FFN).
         let dim = self.self_attn.num_heads as i32 * self.self_attn.head_dim as i32;
-        let m = add(&self.modulation, e)?; // [1, 1, 6, dim] f32
+        let m = add(&self.modulation, e)?; // [1, L_e, 6, dim] f32
+        let l_e = m.shape()[1];
         let p = split(&m, 6, 2)?;
-        let v = |i: usize| -> Result<Array> { Ok(p[i].reshape(&[1, 1, dim])?) };
+        let v = |i: usize| -> Result<Array> { Ok(p[i].reshape(&[1, l_e, dim])?) };
         let (e0, e1, e2) = (v(0)?, v(1)?, v(2)?);
         let (e3, e4, e5) = (v(3)?, v(4)?, v(5)?);
 
@@ -479,14 +482,40 @@ impl WanTransformer {
         Ok((e, e0))
     }
 
-    /// Output head: modulated LayerNorm + projection → `[1, L, out_dim·∏patch]` (f32).
+    /// Per-token time embedding `e` `[1, L, dim]` (f32) + the 6-vector modulation `e0`
+    /// `[1, L, 6, dim]` from a per-token timestep vector `t_tokens` `[1, L]` (the TI2V mask-blend
+    /// path, sc-2680 — first-frame tokens frozen at `t=0`). Mirrors `WanModel.__call__`'s `t.ndim==2`
+    /// branch (`sinusoidal_embedding_1d` over the `[1,L]` positions, then the same time MLP/projection).
+    fn time_embed_tokens(&self, t_tokens: &Array) -> Result<(Array, Array)> {
+        let l = t_tokens.shape()[1];
+        let pos = t_tokens.reshape(&[1, l, 1])?; // [1, L, 1]
+        let sinusoid = multiply(&pos, &self.inv_freq)?; // [1, L, half] f32
+        let sin_emb = concatenate_axis(&[&cos(&sinusoid)?, &sin(&sinusoid)?], 2)?; // [1, L, freq_dim]
+        let e = self
+            .time_embedding_1
+            .forward(&silu(&self.time_embedding_0.forward(&sin_emb)?)?)?; // [1, L, dim] f32
+        let e0 =
+            self.time_projection
+                .forward(&silu(&e)?)?
+                .reshape(&[1, l, 6, self.cfg.dim as i32])?; // [1, L, 6, dim] f32
+        Ok((e, e0))
+    }
+
+    /// Output head: modulated LayerNorm + projection → `[1, L, out_dim·∏patch]` (f32). `e` is the
+    /// time embedding `[1, dim]` (T2V) or per-token `[1, L, dim]` (TI2V, sc-2680); `head.modulation`
+    /// `[1,2,dim]` broadcasts over `L_e` either way (the reference `Head.__call__`'s `e.ndim` branch).
     fn apply_head(&self, x: &Array, e: &Array) -> Result<Array> {
         let dim = self.cfg.dim as i32;
-        // head.modulation [1,2,dim] + e [1,1,1,dim] → [1,1,2,dim], split into shift e0 / scale e1.
-        let m = add(&self.head_modulation, &e.reshape(&[1, 1, 1, dim])?)?;
+        let l_e = if e.shape().len() == 2 {
+            1
+        } else {
+            e.shape()[1]
+        };
+        // head.modulation [1,2,dim] + e [1,L_e,1,dim] → [1,L_e,2,dim], split into shift e0 / scale e1.
+        let m = add(&self.head_modulation, &e.reshape(&[1, l_e, 1, dim])?)?;
         let p = split(&m, 2, 2)?;
-        let e0 = p[0].reshape(&[1, 1, dim])?;
-        let e1 = p[1].reshape(&[1, 1, dim])?;
+        let e0 = p[0].reshape(&[1, l_e, dim])?;
+        let e1 = p[1].reshape(&[1, l_e, dim])?;
         let x_mod = add(
             &multiply(&ln(x, self.cfg.eps as f32)?, &add(&e1, scalar(1.0))?)?,
             &e0,
@@ -637,5 +666,82 @@ impl WanTransformer {
         Ok(preds
             .pop()
             .expect("forward_cached yields one output for batch=1"))
+    }
+
+    /// TI2V **per-token-timestep** batched DiT forward (sc-2680). Identical to [`forward_cached`](
+    /// Self::forward_cached) but the timestep is a **per-token** vector `t_tokens` `[1, L]` (`L` = the
+    /// patch-token count = the reference's `i2v_mask_tokens · timestep`), so each token carries its own
+    /// modulation — the mask-blend path freezes the first-frame tokens at `t = 0`. The per-token time
+    /// embedding `e0` `[1, L, 6, dim]` is shared across the CFG batch (cond/uncond use the same
+    /// timesteps), exactly like the scalar path's `e0`, so it broadcasts over `B` and the cond/uncond
+    /// branches diverge only at the first cross-attention. Mirrors `WanModel.__call__`'s `t.ndim == 2`
+    /// branch, run through the same cached/compiled machinery as T2V.
+    pub fn forward_tokens_cached(
+        &self,
+        latent: &Array,
+        t_tokens: &Array,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        batch: usize,
+    ) -> Result<Vec<Array>> {
+        let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
+        let l = (grid.0 * grid.1 * grid.2) as i32;
+        let dim = self.cfg.dim as i32;
+        let x1 = bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[1, l, dim])?;
+        let mut x = if batch > 1 {
+            broadcast_to(&x1, &[batch as i32, l, dim])?
+        } else {
+            x1
+        };
+
+        let (e, e0) = self.time_embed_tokens(t_tokens)?;
+
+        for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
+            x = block.forward(&x, &e0, kv, cos, sin)?;
+        }
+
+        let x = self.apply_head(&x, &e)?; // [batch, L, out_dim·∏patch] f32
+        let op = x.shape()[2];
+        if batch == 1 {
+            let xb = x.reshape(&[l, op])?;
+            return Ok(vec![unpatchify(
+                &xb,
+                grid,
+                self.cfg.out_dim,
+                self.cfg.patch_size,
+            )?]);
+        }
+        let mut out = Vec::with_capacity(batch);
+        for part in split(&x, batch as i32, 0)? {
+            let xb = part.reshape(&[l, op])?;
+            out.push(unpatchify(
+                &xb,
+                grid,
+                self.cfg.out_dim,
+                self.cfg.patch_size,
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// B=1 per-token convenience wrapper (builds the caches on the fly + runs [`forward_tokens_cached`]
+    /// for a single branch) — bit-identical to the cached TI2V denoise loop for one branch. Used by the
+    /// parity probes; the denoise loop ([`denoise_ti2v`](crate::pipeline::denoise_ti2v)) builds the
+    /// caches once per generate.
+    pub fn forward_tokens(
+        &self,
+        latent: &Array,
+        t_tokens: &Array,
+        context_embed: &Array,
+    ) -> Result<Array> {
+        let grid = self.patch_grid(latent);
+        let (cos_t, sin_t) = self.prepare_rope(grid)?;
+        let cross_kv = self.prepare_cross_kv(context_embed)?;
+        let mut preds =
+            self.forward_tokens_cached(latent, t_tokens, &cross_kv, &cos_t, &sin_t, 1)?;
+        Ok(preds
+            .pop()
+            .expect("forward_tokens_cached yields one output for batch=1"))
     }
 }

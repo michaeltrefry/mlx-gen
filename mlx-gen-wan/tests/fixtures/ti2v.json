@@ -1,0 +1,74 @@
+{
+  "config": {
+    "model_type": "t2v",
+    "model_version": "2.1",
+    "patch_size": [
+      1,
+      2,
+      2
+    ],
+    "text_len": 8,
+    "in_dim": 16,
+    "dim": 128,
+    "ffn_dim": 256,
+    "freq_dim": 256,
+    "text_dim": 32,
+    "out_dim": 16,
+    "num_heads": 1,
+    "num_layers": 2,
+    "window_size": [
+      -1,
+      -1
+    ],
+    "qk_norm": true,
+    "cross_attn_norm": true,
+    "eps": 1e-06,
+    "vae_stride": [
+      4,
+      8,
+      8
+    ],
+    "vae_z_dim": 16,
+    "dual_model": false,
+    "boundary": 0.0,
+    "sample_shift": 5.0,
+    "sample_steps": 50,
+    "sample_guide_scale": 5.0,
+    "num_train_timesteps": 1000,
+    "sample_fps": 16,
+    "frame_num": 81,
+    "sample_neg_prompt": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+    "max_area": 0,
+    "t5_vocab_size": 256384,
+    "t5_dim": 4096,
+    "t5_dim_attn": 4096,
+    "t5_dim_ffn": 10240,
+    "t5_num_heads": 64,
+    "t5_num_layers": 24,
+    "t5_num_buckets": 32
+  },
+  "steps": 4,
+  "shift": 5.0,
+  "guidance": 3.0,
+  "scheduler": "euler",
+  "frames": 5,
+  "height": 16,
+  "width": 16,
+  "seq_len": 2,
+  "grid": [
+    2,
+    1,
+    1
+  ],
+  "ctx_tokens": 4,
+  "z_dim": 16,
+  "t_lat": 2,
+  "h_lat": 2,
+  "w_lat": 2,
+  "final_latents_shape": [
+    16,
+    2,
+    2,
+    2
+  ]
+}

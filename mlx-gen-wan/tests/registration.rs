@@ -1,11 +1,11 @@
 //! Registry wiring + config-driven `load` for all Wan models.
 //!
-//! Verifies that `wan2_2_ti2v_5b` (dense 5B, `generate` still a WIP stub — sc-2680),
+//! Verifies that `wan2_2_ti2v_5b` (dense 5B, `generate` fully wired — sc-2680),
 //! `wan2_2_t2v_14b` (dual-expert MoE T2V, `generate` fully wired) and `wan2_2_i2v_14b` (dual-expert
 //! MoE channel-concat I2V, `generate` fully wired) each self-register with the right descriptor, that
 //! `load` reads the model's `config.json` (5B preset / dual-expert / i2v detection), that the 14B
-//! loaders reject a mismatched config, and that the not-yet-wired sibling features (quant / adapters
-//! / single-file source / precision override) are rejected for all.
+//! loaders reject a mismatched config, that Q4/Q8 + LoRA/LoKr are accepted at load (applied in
+//! generate), and that an invalid source / precision override is rejected for all.
 
 use std::path::PathBuf;
 
@@ -136,12 +136,17 @@ fn wan_is_registered() {
     assert!(d.capabilities.supports_guidance);
     assert!(d.capabilities.supports_negative_prompt);
     assert!(d.capabilities.supports_kv_cache);
-    assert!(!d.capabilities.supports_lora);
+    // LoRA (sc-2683) + LoKr (sc-2393) merge onto the single dense model at generate; Q4/Q8 (sc-2682)
+    // via spec.quantize.
+    assert!(d.capabilities.supports_lora);
+    assert!(d.capabilities.supports_lokr);
     assert!(d.capabilities.samplers.contains(&"unipc"));
+    // H/W align to patch×vae_stride = 32 for the z48 vae22 (spatial stride 16).
+    assert_eq!(d.capabilities.min_size, 32);
 }
 
 #[test]
-fn load_reads_config_and_stubs_generate() {
+fn load_reads_config_and_wires_generate() {
     let dir = temp_model_dir("load");
     let g = registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
         .expect("load should succeed (reads config.json)");
@@ -169,16 +174,20 @@ fn load_reads_config_and_stubs_generate() {
     };
     assert!(g.validate(&bad_frames).is_err());
 
-    // generate is an explicit WIP error until S1–S5.
+    // generate IS wired (sc-2680, no longer a WIP stub) — with only config.json in the dir it errors
+    // by trying to open the absent `t5_encoder.safetensors`, not by a scaffold/stub message.
     let mut noop = |_p| {};
     let err = g.generate(&ok, &mut noop).unwrap_err().to_string();
-    assert!(err.contains("S1"), "expected WIP message, got: {err}");
+    assert!(
+        !err.contains("scaffold") && !err.contains("not yet wired") && !err.contains("S1–S5"),
+        "5B generate must be wired (got a WIP stub message): {err}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn load_rejects_unwired_features() {
+fn load_rejects_bad_source_and_precision() {
     let dir = temp_model_dir("reject");
     // Single-file source.
     assert!(registry::load(
@@ -186,18 +195,26 @@ fn load_rejects_unwired_features() {
         &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
     )
     .is_err());
-    // Quantization (sc-2682) is wired at the transformer level (WanTransformer::quantize) but the
-    // 5B generate pipeline is still stubbed (sc-2680), so load() rejects a quant spec it cannot run.
+    // Precision override (the DiT runs bf16 GEMMs over an f32 residual — the parity regime).
+    let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
+    spec.precision = Precision::Fp32;
+    assert!(registry::load(MODEL_ID, &spec).is_err());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_accepts_quant_and_adapters() {
+    // Q4/Q8 (sc-2682) is now WIRED at load (the DiT is quantized lazily in generate); the e2e
+    // numerics ride the shared WanTransformer::quantize path.
+    let dir = temp_model_dir("quant");
     assert!(registry::load(
         MODEL_ID,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
     )
-    .is_err());
-    // Precision override (the dense path runs f32 activations).
-    let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
-    spec.precision = Precision::Fp32;
-    assert!(registry::load(MODEL_ID, &spec).is_err());
-    // Adapters (sc-2683 / sc-2393).
+    .is_ok());
+    // LoRA/LoKr (sc-2683 / sc-2393) are accepted at load — the file is read + merged in generate
+    // (which needs the real model weights), so load itself succeeds.
     let adapters = vec![AdapterSpec {
         path: dir.join("x.safetensors"),
         scale: 1.0,
@@ -209,7 +226,7 @@ fn load_rejects_unwired_features() {
         MODEL_ID,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(adapters)
     )
-    .is_err());
+    .is_ok());
 
     std::fs::remove_dir_all(&dir).ok();
 }

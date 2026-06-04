@@ -24,6 +24,7 @@ use mlx_gen::{Error, Image, Result};
 use crate::scheduler::{make_scheduler, SolverKind};
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
+use crate::vae22::Wan22Vae;
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
@@ -215,6 +216,94 @@ pub fn denoise(
     Ok(latents)
 }
 
+/// One TI2V prediction with **per-token timesteps**, reusing the precomputed [`StepCache`]: a single
+/// batched forward over the per-token timestep vector `t_tokens` `[1, L]` (mask-blend, sc-2680),
+/// combined as `uncond + gs·(cond − uncond)` when CFG is on, else the B=1 cond-only forward. Mirrors
+/// [`predict`] but routes through [`WanTransformer::forward_tokens_cached`].
+fn predict_tokens(
+    transformer: &WanTransformer,
+    latents: &Array,
+    t_tokens: &Array,
+    cache: &StepCache,
+    guidance: f32,
+) -> Result<Array> {
+    let preds = transformer.forward_tokens_cached(
+        latents,
+        t_tokens,
+        &cache.cross_kv,
+        &cache.cos,
+        &cache.sin,
+        cache.batch,
+    )?;
+    if cache.batch == 2 {
+        cfg_combine(&preds[0], &preds[1], guidance)
+    } else {
+        Ok(preds
+            .into_iter()
+            .next()
+            .expect("B=1 forward yields one output"))
+    }
+}
+
+/// The image-conditioned TI2V-5B **mask-blend** denoise loop (port of `generate_wan.py`'s
+/// `is_i2v_mask_blend` path, sc-2680). The first latent temporal frame is pinned to the encoded
+/// image `z_img` and *frozen*: every step (1) builds the per-token timestep vector `t_tokens =
+/// mask_tokens · t` (`0` for the first-frame tokens, so they carry timestep 0), (2) predicts the
+/// noise with [`predict_tokens`], (3) scheduler-steps, then (4) re-blends `latents = (1−mask)·z_img +
+/// mask·latents` so the first frame stays the conditioning image while the rest denoise.
+///
+/// `init_latents` is the pre-blended `[C,F,H,W]` start `(1−mask)·z_img + mask·noise`; `z_img` is the
+/// VAE-encoded image `[C,1,H,W]` (broadcasts over `F`); `mask` is `[C,F,H,W]` (`0` first frame, `1`
+/// rest); `mask_tokens` is `[1,L]` (`0` first-frame tokens, `1` rest), `L` = the patch-token count.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_ti2v(
+    transformer: &WanTransformer,
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    guidance: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    init_latents: &Array,
+    z_img: &Array,
+    mask: &Array,
+    mask_tokens: &Array,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<Array> {
+    let mut sched = make_scheduler(kind, num_train_timesteps);
+    sched.set_timesteps(steps, shift);
+    let timesteps: Vec<f32> = sched.timesteps().to_vec();
+
+    // sc-2957: compile the DiT's fusable elementwise glue (bit-exact, ~14% faster/step). The per-token
+    // modulation shapes differ from T2V's, so `mx.compile` simply re-traces them once; process-global.
+    crate::transformer::set_compile_glue(true);
+
+    // Precompute the RoPE + cross-K/V caches once (grid + context constant across steps), exactly like
+    // [`denoise`]. The per-token timesteps change each step (the only per-step DiT input besides the
+    // latent), so the time embedding is recomputed inside `forward_tokens_cached`.
+    let grid = transformer.patch_grid(init_latents);
+    let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
+
+    // `(1−mask)·z_img` — the frozen first-frame content (z_img broadcasts over F); precomputed once.
+    let one_minus_mask = subtract(scalar(1.0), mask)?;
+    let frozen = multiply(&one_minus_mask, z_img)?;
+
+    let mut latents = init_latents.clone();
+    for (i, &t) in timesteps.iter().enumerate() {
+        // Per-token timesteps: 0 for the first-frame tokens (frozen), `t` for the rest. (The 5B's
+        // seq_len equals the patch count, so no padding is needed — matches the reference.)
+        let t_tokens = multiply(mask_tokens, scalar(t))?;
+        let pred = predict_tokens(transformer, &latents, &t_tokens, &cache, guidance)?;
+        latents = sched.step(&pred, &latents)?;
+        // Re-apply the mask so the first frame stays pinned to the conditioning image.
+        latents = add(&frozen, &multiply(mask, &latents)?)?;
+        mlx_rs::transforms::eval([&latents])?;
+        on_step(i + 1);
+    }
+    Ok(latents)
+}
+
 /// One MoE expert: a full transformer + its own (per-model) embedded contexts + guidance scale.
 /// Wan2.2-A14B's "MoE" is two complete checkpoints, not token routing — each carries its own
 /// `text_embedding`, so contexts are embedded per expert.
@@ -311,6 +400,29 @@ pub fn decode_to_frames(
         .transpose_axes(&[1, 2, 3, 0])?; // [F,H,W,3]
                                          // [-1,1] → [0,255] uint8
     let scaled = multiply(&add(&chw, scalar(1.0))?, scalar(127.5))?;
+    let clamped = minimum(&maximum(&scaled, scalar(0.0))?, scalar(255.0))?;
+    Ok(clamped.as_dtype(mlx_rs::Dtype::Uint8)?)
+}
+
+/// Decode denoised z48 latents `[C, F, H, W]` → an RGB video tensor `[F_out, H_out, W_out, 3]` of
+/// `uint8` via the Wan **2.2** z48 [`Wan22Vae`] (sc-2680). The vae22 decoder is **channels-last** and
+/// emits `[1, F', 16H, 16W, 3]` in `[-1, 1]` directly (no `[1,3,F,H,W]` transpose, unlike the z16
+/// [`decode_to_frames`]); this drops the batch axis and maps `(v+1)/2·255` clamped. `tiling` →
+/// [`Wan22Vae::decode_tiled`] (memory-bounded); `None` is single-pass.
+pub fn decode_to_frames_22(
+    vae: &Wan22Vae,
+    latents: &Array,
+    tiling: Option<&TilingConfig>,
+) -> Result<Array> {
+    let video = match tiling {
+        Some(cfg) => vae.decode_tiled(latents, cfg)?,
+        None => vae.decode(latents)?,
+    };
+    // [1, F', H', W', 3] → [F', H', W', 3]; [-1,1] → [0,255] uint8.
+    let sh = video.shape();
+    let (f, h, w) = (sh[1], sh[2], sh[3]);
+    let frames = video.reshape(&[f, h, w, 3])?;
+    let scaled = multiply(&add(&frames, scalar(1.0))?, scalar(127.5))?;
     let clamped = minimum(&maximum(&scaled, scalar(0.0))?, scalar(255.0))?;
     Ok(clamped.as_dtype(mlx_rs::Dtype::Uint8)?)
 }
@@ -445,6 +557,73 @@ pub fn build_i2v_y(
     Ok(concatenate_axis(&[&mask, &z_video], 0)?)
 }
 
+// ===========================================================================================
+// TI2V-5B mask-blend conditioning (port of `generate_wan.py`'s `is_i2v_mask_blend` setup + i2v_utils)
+// ===========================================================================================
+
+/// Preprocess a TI2V conditioning image to **channels-last** `[1, 1, height, width, 3]` f32 in
+/// `[-1, 1]` (batch + temporal dims), the layout the z48 [`Wan22Vae::encode`] consumes. Reuses the
+/// PIL-exact cover-fit LANCZOS + center-crop pipeline of [`preprocess_i2v_image`] (which returns CHW),
+/// then moves channels last + adds the batch/temporal axes. Mirrors `i2v_utils.preprocess_image`.
+pub fn preprocess_ti2v_image(image: &Image, width: u32, height: u32) -> Result<Array> {
+    let chw = preprocess_i2v_image(image, width, height)?; // [3, H, W]
+    Ok(chw
+        .transpose_axes(&[1, 2, 0])?
+        .expand_dims(0)?
+        .expand_dims(0)?) // [1, 1, H, W, 3]
+}
+
+/// Build the TI2V-5B mask-blend tensors (port of `i2v_utils.build_i2v_mask`):
+///  - `mask` `[z, T_lat, h_lat, w_lat]` (f32): `0.0` for the first latent temporal frame (all
+///    channels/spatial), `1.0` elsewhere — the latent the first frame is frozen, the rest denoise.
+///  - `mask_tokens` `[1, L]` (f32): the channel-0 mask subsampled to the patch grid (`0.0` for the
+///    first-frame tokens, `1.0` for the rest), `L` = the DiT patch-token count `(T_lat/pt)·(h_lat/ph)·
+///    (w_lat/pw)`. Token order is temporal-slowest (matching [`crate::patchify::patchify`]).
+pub fn build_ti2v_mask(
+    z_dim: usize,
+    t_lat: usize,
+    h_lat: usize,
+    w_lat: usize,
+    patch_size: (usize, usize, usize),
+) -> (Array, Array) {
+    let plane = h_lat * w_lat;
+    // mask: 1.0 everywhere except temporal index 0 (= 0.0).
+    let mut mask = vec![1f32; z_dim * t_lat * plane];
+    for c in 0..z_dim {
+        let base = c * t_lat * plane; // temporal index 0 of channel c
+        for p in 0..plane {
+            mask[base + p] = 0.0;
+        }
+    }
+    let mask = Array::from_slice(
+        &mask,
+        &[z_dim as i32, t_lat as i32, h_lat as i32, w_lat as i32],
+    );
+
+    // mask_tokens: subsample channel 0 by the patch grid. mask is 0 only at temporal index 0, so a
+    // token is 0 iff its source temporal index `t'·pt == 0` (i.e. `t' == 0`) → the first `hg·wg`
+    // tokens (temporal-slowest order) are 0, the rest 1.
+    let (pt, ph, pw) = patch_size;
+    let (tg, hg, wg) = (t_lat / pt, h_lat / ph, w_lat / pw);
+    let mut tok = vec![1f32; tg * hg * wg];
+    for v in tok.iter_mut().take(hg * wg) {
+        *v = 0.0;
+    }
+    let mask_tokens = Array::from_slice(&tok, &[1, (tg * hg * wg) as i32]);
+    (mask, mask_tokens)
+}
+
+/// Blend the encoded image latent with the initial noise for the TI2V start: `latents = (1−mask)·
+/// z_img + mask·noise` (port of `generate_wan.py`'s `is_i2v_mask_blend` init). `z_img` is `[z,1,h,w]`
+/// (broadcasts over the noise's `T_lat`), `mask`/`noise` are `[z,T_lat,h,w]`.
+pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Array> {
+    let one_minus_mask = subtract(scalar(1.0), mask)?;
+    Ok(add(
+        &multiply(&one_minus_mask, z_img)?,
+        &multiply(mask, noise)?,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +682,31 @@ mod tests {
         let m = build_i2v_mask(2, 1, 1);
         assert_eq!(m.shape(), &[4, 2, 1, 1]);
         assert_eq!(m.as_slice::<f32>(), &[1., 0., 1., 0., 1., 0., 1., 0.]);
+    }
+
+    #[test]
+    fn build_ti2v_mask_freezes_first_frame() {
+        // z=2, T_lat=2, h=w=2, patch (1,2,2) → grid (2,1,1) → L=2 tokens.
+        let (mask, tokens) = build_ti2v_mask(2, 2, 2, 2, (1, 2, 2));
+        assert_eq!(mask.shape(), &[2, 2, 2, 2]);
+        // Per channel (8 vals): temporal 0 → 0.0 (4 spatial), temporal 1 → 1.0 (4 spatial).
+        assert_eq!(
+            mask.as_slice::<f32>(),
+            &[0., 0., 0., 0., 1., 1., 1., 1., 0., 0., 0., 0., 1., 1., 1., 1.]
+        );
+        // Token mask: first (t'=0) token frozen (0), second (t'=1) active (1).
+        assert_eq!(tokens.shape(), &[1, 2]);
+        assert_eq!(tokens.as_slice::<f32>(), &[0., 1.]);
+    }
+
+    #[test]
+    fn ti2v_blend_init_freezes_first_frame() {
+        // z=1,T=2,h=w=1: mask 0 at t=0, 1 at t=1. z_img=[9] (frame0), noise=[5,7].
+        let z_img = Array::from_slice(&[9.0f32], &[1, 1, 1, 1]);
+        let mask = Array::from_slice(&[0.0f32, 1.0], &[1, 2, 1, 1]);
+        let noise = Array::from_slice(&[5.0f32, 7.0], &[1, 2, 1, 1]);
+        let out = ti2v_blend_init(&z_img, &mask, &noise).unwrap();
+        // frame0 = z_img (9), frame1 = noise (7).
+        assert_eq!(out.as_slice::<f32>(), &[9.0, 7.0]);
     }
 }

@@ -38,6 +38,14 @@ impl VaeTiling {
         temporal_scale: 4,
         causal_temporal: false,
     };
+    /// Wan 2.2 z48 `vae22` VAE: spatial ×16 (8× conv upsample × 2× unpatchify), temporal ×4,
+    /// **causal** (`out_f = 1 + (f−1)·4` — the decoder runs `first_chunk=True`, so the leading
+    /// temporal-padding frames are trimmed). The 5B's TI2V-5B VAE (sc-2680).
+    pub const WAN22: Self = Self {
+        spatial_scale: 16,
+        temporal_scale: 4,
+        causal_temporal: true,
+    };
 }
 
 /// Per-frame spatial tiling (tile + overlap in **output pixels**).

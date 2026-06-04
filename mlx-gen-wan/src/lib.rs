@@ -13,8 +13,8 @@
 //! dual-expert MoE T2V, fully wired — `mlx_gen::load("wan2_2_t2v_14b", spec)` runs the complete
 //! pipeline), **`wan2_2_i2v_14b`** (the dual-expert MoE channel-concat image→video, fully wired —
 //! shares the T2V pipeline with the 20-channel `y` conditioning + in_dim-36 patch-embed, sc-2681) and
-//! **`wan2_2_ti2v_5b`** (the dense 5B, whose z48 VAE + dense denoise are sc-2680, so its `generate`
-//! still stubs).
+//! **`wan2_2_ti2v_5b`** (the dense 5B, fully wired — sc-2680: text→video plus native image-conditioned
+//! (TI2V) mask-blend video, with its own z48 [`Wan22Vae`]; Q4/Q8 + LoRA/LoKr supported).
 //!
 //! ## Status (S0–S6)
 //! S0 — foundation: registry + config (`config.json`-driven, all Wan presets) + the three
@@ -40,6 +40,14 @@
 //! frames), verified end-to-end on the **real converted Wan2.2-T2V-A14B checkpoint** against a
 //! `mlx_video`-reference golden on matched injected noise (`tests/s6_real_parity.rs`, `#[ignore]` —
 //! the 54 GB weights live outside CI; the tiny S1–S5 gates carry CI).
+//!
+//! sc-2680 — the dense **TI2V-5B** ([`model::Wan`]): the z48 [`Wan22Vae`] (`vae22`: channels-last
+//! causal-conv decoder/encoder, spatial 2×2 patchify, `DupUp3D`/`AvgDown3D`, RMS-L2 norm; gated by
+//! `tests/vae22_parity.rs`) + the dense [`Generator::generate`] — **T2V** ([`denoise`]) and
+//! **image-conditioned TI2V** mask-blend ([`denoise_ti2v`] + the DiT's per-token-timestep
+//! [`WanTransformer::forward_tokens`], gated by `tests/ti2v_parity.rs`). Q4/Q8 (`spec.quantize`) +
+//! LoRA/LoKr merge onto the single dense model. The full e2e on the real converted 5B checkpoint is
+//! `tests/ti2v_real_parity.rs` (`#[ignore]` — heavy weights outside CI).
 
 pub mod adapters;
 pub mod config;
@@ -51,6 +59,7 @@ pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
+pub mod vae22;
 
 pub use adapters::{merge_wan_adapters, WanLoraReport};
 pub use config::{GuideScale, WanModelConfig, WanQuant, SAMPLE_NEG_PROMPT};
@@ -59,8 +68,9 @@ pub use model::{
     MODEL_ID_I2V_14B, MODEL_ID_T2V_14B,
 };
 pub use pipeline::{
-    best_output_size, build_i2v_y, decode_to_frames, denoise, denoise_moe, frames_to_images,
-    preprocess_i2v_image, Expert,
+    best_output_size, build_i2v_y, build_ti2v_mask, decode_to_frames, decode_to_frames_22, denoise,
+    denoise_moe, denoise_ti2v, frames_to_images, preprocess_i2v_image, preprocess_ti2v_image,
+    ti2v_blend_init, Expert,
 };
 pub use rope::{rope_apply, RopeTable};
 pub use scheduler::{
@@ -70,3 +80,4 @@ pub use scheduler::{
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};
 pub use transformer::WanTransformer;
 pub use vae::WanVae;
+pub use vae22::Wan22Vae;

@@ -27,13 +27,15 @@ use mlx_rs::random;
 use crate::adapters::merge_wan_adapters;
 use crate::config::{GuideScale, WanModelConfig};
 use crate::pipeline::{
-    align_dim, best_output_size, build_i2v_y, decode_to_frames, denoise_moe, frames_to_images,
-    latent_shape, Expert,
+    align_dim, best_output_size, build_i2v_y, build_ti2v_mask, decode_to_frames,
+    decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images, latent_shape,
+    preprocess_ti2v_image, ti2v_blend_init, Expert,
 };
 use crate::scheduler::SolverKind;
 use crate::text_encoder::{load_tokenizer, Umt5Encoder};
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
+use crate::vae22::Wan22Vae;
 
 /// Public registry id: `mlx_gen::load("wan2_2_ti2v_5b", spec)`.
 pub const MODEL_ID: &str = "wan2_2_ti2v_5b";
@@ -51,10 +53,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_guidance: true,
             supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference],
-            // Q4/Q8 quantization (sc-2682) is wired via `spec.quantize`; LoRA/LoKr (sc-2683 /
-            // sc-2393) are sibling slices.
-            supports_lora: false,
-            supports_lokr: false,
+            // Q4/Q8 (sc-2682) loads via `spec.quantize` (transformer-only); LoRA/LoKr merge onto the
+            // single dense model at generate time (the reference `_loras_single` path — shared
+            // untagged specs only, reusing the sc-2683/sc-2393 `merge_wan_adapters` seam).
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec!["unipc", "euler", "dpmpp2m"],
             schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 32; cap the long edge at 1280 (max_area 704×1280).
@@ -70,60 +73,109 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// The loaded Wan model. S0 holds the resolved config; the network components (UMT5 TE, DiT, z48
-/// VAE) attach across S1–S5.
+/// The loaded Wan2.2 TI2V-5B (dense). Holds the resolved config + the snapshot directory; the heavy
+/// components (UMT5 TE, the single 5B DiT, the z48 vae22) are **staged** inside [`Wan::generate`] —
+/// loaded, used, then dropped in turn — to bound peak memory (mirrors `generate_wan.py`, which never
+/// holds the T5 encoder + the 10 GB transformer resident at once).
 pub struct Wan {
     descriptor: ModelDescriptor,
-    #[allow(dead_code)] // consumed by the S1–S5 pipeline.
     config: WanModelConfig,
+    root: PathBuf,
+    /// LoRA/LoKr adapters merged onto the single dense model at generate time (the reference
+    /// `_loras_single` path). Empty for a plain load. `moe_expert`-tagged specs are rejected (dense).
+    adapters: Vec<AdapterSpec>,
+    /// Optional Q4/Q8 quantization for the transformer (sc-2682). `None` = dense bf16 (or a
+    /// pre-quantized snapshot, which `from_weights` builds packed from its `config.json` manifest).
+    quant: Option<Quant>,
 }
 
 impl Wan {
-    /// The resolved model config (exposed for the S1–S5 pipeline slices + tests).
+    /// The resolved model config (exposed for tests).
     pub fn config(&self) -> &WanModelConfig {
         &self.config
     }
+
+    /// Merge the load-time LoRA/LoKr adapters onto the single dense model weight map in place,
+    /// before the [`WanTransformer`] is built. No-op without adapters. The dense 5B has no MoE
+    /// experts, so it takes only **shared** (untagged) specs — the reference's `_loras_single`
+    /// (`--lora`, not `--lora-high/low`); a `moe_expert`-tagged spec is a misconfiguration here.
+    /// Reuses the sc-2683/sc-2393 [`merge_wan_adapters`] seam (`MoeExpert::High` ⇒ only the
+    /// `moe_expert == None` pass fires, since all specs are untagged).
+    fn merge_adapters(&self, w: &mut Weights) -> Result<()> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        if self.config.quantization.is_some() {
+            return Err(Error::Msg(format!(
+                "{}: LoRA adapters on a pre-quantized snapshot need dequantize-then-merge (the \
+                 reference loading.py path), not yet wired — load a dense bf16 snapshot (LoRA \
+                 merges, then `spec.quantize` quantizes the merged weights), or drop the adapters",
+                self.descriptor.id
+            )));
+        }
+        if self.adapters.iter().any(|s| s.moe_expert.is_some()) {
+            return Err(Error::Msg(format!(
+                "{}: `moe_expert` (high/low) tagging is only for the dual-expert A14B — the dense \
+                 5B takes shared (untagged) adapters",
+                self.descriptor.id
+            )));
+        }
+        let report = merge_wan_adapters(w, &self.adapters, MoeExpert::High)?;
+        if report.applied == 0 {
+            return Err(Error::Msg(format!(
+                "{}: {} adapter file(s) matched no module — check the format (PEFT `lora_A/B` or \
+                 kohya `lora_down/up`, `diffusion_model.`-prefixed Wan module names)",
+                self.descriptor.id,
+                self.adapters.len()
+            )));
+        }
+        if !report.skipped.is_empty() {
+            eprintln!(
+                "{}: {} adapter target(s) not present in this checkpoint, skipped: {:?}",
+                self.descriptor.id,
+                report.skipped.len(),
+                report.skipped
+            );
+        }
+        Ok(())
+    }
 }
 
-/// Load the model from a snapshot directory. Reads + resolves `config.json` (the config seam). The
-/// 5B path runs f32 activations (quality + dodging the pmetal bf16 GEMM bug); quantization and
-/// adapters are sibling slices, rejected here for now.
+/// Load the Wan2.2 TI2V-5B from a converted MLX snapshot directory (`convert_wan.py` output:
+/// `model.safetensors` + `t5_encoder.safetensors` + `vae.safetensors` + `tokenizer.json` +
+/// `config.json`). The DiT runs bf16 GEMMs over an f32 residual (the S3 parity regime). Q4/Q8
+/// (sc-2682) loads via `spec.quantize` or a pre-quantized snapshot; LoRA/LoKr (sc-2683 / sc-2393)
+/// merge onto the single dense model at generate time.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p,
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "wan2_2_ti2v_5b: expected a model directory (split-weight snapshot), not a single \
-                 file"
-                    .into(),
-            )),
-        };
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => return Err(Error::Msg(
+            "wan2_2_ti2v_5b: expected a model directory (converted MLX snapshot), not a single file"
+                .into(),
+        )),
+    };
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
-            "wan2_2_ti2v_5b: precision override is not wired (the dense path runs f32 activations)"
+            "wan2_2_ti2v_5b: precision override is not wired (the DiT runs bf16 GEMMs over an f32 \
+             residual stream — the parity regime)"
                 .into(),
         ));
     }
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(
-            "wan2_2_ti2v_5b: Q4/Q8 quantization (sc-2682) is wired at the transformer level \
-             (WanTransformer::quantize) but the 5B generate pipeline itself is still stubbed \
-             (sc-2680), so it cannot run end-to-end yet"
-                .into(),
-        ));
+    let config = WanModelConfig::from_model_dir(&root)?;
+    if config.dual_model || !config.is_ti2v() {
+        return Err(Error::Msg(format!(
+            "wan2_2_ti2v_5b: config.json is not the dense TI2V-5B (model_type={}, dual_model={}); \
+             expected the converted Wan2.2 TI2V-5B checkpoint (model_type=ti2v, dual_model=false)",
+            config.model_type, config.dual_model
+        )));
     }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "wan2_2_ti2v_5b: adapters are moot until the dense 5B denoise/generate lands (sc-2680); \
-             LoRA-in-generate is wired for the live A14B experts (sc-2683)"
-                .into(),
-        ));
-    }
-
-    let config = WanModelConfig::from_model_dir(root)?;
+    let quant = resolve_load_time_quant(MODEL_ID, &config, spec.quantize)?;
     Ok(Box::new(Wan {
         descriptor: descriptor(),
         config,
+        root,
+        adapters: spec.adapters.clone(),
+        quant,
     }))
 }
 
@@ -153,17 +205,173 @@ impl Generator for Wan {
         Ok(())
     }
 
+    /// The dense 5B pipeline (port of `generate_wan.py`'s single-model path, sc-2680) — **T2V** when
+    /// no image is given, **TI2V** mask-blend when a `Reference` image is. Resolves request knobs,
+    /// then **stages** the phases to bound memory: (1) UMT5 encode the prompt (+ neg, unless CFG is
+    /// off); (1b, TI2V) load the z48 vae22, encode the conditioning image → `z_img`, build the
+    /// first-frame mask + per-token mask, blend the noise init; (2) load the 5B DiT (merge adapters,
+    /// quantize), embed the contexts, run the dense [`denoise`] (T2V) or [`denoise_ti2v`] mask-blend
+    /// loop; (3) load the vae22 decoder → RGB8 frames. CFG runs with the single guidance scale.
     fn generate(
         &self,
-        _req: &GenerationRequest,
-        _on_progress: &mut dyn FnMut(Progress),
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        Err(Error::Msg(
-            "wan2_2_ti2v_5b: the T2V/TI2V denoise pipeline is not yet wired — S0 ships the \
-             scaffold, config, 3 flow-match solvers, 3-axis RoPE, and 3-D patchify; the UMT5 TE / \
-             z48 VAE / DiT / pipeline land in S1–S5 (sc-2678 / sc-2680)"
-                .into(),
-        ))
+        let cfg = &self.config;
+
+        // --- Resolve request knobs against config defaults ---
+        let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
+        let trim = req.trim_first_frames.unwrap_or(0) as usize;
+        let trim_out = trim * cfg.vae_stride.0; // discarded output frames = trim · 4
+        let gen_frames = frames + trim_out;
+        let mut width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
+        let mut height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
+        // Enforce the model's max-area cap (704×1280) with an aspect-preserving, grid-aligned fit.
+        if cfg.max_area > 0 && (width as usize) * (height as usize) > cfg.max_area {
+            let dw = (cfg.patch_size.2 * cfg.vae_stride.2) as u32;
+            let dh = (cfg.patch_size.1 * cfg.vae_stride.1) as u32;
+            (width, height) = best_output_size(width, height, dw, dh, cfg.max_area);
+        }
+        let steps = req.steps.map(|s| s as usize).unwrap_or(cfg.sample_steps);
+        let shift = req.scheduler_shift.unwrap_or(cfg.sample_shift);
+        let kind = solver_kind(req.sampler.as_deref());
+        let seed = req.seed.unwrap_or_else(default_seed);
+        // The 5B is dense → a single guidance scale (config Single(5.0), overridable per request).
+        let guidance = match (cfg.sample_guide_scale, req.guidance) {
+            (_, Some(g)) => g,
+            (GuideScale::Single(s), None) => s,
+            (GuideScale::Dual { low, .. }, None) => low, // unreachable for the dense 5B
+        };
+        let cfg_disabled = guidance <= 1.0;
+        let neg_prompt = req
+            .negative_prompt
+            .clone()
+            .unwrap_or_else(|| cfg.sample_neg_prompt.clone());
+
+        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
+
+        // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
+        let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
+        let (context, context_null) = {
+            let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
+            let enc = Umt5Encoder::from_weights(&w, cfg)?;
+            let context = enc.encode(&tokenizer, &req.prompt)?;
+            let context_null = if cfg_disabled {
+                None
+            } else {
+                Some(enc.encode(&tokenizer, &neg_prompt)?)
+            };
+            match &context_null {
+                Some(cn) => mlx_rs::transforms::eval([&context, cn])?,
+                None => mlx_rs::transforms::eval([&context])?,
+            }
+            (context, context_null)
+        };
+
+        // Seeded init noise (f32) — shape matches the reference; exact RNG values differ across the
+        // mlx-python/mlx-rs split (expected).
+        let key = random::key(seed)?;
+        let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
+
+        // --- Stage 1b (TI2V only): encode the conditioning image + build the mask-blend init ---
+        // A `Reference` image → z48-VAE-encode to `z_img [z,1,h,w]`, build the first-frame mask
+        // (`[z,T,h,w]`, 0 at frame 0) + per-token mask (`[1,L]`), and blend `(1−mask)·z_img +
+        // mask·noise`. Without an image this is pure-noise T2V.
+        let (latents_init, ti2v) = match i2v_reference(req) {
+            Some(image) => {
+                let img_thwc = preprocess_ti2v_image(image, width, height)?; // [1,1,H,W,3]
+                let z_img = {
+                    let w = Weights::from_file(self.root.join("vae.safetensors"))?;
+                    let vae = Wan22Vae::from_weights(&w)?;
+                    let z = vae.encode(&img_thwc)?; // [1,1,h,w,z]
+                                                    // [1,1,h,w,z] → [1,h,w,z] → [z,1,h,w] (channels-first, the latent convention).
+                    z.reshape(&z.shape()[1..])?.transpose_axes(&[3, 0, 1, 2])?
+                };
+                let (t_lat, h_lat, w_lat) = (lat[1] as usize, lat[2] as usize, lat[3] as usize);
+                let (mask, mask_tokens) =
+                    build_ti2v_mask(cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
+                let latents = ti2v_blend_init(&z_img, &mask, &init_noise)?;
+                mlx_rs::transforms::eval([&latents, &z_img])?;
+                (latents, Some((z_img, mask, mask_tokens)))
+            }
+            None => (init_noise.clone(), None),
+        };
+
+        // --- Stage 2: load the DiT, merge adapters + quantize, embed contexts, denoise (→ freed) ---
+        let latents = {
+            let mut w = Weights::from_file(self.root.join("model.safetensors"))?;
+            // Merge LoRA/LoKr on the dense bf16 weights (no-op without adapters). Runs BEFORE
+            // quantization (the fork order: a LoRA folds into the dense weight, then it is quantized;
+            // load rejects LoRA on a pre-quantized snapshot).
+            self.merge_adapters(&mut w)?;
+            let mut dit = WanTransformer::from_weights(&w, cfg)?;
+            if let Some(q) = self.quant {
+                dit.quantize(q.bits(), None)?;
+            }
+            let ctx_cond = dit.embed_text(&context)?;
+            let ctx_uncond = match &context_null {
+                Some(cn) => Some(dit.embed_text(cn)?),
+                None => None,
+            };
+            let total = steps as u32;
+            let mut on_step = |i: usize| {
+                on_progress(Progress::Step {
+                    current: i as u32,
+                    total,
+                })
+            };
+            match &ti2v {
+                Some((z_img, mask, mask_tokens)) => denoise_ti2v(
+                    &dit,
+                    kind,
+                    cfg.num_train_timesteps,
+                    steps,
+                    shift,
+                    guidance,
+                    &ctx_cond,
+                    ctx_uncond.as_ref(),
+                    &latents_init,
+                    z_img,
+                    mask,
+                    mask_tokens,
+                    &mut on_step,
+                )?,
+                None => denoise(
+                    &dit,
+                    kind,
+                    cfg.num_train_timesteps,
+                    steps,
+                    shift,
+                    guidance,
+                    &ctx_cond,
+                    ctx_uncond.as_ref(),
+                    &latents_init,
+                    &mut on_step,
+                )?,
+            }
+        };
+
+        // --- Stage 3: z48 vae22 decode → RGB8 frames ---
+        on_progress(Progress::Decoding);
+        // Causal temporal decode: t_lat → 1 + (t_lat−1)·4 output frames (= gen_frames).
+        let tiling = TilingConfig::auto(height as i32, width as i32, gen_frames as i32);
+        let frames_u8 = {
+            let w = Weights::from_file(self.root.join("vae.safetensors"))?;
+            let vae = Wan22Vae::from_weights(&w)?;
+            decode_to_frames_22(&vae, &latents, tiling.as_ref())?
+        };
+        let mut images = frames_to_images(&frames_u8)?;
+        // Discard the extra leading frames generated for `trim_first_frames`.
+        if trim_out > 0 {
+            images.drain(0..trim_out.min(images.len()));
+        }
+
+        let fps = req.fps.unwrap_or(cfg.sample_fps);
+        Ok(GenerationOutput::Video {
+            frames: images,
+            fps,
+            audio: None,
+        })
     }
 }
 
