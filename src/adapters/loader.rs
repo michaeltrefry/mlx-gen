@@ -176,11 +176,18 @@ pub fn apply_lokr(host: &mut impl AdaptableHost, w: &Weights, scale: f32) -> Res
     Ok(report)
 }
 
-/// Install a PEFT-format LoRA file (`‹prefix›‹path›.lora_A.weight` / `.lora_B.weight`, with
-/// optional `‹prefix›‹path›.alpha`) onto `host`. PEFT stores `lora_A: [r, in]`,
-/// `lora_B: [out, r]`; we transpose to the residual form `x·A·B` (`A: [in, r]`, `B: [r, out]`)
-/// and fold `alpha/rank` into `B`, matching the fork. `strip_prefix` removes a leading
-/// namespace such as `"base_model.model."` or `"transformer."`.
+/// Install a PEFT/diffusers-format LoRA file onto `host`. The down/up factors carry the file's
+/// namespace prefix on a **dotted** module path, in either of two interchangeable spellings:
+/// - PEFT: `‹prefix›‹path›.lora_A.weight` / `.lora_B.weight`;
+/// - diffusers/ComfyUI/ai-toolkit (e.g. the lightx2v Qwen-Image-Lightning LoRAs, sc-2909):
+///   `‹prefix›‹path›.lora_down.weight` / `.lora_up.weight` — `lora_down`==`lora_A`, `lora_up`==`lora_B`
+///   (identical shapes), differing from the kohya format only in that the path stays dotted (no
+///   `lora_unet_` flattening), so it routes here rather than to [`apply_lora_kohya`].
+///
+/// Both store the down factor as `[r, in]` and the up factor as `[out, r]`; we transpose to the
+/// residual form `x·A·B` (`A: [in, r]`, `B: [r, out]`) and fold `alpha/rank` into `B`, matching the
+/// fork. `‹prefix›‹path›.alpha` is optional (and may be bare — see below). `strip_prefix` removes a
+/// leading namespace such as `"base_model.model."` or `"transformer."`.
 pub fn apply_lora_peft(
     host: &mut impl AdaptableHost,
     w: &Weights,
@@ -190,13 +197,20 @@ pub fn apply_lora_peft(
     let prefix = strip_prefix.unwrap_or("");
     let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
     for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
-        // `lora_A/B` always carry the file's namespace prefix.
+        // The down/up factors always carry the file's namespace prefix. `lora_A`/`lora_B` (PEFT) and
+        // `lora_down`/`lora_up` (diffusers/ComfyUI) are interchangeable spellings of the same role.
         if let Some(rest) = key.strip_prefix(prefix) {
-            if let Some(path) = rest.strip_suffix(".lora_A.weight") {
+            if let Some(path) = rest
+                .strip_suffix(".lora_A.weight")
+                .or_else(|| rest.strip_suffix(".lora_down.weight"))
+            {
                 groups.entry(path.to_string()).or_default().a = Some(w.require(&key)?.clone());
                 continue;
             }
-            if let Some(path) = rest.strip_suffix(".lora_B.weight") {
+            if let Some(path) = rest
+                .strip_suffix(".lora_B.weight")
+                .or_else(|| rest.strip_suffix(".lora_up.weight"))
+            {
                 groups.entry(path.to_string()).or_default().b = Some(w.require(&key)?.clone());
                 continue;
             }
@@ -1196,6 +1210,85 @@ mod tests {
             moe_expert: None,
         }];
         assert!(apply_adapters_strict(&mut host2, &specs2, "test").is_err());
+    }
+
+    /// sc-2909: a diffusers/ComfyUI LoRA spelled with `lora_down`/`lora_up` factor suffixes on a
+    /// **dotted, un-prefixed** path (the lightx2v Qwen-Image-Lightning format) routes through the
+    /// PEFT loader (no `lora_unet_` prefix → not kohya) and installs the BYTE-IDENTICAL adapter to
+    /// its `lora_A`/`lora_B` twin — and `apply_adapter_specs_autoprefix` resolves it end-to-end.
+    #[test]
+    fn diffusers_lora_down_up_equals_peft_ab() {
+        let weight = Array::from_slice(
+            &(0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            &[4, 3],
+        );
+        let a_raw = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]); // [r, in]
+        let b_raw = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]); // [out, r]
+        let alpha = Array::from_slice(&[4.0f32], &[1]);
+
+        // down==A, up==B, bare alpha, no namespace prefix — exactly the lightx2v Lightning spelling.
+        let down_path = tmp("diffusers_down_up.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("lin.lora_down.weight", &a_raw),
+                ("lin.lora_up.weight", &b_raw),
+                ("lin.alpha", &alpha),
+            ],
+            None,
+            &down_path,
+        )
+        .unwrap();
+        // Detected as un-prefixed (not kohya, not BFL) and resolved through the strict seam.
+        let w = Weights::from_file(&down_path).unwrap();
+        assert!(!is_kohya(&w), "dotted-path lora_down is NOT kohya");
+        assert_eq!(detect_lora_prefix(&w), None, "no namespace prefix");
+
+        let mut via_down = OneLinear {
+            lin: AdaptableLinear::dense(weight.clone(), None),
+        };
+        let report = apply_adapter_specs_autoprefix(
+            &mut via_down,
+            &[AdapterSpec::new(down_path, 0.5, AdapterKind::Lora)],
+        )
+        .unwrap();
+        assert_eq!(report.applied, 1, "lora_down/up resolved to lin");
+        assert!(report.unmatched_paths.is_empty());
+
+        // The `lora_A`/`lora_B` twin must install the identical adapter.
+        let ab_path = tmp("diffusers_ab_twin.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("lin.lora_A.weight", &a_raw),
+                ("lin.lora_B.weight", &b_raw),
+                ("lin.alpha", &alpha),
+            ],
+            None,
+            &ab_path,
+        )
+        .unwrap();
+        let mut via_ab = OneLinear {
+            lin: AdaptableLinear::dense(weight, None),
+        };
+        apply_lora_peft(
+            &mut via_ab,
+            &Weights::from_file(&ab_path).unwrap(),
+            0.5,
+            None,
+        )
+        .unwrap();
+
+        let pull = |h: &mut OneLinear| match h.adaptable_mut(&["lin"]).unwrap().adapters() {
+            [Adapter::Lora { a, b, scale }] => (a.clone(), b.clone(), *scale),
+            _ => panic!("expected one LoRA"),
+        };
+        let (da, db, ds) = pull(&mut via_down);
+        let (pa, pb, ps) = pull(&mut via_ab);
+        assert_eq!(ds, ps);
+        assert!(
+            array_eq(&da, &pa, false).unwrap().item::<bool>()
+                && array_eq(&db, &pb, false).unwrap().item::<bool>(),
+            "lora_down/up and lora_A/B installed different adapters"
+        );
     }
 
     // ---- kohya `lora_unet_` LoRA (sc-2618) ----

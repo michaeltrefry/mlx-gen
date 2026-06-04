@@ -15,7 +15,8 @@ use mlx_gen::{
 use mlx_gen_qwen_image::transformer::QwenRope3d;
 use mlx_gen_qwen_image::{
     decoded_to_image, denoise_edit_with_progress, encode_reference_latents, loader, model_edit,
-    qwen_scheduler, tokenize_edit, unpack_latents, ImageInput, QwenImageProcessor,
+    qwen_scheduler, tokenize_edit, unpack_latents, FlowMatchSampler, ImageInput,
+    QwenImageProcessor,
 };
 use mlx_rs::Array;
 
@@ -135,16 +136,16 @@ fn edit_pipeline_matches_fork() {
     let static_lat = g.require("static_image_latents").unwrap();
     let pos = g.require("pos_embeds").unwrap();
     let neg = g.require("neg_embeds").unwrap();
-    let scheduler = qwen_scheduler(STEPS, w, h);
+    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, w, h));
 
     let latents = denoise_edit_with_progress(
         &transformer,
-        &scheduler,
+        &sampler,
         noise,
         static_lat,
         &cond_grids,
         pos,
-        neg,
+        Some(neg),
         GUIDANCE,
         w,
         h,
@@ -467,16 +468,16 @@ fn edit_pipeline_q8_matches_fork() {
     let static_lat = g.require("static_image_latents").unwrap();
     let pos = g.require("pos_embeds").unwrap();
     let neg = g.require("neg_embeds").unwrap();
-    let scheduler = qwen_scheduler(STEPS, w, h);
+    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, w, h));
 
     let latents = denoise_edit_with_progress(
         &transformer,
-        &scheduler,
+        &sampler,
         noise,
         static_lat,
         &cond_grids,
         pos,
-        neg,
+        Some(neg),
         GUIDANCE,
         w,
         h,
