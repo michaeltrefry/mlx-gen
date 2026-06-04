@@ -66,6 +66,12 @@ MODEL = Path.home() / "Library/Application Support/SceneWorks/data/models/mlx/lt
 DIM, CTX = 4096, 16
 LF, LH, LW = 2, 4, 4  # latent frames/height/width → S = 32 tokens
 
+# `LTX_BF16=1` emits the reference's **native** bf16+Q8 forward (no f32 upcast, bf16 activations) —
+# the production-precision parity target (Rust `Precision::Bf16Q8`). Default = the f32 quality target
+# (`Precision::F32Q8`). bf16 uses a non-bf16-exact sigma so the timestep `×1000` rounding is exercised.
+BF16 = os.environ.get("LTX_BF16") == "1"
+ACT = mx.bfloat16 if BF16 else mx.float32
+
 # Build the AudioVideo model (the reference __call__ only wires the multimodal preprocessor) and run
 # it video-only (audio=None) — the video path is independent of the audio/cross-modal modules, which
 # stay random + unused. Mirrors generate_av's config build (gated 2.3, no caption-projection).
@@ -115,26 +121,29 @@ def _should_quantize(path, module):
 
 nn.quantize(model, group_size=64, bits=8, class_predicate=_should_quantize)
 model.load_weights(list(video.items()), strict=False)
-# Pure f32 activations: upcast every non-packed param (dense weights, q/k-norm, scale-shift tables,
-# AND the Q8 scales/biases) to f32 — a lossless bf16→f32 upcast that makes the gate a clean f32
-# computation (only the packed U32 Q8 weight stays). Matches the Rust F32Q8 path.
-from mlx.utils import tree_map  # noqa: E402
+if not BF16:
+    # Pure f32 activations: upcast every non-packed param (dense weights, q/k-norm, scale-shift
+    # tables, AND the Q8 scales/biases) to f32 — a lossless bf16→f32 upcast that makes the gate a
+    # clean f32 computation (only the packed U32 Q8 weight stays). Matches the Rust F32Q8 path. The
+    # bf16 variant keeps the model as loaded (bf16 params + Q8) — the reference's native compute.
+    from mlx.utils import tree_map  # noqa: E402
 
-model.update(
-    tree_map(
-        lambda p: p.astype(mx.float32) if p.dtype != mx.uint32 else p,
-        model.parameters(),
+    model.update(
+        tree_map(
+            lambda p: p.astype(mx.float32) if p.dtype != mx.uint32 else p,
+            model.parameters(),
+        )
     )
-)
 mx.eval(model.parameters())
 
-# Deterministic synthetic inputs — **f32 activations** (the port's quality target). The loaded model
-# is bf16 + Q8; feeding f32 inputs promotes the dense matmuls to f32 and runs quantized_matmul at f32
-# (Q8 weights, fp32 accum) — exactly the Rust F32Q8 path.
+# Deterministic synthetic inputs in the compute dtype (`ACT`). f32 (default): feeding f32 inputs
+# promotes the dense matmuls to f32 and runs quantized_matmul at f32 (the Rust F32Q8 path). bf16:
+# native bf16 activations × Q8 (the Rust Bf16Q8 path); the timestep is bf16 with a non-bf16-exact
+# sigma so the preprocessor's `timestep × 1000` rounds in bf16 exactly as `denoise_av` does.
 mx.random.seed(7)
-latent = (mx.random.normal((1, LF * LH * LW, 128)) * 0.5).astype(mx.float32)
-context = (mx.random.normal((1, CTX, DIM)) * 0.5).astype(mx.float32)
-timestep = mx.array([[0.5]], dtype=mx.float32)  # (1, 1)
+latent = (mx.random.normal((1, LF * LH * LW, 128)) * 0.5).astype(ACT)
+context = (mx.random.normal((1, CTX, DIM)) * 0.5).astype(ACT)
+timestep = mx.array([[0.909375 if BF16 else 0.5]], dtype=ACT)  # (1, 1)
 positions = create_position_grid(1, LF, LH, LW)  # (1, 3, 32, 2) f32
 
 modality = Modality(
@@ -161,16 +170,19 @@ vx = model._process_output(
 mx.eval(vx, h, emb_ts)
 print(f"dit: latent{latent.shape} -> velocity{vx.shape} dtype={vx.dtype}")
 
+# Preserve the native dtype (`ACT`) for velocity/tap_h so the bf16 gate checks bf16 bit-exactness
+# (the Rust comparison upcasts both sides to f32, lossless). Inputs stay native too.
 tensors = {
     "latent": latent,
     "context": context,
     "timestep": timestep,
     "positions": positions.astype(mx.float32),
-    "velocity": vx.astype(mx.float32),
-    "tap_h": h.astype(mx.float32),        # post-48-block hidden (output-head sanity)
-    "tap_emb_ts": emb_ts.astype(mx.float32),
+    "velocity": vx.astype(ACT),
+    "tap_h": h.astype(ACT),        # post-48-block hidden (output-head sanity)
+    "tap_emb_ts": emb_ts.astype(ACT),
 }
-out_path = fixture("mlx-gen-ltx/tests/fixtures/ltx_dit_golden.safetensors")
+name = "ltx_dit_golden_bf16.safetensors" if BF16 else "ltx_dit_golden.safetensors"
+out_path = fixture(f"mlx-gen-ltx/tests/fixtures/{name}")
 Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 mx.save_safetensors(out_path, tensors, metadata={"S": str(LF * LH * LW), "ctx": str(CTX)})
 print(f"wrote {out_path}")

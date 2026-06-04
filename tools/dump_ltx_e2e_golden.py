@@ -59,12 +59,22 @@ STAGE2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 # 256×256, 9 frames → latent_frames 2, stage1 4×4, stage2 8×8.
 LF, H1, W1, H2, W2 = 2, 4, 4, 8, 8
 
+# `LTX_BF16=1` runs the reference's **native** bf16+Q8 pipeline end-to-end (no f32 upcast on the
+# transformer / upsampler / VAE / statistics) — the production-precision parity target. Default = the
+# f32 quality target (every module upcast to f32 activations; the Q8 packed weights stay U32).
+BF16 = os.environ.get("LTX_BF16") == "1"
+ACT = mx.bfloat16 if BF16 else mx.float32
+
 te = mx.load(fixture("tools/golden/ltx_e2e_te.safetensors"))
 input_ids = te["input_ids"]
-context = te["video_embeddings"].astype(mx.float32)  # (1, 128, 4096)
+context = te["video_embeddings"].astype(ACT)  # (1, 128, 4096)
 
 
 def _f32_acts(model):
+    # f32 target only — upcast every non-packed param to f32. bf16 keeps the native dtype (the
+    # reference's production compute: bf16 activations × Q8, bf16 dense/norm/scale-shift params).
+    if BF16:
+        return
     model.update(
         tree_map(lambda p: p.astype(mx.float32) if p.dtype != mx.uint32 else p, model.parameters())
     )
@@ -125,17 +135,19 @@ def denoise(latents, positions, sigmas):
 
 
 upsampler = load_upsampler(str(MODEL / "upsampler.safetensors"))
-upsampler.update(tree_map(lambda p: p.astype(mx.float32), upsampler.parameters()))
-mx.eval(upsampler.parameters())
 vae = load_vae_decoder(str(MODEL), timestep_conditioning=None, use_unified=True)
-vae.update(tree_map(lambda p: p.astype(mx.float32), vae.parameters()))
-vae.latents_mean = vae.latents_mean.astype(mx.float32)
-vae.latents_std = vae.latents_std.astype(mx.float32)
-mx.eval(vae.parameters())
+if not BF16:
+    # f32 target: upcast the upsampler + VAE + their latent statistics. bf16 keeps them native (the
+    # on-disk dtype is bf16 for both — the reference's production decode path).
+    upsampler.update(tree_map(lambda p: p.astype(mx.float32), upsampler.parameters()))
+    vae.update(tree_map(lambda p: p.astype(mx.float32), vae.parameters()))
+    vae.latents_mean = vae.latents_mean.astype(mx.float32)
+    vae.latents_std = vae.latents_std.astype(mx.float32)
+mx.eval(upsampler.parameters(), vae.parameters())
 
 mx.random.seed(7)
-stage1_noise = (mx.random.normal((1, 128, LF, H1, W1)) * 0.5).astype(mx.float32)
-stage2_noise = (mx.random.normal((1, 128, LF, H2, W2)) * 0.5).astype(mx.float32)
+stage1_noise = (mx.random.normal((1, 128, LF, H1, W1)) * 0.5).astype(ACT)
+stage2_noise = (mx.random.normal((1, 128, LF, H2, W2)) * 0.5).astype(ACT)
 pos1 = create_video_position_grid(1, LF, H1, W1)
 pos2 = create_video_position_grid(1, LF, H2, W2)
 
@@ -151,6 +163,9 @@ frames = (mx.clip((vid + 1.0) / 2.0, 0.0, 1.0) * 255).astype(mx.uint8)
 mx.eval(final_latents, frames)
 print(f"e2e: context{context.shape} -> final{final_latents.shape} -> frames{frames.shape}")
 
+# Stage latents are saved in the native compute dtype (`ACT`) so the Rust gate checks exact parity
+# (the comparison upcasts both sides to f32, lossless). `video_embeddings` is bf16 either way (the TE
+# output dtype; the f32 DiT upcasts it, exactly as the f32-act reference transformer does).
 tensors = {
     "input_ids": input_ids.astype(mx.int32),
     "video_embeddings": context.astype(mx.bfloat16),
@@ -158,13 +173,14 @@ tensors = {
     "stage2_noise": stage2_noise,
     "stage1_positions": pos1.astype(mx.float32),
     "stage2_positions": pos2.astype(mx.float32),
-    "stage1_out": s1.astype(mx.float32),
-    "upsampled": ups.astype(mx.float32),
-    "renoised": renoised.astype(mx.float32),
-    "final_latents": final_latents.astype(mx.float32),
+    "stage1_out": s1.astype(ACT),
+    "upsampled": ups.astype(ACT),
+    "renoised": renoised.astype(ACT),
+    "final_latents": final_latents.astype(ACT),
     "frames": frames,
 }
-out = fixture("mlx-gen-ltx/tests/fixtures/ltx_e2e_golden.safetensors")
+name = "ltx_e2e_golden_bf16.safetensors" if BF16 else "ltx_e2e_golden.safetensors"
+out = fixture(f"mlx-gen-ltx/tests/fixtures/{name}")
 Path(out).parent.mkdir(parents=True, exist_ok=True)
-mx.save_safetensors(out, tensors, metadata={"res": "256x256", "frames": "9"})
+mx.save_safetensors(out, tensors, metadata={"res": "256x256", "frames": "9", "prec": str(ACT)})
 print(f"wrote {out}")

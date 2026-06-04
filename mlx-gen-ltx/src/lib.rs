@@ -4,16 +4,26 @@
 //! `mlx-video-with-audio` package's LTX video path (`generate_av.py`, `models/ltx/*`,
 //! `models/ltx/video_vae/*`) onto Rust + `mlx-rs`.
 //!
-//! **Scope:** the bf16/f32 **video-only** T2V core (sc-2679). The audio half (`generate_av.py`'s
-//! AudioVideo path), I2V, Q4/Q8, LoRA, and LoKr are sibling stories.
+//! **Scope:** the **video-only** T2V core (sc-2679). The audio half (`generate_av.py`'s AudioVideo
+//! path), I2V, Q4/Q8-of-everything, LoRA, and LoKr are sibling stories.
 //!
 //! This crate self-registers `ltx_2_3` into the `mlx-gen` model registry; load it with
 //! `mlx_gen::load("ltx_2_3", spec)`.
 //!
-//! ## Status (S0)
-//! Foundation slice: registry + config (`embedded_config.json`-driven) + SPLIT 3-D RoPE
-//! (double-precision) + f32 position grid + distilled sigma schedules + legacy Euler step. The
-//! denoise pipeline lands across S1–S5; `Generator::generate` errors until then.
+//! ## Status (S0–S6 complete)
+//! The full text-to-video path is wired and pixel-parity vs the reference `generate_av.py`: Gemma-3
+//! tokenizer (byte-exact) → [`LtxTextEncoder`] (Gemma backbone + connector) → seeded noise → the
+//! 2-stage distilled denoise ([`pipeline`]: stage-1 half-res → 2× [`upsampler::LatentUpsampler`] →
+//! re-noise → stage-2 full-res over the 48-layer [`transformer::LtxDiT`]) → [`vae::LtxVideoVae`]
+//! decode → uint8 frames. Built on SPLIT 3-D RoPE (double-precision), an f32 position grid, the
+//! distilled sigma schedules, and the legacy dtype-preserving Euler step.
+//!
+//! The distilled stage-1 sampler is chaos-sensitive, so e2e pixel-parity requires a **bit-exact
+//! per-forward DiT** (sc-2842 — the adaLN timestep table must be built in MLX f32, not host f64). Two
+//! shipped precisions, both gated bit-exact vs their reference golden: [`transformer::Precision::F32Q8`]
+//! (f32 activations × Q8 — the quality target) and [`transformer::Precision::Bf16Q8`] (the reference's
+//! native bf16 activations × Q8 — the production-speed path). Q4/Q8-of-everything, I2V, LoRA, LoKr,
+//! and audio are sibling stories.
 
 pub mod config;
 pub mod connector;

@@ -26,6 +26,12 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/ltx_dit_golden.safetensors"
 );
+/// The reference's **native bf16+Q8** velocity golden (`LTX_BF16=1 dump_ltx_dit_golden.py`) — the
+/// production-precision target for [`Precision::Bf16Q8`].
+const GOLDEN_BF16: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/ltx_dit_golden_bf16.safetensors"
+);
 
 fn base_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("LTX_BASE_DIR") {
@@ -54,14 +60,18 @@ fn mean_rel(got: &Array, want: &Array) -> f32 {
     num.item::<f32>() / den.item::<f32>().max(1e-12)
 }
 
-fn build() -> (LtxDiT, Weights) {
+fn build_prec(prec: Precision, golden: &str) -> (LtxDiT, Weights) {
     let dir = base_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
     let w =
         Weights::from_file(dir.join("transformer.safetensors")).expect("transformer.safetensors");
-    let dit = LtxDiT::from_weights(&w, &cfg, Precision::F32Q8).expect("build LtxDiT");
-    let g = Weights::from_file(GOLDEN).expect("golden (run tools/dump_ltx_dit_golden.py)");
+    let dit = LtxDiT::from_weights(&w, &cfg, prec).expect("build LtxDiT");
+    let g = Weights::from_file(golden).expect("golden (run tools/dump_ltx_dit_golden.py)");
     (dit, g)
+}
+
+fn build() -> (LtxDiT, Weights) {
+    build_prec(Precision::F32Q8, GOLDEN)
 }
 
 #[test]
@@ -90,6 +100,38 @@ fn dit_velocity_matches_reference() {
     assert!(
         mr == 0.0,
         "dit velocity mean_rel {mr:.3e} must be bit-exact"
+    );
+}
+
+/// The reference's **native bf16+Q8** per-forward — the production-speed path ([`Precision::Bf16Q8`]).
+/// Bit-exact at matched mlx 0.31.2 (the distilled stage-1 sampler is chaos-sensitive, so the bf16
+/// per-forward must be as tight as the f32 one). The same sc-2842 timestep-table fix applies, plus
+/// the `timestep × 1000` scaling must run in the **input (bf16) dtype** — `denoise_av` feeds a bf16
+/// timestep, so a pre-upcast-to-f32 would round differently (`f32(σ)·1000` ≠ `bf16(σ·1000)`).
+#[test]
+#[ignore = "needs ltx_2_3_base_q8 transformer.safetensors (~20 GB)"]
+fn dit_velocity_matches_reference_bf16() {
+    let (dit, g) = build_prec(Precision::Bf16Q8, GOLDEN_BF16);
+    let got = dit
+        .forward(
+            g.require("latent").unwrap(),
+            g.require("timestep").unwrap(),
+            g.require("context").unwrap(),
+            None,
+            g.require("positions").unwrap(),
+        )
+        .expect("dit forward");
+    let want = g.require("velocity").unwrap();
+    assert_eq!(got.shape(), want.shape(), "velocity shape");
+    let (pr, mr) = (peak_rel(&got, want), mean_rel(&got, want));
+    eprintln!("dit velocity (bf16) peak_rel = {pr:.3e} mean_rel = {mr:.3e}");
+    assert!(
+        pr == 0.0,
+        "dit velocity (bf16) peak_rel {pr:.3e} must be bit-exact"
+    );
+    assert!(
+        mr == 0.0,
+        "dit velocity (bf16) mean_rel {mr:.3e} must be bit-exact"
     );
 }
 

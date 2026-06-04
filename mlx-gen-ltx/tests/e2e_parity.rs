@@ -42,6 +42,12 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/ltx_e2e_golden.safetensors"
 );
+/// The reference's **native bf16+Q8** e2e golden (`LTX_BF16=1 dump_ltx_e2e_golden.py`) — the
+/// production-precision target ([`Precision::Bf16Q8`] DiT + bf16 upsampler/statistics; f32 VAE decode).
+const GOLDEN_BF16: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/ltx_e2e_golden_bf16.safetensors"
+);
 /// The prompt PHASE A (`dump_ltx_e2e_te.py`) tokenized.
 const PROMPT: &str = "A cat playing a grand piano on a city rooftop at sunset.";
 const MAX_TOKENS: usize = 128;
@@ -229,10 +235,112 @@ fn e2e_frames_match_reference() {
     );
 }
 
-/// Load a VAE `per_channel_statistics.{mean,std}` as f32 (the upsampler's latent norm).
-fn latent_stat(dec: &Weights, which: &str) -> Array {
+/// The **production-precision** e2e: the reference's native bf16+Q8 path ([`Precision::Bf16Q8`] DiT +
+/// bf16 upsampler/statistics) vs the bf16 golden. The DiT per-forward is bit-exact (sc-2842, incl. the
+/// bf16 timestep-scale fix), so the bf16 stage-1/stage-2 latents are bit-exact too; the VAE decode runs
+/// f32 (the quality island, post-sampling, no chaos amplification), so frames are pixel-parity within
+/// the <1% acceptance rather than byte-identical.
+#[test]
+#[ignore = "needs ltx_2_3_base_q8 transformer (~20 GB) + upsampler + vae_decoder"]
+fn e2e_frames_match_reference_bf16() {
+    let dir = base_dir();
+    let cfg = LtxConfig::from_model_dir(&dir).expect("config");
+    let tw = Weights::from_file(dir.join("transformer.safetensors")).expect("transformer");
+    let dit = LtxDiT::from_weights(&tw, &cfg, Precision::Bf16Q8).expect("dit");
+    let uw = Weights::from_file(dir.join("upsampler.safetensors")).expect("upsampler");
+    let up = LatentUpsampler::from_weights(&uw).expect("upsampler");
+    let vcfg = LtxVaeConfig::from_model_dir(&dir).expect("vae cfg");
+    let dec = Weights::from_file(dir.join("vae_decoder.safetensors")).expect("vae");
+    let vae = LtxVideoVae::from_weights(&dec, None, &vcfg).expect("vae");
+
+    let g = Weights::from_file(GOLDEN_BF16).expect("e2e bf16 golden");
+    let ctx = g.require("video_embeddings").unwrap(); // bf16 (the DiT keeps it bf16)
+                                                      // bf16 latent statistics — the upsampler + re-normalize run native bf16 in the production path.
+    let (mean, std) = (
+        latent_stat_dt(&dec, "mean", Dtype::Bfloat16),
+        latent_stat_dt(&dec, "std", Dtype::Bfloat16),
+    );
+    let pos1 = create_position_grid(1, 2, 4, 4);
+    let pos2 = create_position_grid(1, 2, 8, 8);
+
+    // Upsample + re-noise are bit-exact (bf16) from the reference's stage-1 latents.
+    let ups = upsample_latents(g.require("stage1_out").unwrap(), &up, &mean, &std).expect("ups");
+    assert!(
+        peak_rel(&ups, g.require("upsampled").unwrap()) == 0.0,
+        "bf16 upsample bit-exact"
+    );
+    let rn = renoise(
+        g.require("upsampled").unwrap(),
+        g.require("stage2_noise").unwrap(),
+        STAGE2_SIGMAS[0],
+    )
+    .expect("renoise");
+    assert!(
+        peak_rel(&rn, g.require("renoised").unwrap()) == 0.0,
+        "bf16 renoise bit-exact"
+    );
+
+    // Stage-2 (3 steps) from the reference's exact bf16 input — bit-exact (the bf16 per-forward is).
+    let s2 = denoise(
+        &dit,
+        g.require("renoised").unwrap(),
+        ctx,
+        &pos2,
+        &STAGE2_SIGMAS,
+        &mut |_| {},
+    )
+    .expect("stage2");
+    let s2_mr = mean_rel(&s2, g.require("final_latents").unwrap());
+    eprintln!("bf16 stage2 (from ref input) mean_rel = {s2_mr:.3e}");
+    assert!(
+        s2_mr == 0.0,
+        "bf16 stage2 from correct input must be bit-exact: {s2_mr:.3e}"
+    );
+
+    // Full 2-stage bf16 e2e → frames.
+    let latents = generate_t2v_latents(
+        &dit,
+        &up,
+        g.require("stage1_noise").unwrap(),
+        &pos1,
+        g.require("stage2_noise").unwrap(),
+        &pos2,
+        ctx,
+        &mean,
+        &std,
+        &mut |_| {},
+    )
+    .expect("generate_t2v_latents");
+    let fmr = mean_rel(&latents, g.require("final_latents").unwrap());
+    let frames = decode_to_frames(&vae, &latents).expect("decode");
+    let want_frames = g.require("frames").unwrap();
+    assert_eq!(frames.shape(), want_frames.shape(), "frame shape");
+    assert_eq!(frames.dtype(), Dtype::Uint8);
+    let px = px_gt8(&frames, want_frames);
+    eprintln!(
+        "bf16 FULL e2e: final latents mean_rel = {fmr:.3e}, frames px>8 = {:.2}%",
+        px * 100.0
+    );
+    assert!(
+        fmr == 0.0,
+        "bf16 full e2e final latents must be bit-exact (bf16 per-forward is): {fmr:.3e}"
+    );
+    assert!(
+        px < 1e-2,
+        "bf16 e2e frames px>8 {:.2}% exceeds the 1% acceptance",
+        px * 100.0
+    );
+}
+
+/// Load a VAE `per_channel_statistics.{mean,std}` at `dt` (the upsampler's latent norm). f32 for the
+/// quality path; bf16 for the production path (the upsampler + re-norm then run native bf16).
+fn latent_stat_dt(dec: &Weights, which: &str, dt: Dtype) -> Array {
     dec.require(&format!("per_channel_statistics.{which}"))
         .unwrap()
-        .as_dtype(Dtype::Float32)
+        .as_dtype(dt)
         .unwrap()
+}
+
+fn latent_stat(dec: &Weights, which: &str) -> Array {
+    latent_stat_dt(dec, which, Dtype::Float32)
 }

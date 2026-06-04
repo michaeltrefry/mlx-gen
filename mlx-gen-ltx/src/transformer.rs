@@ -462,20 +462,16 @@ impl LtxDiT {
         })
     }
 
-    /// Velocity forward.
-    ///
-    /// * `latent` — `(B, S, in_channels=128)` patchified latent tokens.
-    /// * `timestep` — `(B, 1)` (or `(B,)`) per-sample sigma (T2V; broadcast over tokens).
-    /// * `context` — `(B, ctx, inner)` text embeddings (connector output); `mask` its additive mask.
-    /// * `positions` — `(B, 3, S, 2)` position grid (from [`crate::positions`]).
-    pub fn forward(
+    /// The preprocessor (mirrors the reference `TransformerArgsPreprocessor.prepare`): patchify_proj →
+    /// adaLN-single timestep projection + prompt-adaLN → caption_projection (Identity, 2.3) → SPLIT
+    /// RoPE tables. Shared by [`forward`](Self::forward) and [`block_hidden`](Self::block_hidden).
+    fn preprocess(
         &self,
         latent: &Array,
         timestep: &Array,
         context: &Array,
-        mask: Option<&Array>,
         positions: &Array,
-    ) -> Result<Array> {
+    ) -> Result<Preprocessed> {
         let dt = self.prec.dtype();
         let b = latent.shape()[0];
         let inner = self.cfg.inner_dim();
@@ -483,10 +479,13 @@ impl LtxDiT {
 
         let x = self.patchify_proj.forward(&latent.as_dtype(dt)?)?;
 
-        // adaLN-single timestep projection (scaled by timestep_scale_multiplier).
-        let mult = self.cfg.timestep_scale_multiplier as f32;
-        let ts_flat =
-            multiply(&timestep.as_dtype(Dtype::Float32)?, scalar(mult))?.reshape(&[-1])?;
+        // adaLN-single timestep projection. The `× timestep_scale_multiplier` runs in the **input
+        // dtype** (matching `denoise_av`, which feeds a latent-dtype timestep): the adaLN sinusoid
+        // upcasts to f32 internally, but a bf16 timestep must round `bf16(σ·1000)` *first* — pre-
+        // upcasting to f32 would change the high-frequency sinusoid phase (~33% velocity divergence
+        // in the bf16 path). f32 input is unaffected (`f32(σ)·1000` either way).
+        let mult = scalar(self.cfg.timestep_scale_multiplier as f32).as_dtype(timestep.dtype())?;
+        let ts_flat = multiply(timestep, &mult)?.reshape(&[-1])?;
         let (ts_emb, emb_ts) = self.adaln.forward(&ts_flat, dt)?;
         let ts_emb = ts_emb.reshape(&[b, -1, coeff * inner])?;
         let emb_ts = emb_ts.reshape(&[b, -1, inner])?;
@@ -499,7 +498,7 @@ impl LtxDiT {
                 } else {
                     timestep.clone()
                 };
-                let src = multiply(&src.as_dtype(Dtype::Float32)?, scalar(mult))?.reshape(&[-1])?;
+                let src = multiply(&src, &mult)?.reshape(&[-1])?;
                 let (pts, _) = padaln.forward(&src, dt)?;
                 Some(pts.reshape(&[b, -1, 2 * inner])?)
             }
@@ -518,11 +517,45 @@ impl LtxDiT {
             self.cfg.num_attention_heads,
         )?;
 
-        let mut h = x;
+        Ok(Preprocessed {
+            x,
+            ts_emb,
+            emb_ts,
+            prompt_ts,
+            context,
+            cos,
+            sin,
+        })
+    }
+
+    /// Velocity forward.
+    ///
+    /// * `latent` — `(B, S, in_channels=128)` patchified latent tokens.
+    /// * `timestep` — `(B, 1)` (or `(B,)`) per-sample sigma (T2V; broadcast over tokens).
+    /// * `context` — `(B, ctx, inner)` text embeddings (connector output); `mask` its additive mask.
+    /// * `positions` — `(B, 3, S, 2)` position grid (from [`crate::positions`]).
+    pub fn forward(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        mask: Option<&Array>,
+        positions: &Array,
+    ) -> Result<Array> {
+        let p = self.preprocess(latent, timestep, context, positions)?;
+        let mut h = p.x;
         for block in &self.blocks {
-            h = block.forward(&h, &ts_emb, prompt_ts.as_ref(), &context, mask, &cos, &sin)?;
+            h = block.forward(
+                &h,
+                &p.ts_emb,
+                p.prompt_ts.as_ref(),
+                &p.context,
+                mask,
+                &p.cos,
+                &p.sin,
+            )?;
         }
-        self.output_head(&h, &emb_ts)
+        self.output_head(&h, &p.emb_ts)
     }
 
     /// Diagnostic: run the preprocessor + the first `n` blocks and return the hidden state (for the
@@ -537,43 +570,32 @@ impl LtxDiT {
         positions: &Array,
         n: usize,
     ) -> Result<Array> {
-        let dt = self.prec.dtype();
-        let b = latent.shape()[0];
-        let inner = self.cfg.inner_dim();
-        let coeff = self.cfg.adaln_embedding_coefficient;
-        let x = self.patchify_proj.forward(&latent.as_dtype(dt)?)?;
-        let mult = self.cfg.timestep_scale_multiplier as f32;
-        let ts_flat =
-            multiply(&timestep.as_dtype(Dtype::Float32)?, scalar(mult))?.reshape(&[-1])?;
-        let (ts_emb, _) = self.adaln.forward(&ts_flat, dt)?;
-        let ts_emb = ts_emb.reshape(&[b, -1, coeff * inner])?;
-        let prompt_ts = match &self.prompt_adaln {
-            Some(padaln) => {
-                let src = if timestep.ndim() > 1 {
-                    timestep.index_axis(0, 1)?.reshape(&[b, 1])?
-                } else {
-                    timestep.clone()
-                };
-                let src = multiply(&src.as_dtype(Dtype::Float32)?, scalar(mult))?.reshape(&[-1])?;
-                let (pts, _) = padaln.forward(&src, dt)?;
-                Some(pts.reshape(&[b, -1, 2 * inner])?)
-            }
-            None => None,
-        };
-        let context = context.as_dtype(dt)?;
-        let (cos, sin) = precompute_split_freqs_cis(
-            positions,
-            inner,
-            self.cfg.positional_embedding_theta,
-            self.cfg.positional_embedding_max_pos,
-            self.cfg.num_attention_heads,
-        )?;
-        let mut h = x;
+        let p = self.preprocess(latent, timestep, context, positions)?;
+        let mut h = p.x;
         for block in self.blocks.iter().take(n) {
-            h = block.forward(&h, &ts_emb, prompt_ts.as_ref(), &context, mask, &cos, &sin)?;
+            h = block.forward(
+                &h,
+                &p.ts_emb,
+                p.prompt_ts.as_ref(),
+                &p.context,
+                mask,
+                &p.cos,
+                &p.sin,
+            )?;
         }
         Ok(h)
     }
+}
+
+/// The [`LtxDiT::preprocess`] outputs threaded into the block stack + output head.
+struct Preprocessed {
+    x: Array,
+    ts_emb: Array,
+    emb_ts: Array,
+    prompt_ts: Option<Array>,
+    context: Array,
+    cos: Array,
+    sin: Array,
 }
 
 impl LtxDiT {

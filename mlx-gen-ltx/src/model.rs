@@ -10,10 +10,13 @@
 //! `connector`/transformer/vae); [`resolve_gemma_dir`] locates them via `$LTX_GEMMA_DIR` or the HF
 //! cache (`mlx-community/gemma-3-12b-it-bf16`).
 //!
-//! **Precision.** Runs the **f32-activation** path (transformer [`Precision::F32Q8`]: f32 activations
-//! × the Q8 weights; f32 TE-connector + VAE; the Gemma backbone runs bf16 as the reference does) —
-//! the port's validated quality target (S3b). Distilled 2-stage → **no CFG** (guidance baked in).
-//! Q4/Q8-of-everything, I2V, LoRA/LoKr, and the audio half are sibling slices.
+//! **Precision.** Selected by `LoadSpec::precision`: `Bf16` (the default) → the reference's **native**
+//! bf16 activations × Q8 ([`Precision::Bf16Q8`]) — the production-speed path; `Fp32` →
+//! [`Precision::F32Q8`] (f32 activations × Q8) — the quality target. Both are bit-exact to their
+//! reference golden (sc-2842). The latent statistics follow the path dtype (so the upsampler + denoise
+//! run in that precision); the VAE decode stays f32 (a post-sampling quality island, pixel-parity
+//! either way), and the Gemma backbone runs bf16 as the reference does. Distilled 2-stage → **no CFG**
+//! (guidance baked in). Q4/Q8-of-everything, I2V, LoRA/LoKr, and the audio half are sibling slices.
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -120,11 +123,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    if spec.precision != LoadPrecision::Bf16 {
-        return Err(Error::Msg(
-            "ltx_2_3: precision override is not wired (the path runs f32 activations × Q8)".into(),
-        ));
-    }
+    // Precision selection. `Bf16` (the [`LoadSpec`] default) → the reference's **native** bf16
+    // activations × Q8 — the production-speed path; `Fp32` → f32 activations × Q8 — the quality
+    // target. Both are bit-exact to their reference golden (sc-2842; the distilled stage-1 sampler is
+    // chaos-sensitive, so each per-forward is bit-exact). The latent statistics (the upsampler's
+    // un-/re-normalize) follow the path dtype so the whole denoise stays in that precision; the VAE
+    // decode stays f32 in both — a post-sampling quality island (pixel-parity either way).
+    let (dit_prec, stat_dt) = match spec.precision {
+        LoadPrecision::Bf16 => (Precision::Bf16Q8, Dtype::Bfloat16),
+        LoadPrecision::Fp32 => (Precision::F32Q8, Dtype::Float32),
+    };
     if spec.quantize.is_some() {
         return Err(Error::Msg(
             "ltx_2_3: Q4/Q8-of-everything is a sibling slice (sc-2686); the transformer is already \
@@ -159,15 +167,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         &config,
         Dtype::Bfloat16,
     )?;
-    let transformer = LtxDiT::from_weights(&transformer_w, &config, Precision::F32Q8)?;
+    let transformer = LtxDiT::from_weights(&transformer_w, &config, dit_prec)?;
     let upsampler = LatentUpsampler::from_weights(&upsampler_w)?;
     let vae = LtxVideoVae::from_weights(&vae_w, None, &vae_config)?;
-    // The VAE `per_channel_statistics` double as the upsampler's latent norm (f32).
-    let latent_mean = to_dtype(
-        vae_w.require("per_channel_statistics.mean")?,
-        Dtype::Float32,
-    )?;
-    let latent_std = to_dtype(vae_w.require("per_channel_statistics.std")?, Dtype::Float32)?;
+    // The VAE `per_channel_statistics` double as the upsampler's latent norm, at the path dtype.
+    let latent_mean = to_dtype(vae_w.require("per_channel_statistics.mean")?, stat_dt)?;
+    let latent_std = to_dtype(vae_w.require("per_channel_statistics.std")?, stat_dt)?;
 
     Ok(Box::new(Ltx {
         descriptor: descriptor(),
