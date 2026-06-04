@@ -4,12 +4,11 @@
 //! (`use_linear_projection`), no attention masks, and exact `gelu` in the GEGLU. NHWC I/O.
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
-use mlx_rs::nn::gelu;
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
-use mlx_gen::nn::group_norm;
+use mlx_gen::nn::{gelu_exact, group_norm};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -182,7 +181,7 @@ impl TransformerBlock {
         let y = layer_norm(&x, Some(&self.norm3_w), Some(&self.norm3_b), LN_EPS)?;
         let y = multiply(
             &self.linear1.forward(&y)?,
-            &gelu(self.linear2.forward(&y)?)?,
+            &gelu_exact(&self.linear2.forward(&y)?)?,
         )?;
         let y = self.linear3.forward(&y)?;
         Ok(add(&x, &y)?)

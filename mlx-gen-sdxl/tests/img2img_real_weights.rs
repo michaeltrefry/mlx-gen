@@ -20,16 +20,24 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_sdxl::config::DiffusionConfig;
 use mlx_gen_sdxl::{
-    encode_conditioning, encode_init_latents, load_text_encoder_1, load_text_encoder_2,
-    load_tokenizer, load_unet, load_vae, text_time_ids, EulerSampler,
+    encode_conditioning, encode_init_latents, load_text_encoder_1_dtype, load_text_encoder_2_dtype,
+    load_tokenizer, load_unet_dtype, load_vae, text_time_ids, EulerSampler,
 };
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
+
+/// Production dtype (sc-2721): U-Net + both CLIP TEs run fp16 (VAE stays f32). The component gate
+/// loads the conditioning at fp16 so it matches the `float16=True` golden's f16 conditioning.
+const DT: Dtype = Dtype::Float16;
 // Force-link the provider so its `inventory::submit!` registers `"sdxl"` (MODEL_ARCHITECTURE.md §4).
 use mlx_gen_sdxl as _;
 
+// Production runs fp16 (sc-2721); the render gate (`load("sdxl")`) uses the `float16=True` golden,
+// dumped on MLX 0.31.2. The component gate's compute is f32 either way (the VAE is always f32 and
+// img2img's encoded init keeps the U-Net/step in f32), so it just reads the golden's f16-rounded
+// `timesteps`. Build: FLOAT16=1 <mlx-0.31.2 python> tools/dump_sdxl_img2img_golden.py
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../tools/golden/sdxl_img2img_golden.safetensors"
+    "/../tools/golden/sdxl_img2img_fp16_golden.safetensors"
 );
 
 fn snapshot() -> PathBuf {
@@ -85,8 +93,8 @@ fn img2img_components_bit_exact() {
     let snap = snapshot();
     let image = init_image(&g, w, h);
 
-    let vae = load_vae(&snap).unwrap();
-    let sampler = EulerSampler::new(&DiffusionConfig::sdxl_base(), true);
+    let vae = load_vae(&snap).unwrap(); // VAE always f32
+    let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT);
 
     // x_0 = VAE-encode mean of the preprocessed init.
     let x0 = encode_init_latents(&vae, &image, w, h).unwrap();
@@ -109,25 +117,22 @@ fn img2img_components_bit_exact() {
         )
         .unwrap();
     let (cond, pooled) = encode_conditioning(
-        &load_text_encoder_1(&snap).unwrap(),
-        &load_text_encoder_2(&snap).unwrap(),
+        &load_text_encoder_1_dtype(&snap, DT).unwrap(),
+        &load_text_encoder_2_dtype(&snap, DT).unwrap(),
         &tokens,
     )
     .unwrap();
     let time_ids = text_time_ids(pooled.shape()[0]);
-    let unet = load_unet(&snap).unwrap();
+    let unet = load_unet_dtype(&snap, DT).unwrap();
     let s0 = g.require("step0_latents").unwrap();
     let xu = mlx_rs::ops::concatenate_axis(&[s0, s0], 0).unwrap();
     let eps = unet.forward(&xu, ts[1], &cond, &pooled, &time_ids).unwrap();
     let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0).unwrap();
     let (et, en) = (row(0), row(1));
+    let cfg_s = mlx_gen::array::scalar(cfg).as_dtype(et.dtype()).unwrap();
     let eps1 = mlx_rs::ops::add(
         &en,
-        mlx_rs::ops::multiply(
-            mlx_rs::ops::subtract(&et, &en).unwrap(),
-            mlx_gen::array::scalar(cfg),
-        )
-        .unwrap(),
+        mlx_rs::ops::multiply(mlx_rs::ops::subtract(&et, &en).unwrap(), cfg_s).unwrap(),
     )
     .unwrap();
     let pr_eps = peak_rel(&eps1, g.require("eps1_cfg").unwrap());

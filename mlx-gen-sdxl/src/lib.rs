@@ -34,7 +34,10 @@ pub use adapters::{
 pub use config::{
     BetaSchedule, ClipActivation, ClipTextConfig, DiffusionConfig, UNetConfig, VaeConfig,
 };
-pub use loader::{load_text_encoder_1, load_text_encoder_2, load_tokenizer, load_unet, load_vae};
+pub use loader::{
+    load_text_encoder_1, load_text_encoder_1_dtype, load_text_encoder_2, load_text_encoder_2_dtype,
+    load_tokenizer, load_unet, load_unet_dtype, load_vae,
+};
 pub use model::{descriptor, load, Sdxl, MODEL_ID};
 pub use pipeline::{
     decode_image, decoded_to_image, denoise, encode_conditioning, encode_init_latents,

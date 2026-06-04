@@ -2,9 +2,10 @@
 //! Euler-Ancestral denoise loop with real classifier-free guidance, and the VAE decode. Port of the
 //! vendored `StableDiffusionXL.generate_latents` + `_denoising_loop` + `decode`.
 //!
-//! Everything runs **f32** (the parity/quality target; sidesteps the 16-bit GEMM bug). The RNG is
-//! seeded once per image, then the sampler draws the prior + per-step ancestral noise from the
-//! global stream — reproducing the reference's exact noise sequence for a seed.
+//! The U-Net, text encoders, sampler, and CFG run **fp16**, matching the production reference
+//! (`StableDiffusionXL(float16=True)`); the VAE runs f32 (it promotes the f16 latents on decode).
+//! The RNG is seeded once per image, then the sampler draws the prior + per-step ancestral noise from
+//! the global stream — reproducing the reference's exact noise sequence for a seed.
 
 use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, round, subtract};
 use mlx_rs::{random, Array};
@@ -100,9 +101,14 @@ pub fn denoise(
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
             let eps_text = row(0)?;
             let eps_neg = row(1)?;
+            // `eps_neg + cfg·(eps_text − eps_neg)`. The reference's `cfg_weight` is a python float that
+            // weak-casts to the eps dtype, so CFG runs in the compute dtype — cast the scalar to the
+            // eps dtype here too. An f32 `cfg` would promote an fp16 eps to f32, and the sampler step
+            // (which keys off `eps.dtype()`) would then run f32, silently leaving the latents f32.
+            let cfg_s = scalar(cfg).as_dtype(eps_text.dtype())?;
             add(
                 &eps_neg,
-                &multiply(&subtract(&eps_text, &eps_neg)?, scalar(cfg))?,
+                &multiply(&subtract(&eps_text, &eps_neg)?, &cfg_s)?,
             )?
         } else {
             eps

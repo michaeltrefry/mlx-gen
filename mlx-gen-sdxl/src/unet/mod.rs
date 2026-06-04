@@ -163,16 +163,23 @@ impl UNet2DConditionModel {
         time_ids: &Array,
     ) -> Result<Array> {
         let batch = x.shape()[0];
+        let dtype = x.dtype();
 
-        // Timestep embedding (broadcast the scalar time to the batch).
+        // Timestep embedding (broadcast the scalar time to the batch). The sinusoidal encoding runs
+        // in f32 (its `sigmas` table is f32), then the reference casts to the model dtype *before* the
+        // `time_embedding` MLP (`temb = self.timesteps(t).astype(x.dtype)`), so the MLP runs in the
+        // model dtype. The cast is a no-op for the f32 path.
         let t = Array::from_slice(&vec![timestep; batch as usize], &[batch]);
-        let temb = self.timesteps.forward(&t)?;
+        let temb = self.timesteps.forward(&t)?.as_dtype(dtype)?;
         let mut temb = self.time_embedding.forward(&temb)?;
 
         // SDXL `text_time` added conditioning: concat(pooled_text, flattened sinusoidal time_ids).
+        // `time_ids` stays f32 through its sinusoidal (the reference builds it f32), then the flattened
+        // result is cast to the model dtype before concat with the (model-dtype) pooled text
+        // (`...flatten(1).astype(x.dtype)`).
         let emb = self.add_time_proj.forward(time_ids)?; // [B, 6, 256]
         let es = emb.shape();
-        let emb = emb.reshape(&[es[0], es[1] * es[2]])?; // flatten(1) → [B, 1536]
+        let emb = emb.reshape(&[es[0], es[1] * es[2]])?.as_dtype(dtype)?; // flatten(1) → [B, 1536]
         let emb = concatenate_axis(&[text_emb, &emb], -1)?; // [B, 2816]
         let emb = self.add_embedding.forward(&emb)?;
         temb = add(&temb, &emb)?;

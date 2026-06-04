@@ -78,7 +78,7 @@ fn px8(img: &Image, g: &Weights) -> f32 {
 #[test]
 #[ignore = "needs the real SDXL snapshot + LoKr golden"]
 fn lokr_merge_count() {
-    let g = golden("sdxl_lokr_golden.safetensors");
+    let g = golden("sdxl_lokr_fp16_golden.safetensors");
     let mut unet = load_unet(&snapshot()).unwrap();
     let report =
         apply_sdxl_adapters(&mut unet, &[spec(&g, "lokr_path", 1.0, AdapterKind::Lokr)]).unwrap();
@@ -93,7 +93,7 @@ fn lokr_merge_count() {
 #[test]
 #[ignore = "needs the real SDXL snapshot + LoKr golden"]
 fn lokr_render_matches_reference() {
-    let g = golden("sdxl_lokr_golden.safetensors");
+    let g = golden("sdxl_lokr_fp16_golden.safetensors");
     let s = LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![spec(
         &g,
         "lokr_path",
@@ -131,7 +131,7 @@ fn lokr_render_matches_reference() {
 #[test]
 #[ignore = "needs the real SDXL snapshot + LoKr golden"]
 fn scale_zero_lokr_is_bit_exact_noop() {
-    let g = golden("sdxl_lokr_golden.safetensors");
+    let g = golden("sdxl_lokr_fp16_golden.safetensors");
     let base = render(&LoadSpec::new(WeightsSource::Dir(snapshot())), &g);
     let zero = render(
         &LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![spec(
@@ -158,7 +158,7 @@ fn scale_zero_lokr_is_bit_exact_noop() {
 #[test]
 #[ignore = "needs the real SDXL snapshot + LCM-LoRA + stacked golden"]
 fn lora_plus_lokr_stacks() {
-    let g = golden("sdxl_lokr_stacked_golden.safetensors");
+    let g = golden("sdxl_lokr_stacked_fp16_golden.safetensors");
     // Spec order matches the dump: LCM-LoRA merged first (515), then the LoKr (16).
     let mut unet = load_unet(&snapshot()).unwrap();
     let report = apply_sdxl_adapters(
@@ -175,11 +175,16 @@ fn lora_plus_lokr_stacks() {
         "stacking should merge LoRA (515) + LoKr (16)"
     );
 
+    // The stacked golden's LoRA is the vendored 515-module merge; `model::load` defaults to the
+    // COMPLETE 809 surface (sc-2671), so opt into the vendored surface for an apples-to-apples render.
+    // (Run this `#[ignore]` test on its own — it sets a process-global env.)
+    std::env::set_var("SDXL_LORA_VENDORED", "1");
     let s = LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![
         spec(&g, "lora_path", 1.0, AdapterKind::Lora),
         spec(&g, "lokr_path", 1.0, AdapterKind::Lokr),
     ]);
     let img = render(&s, &g);
+    std::env::remove_var("SDXL_LORA_VENDORED");
     let p = px8(&img, &g);
     println!(
         "✓ LoRA+LoKr stacked render {}x{}: {:.3}% px>8 ({} modules merged)",

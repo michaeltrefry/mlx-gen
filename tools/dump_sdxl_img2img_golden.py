@@ -28,6 +28,7 @@ VENDOR_PARENT = os.environ.get(
 )
 sys.path.insert(0, VENDOR_PARENT)
 from mlx_sd import StableDiffusionXL  # noqa: E402
+import mlx_sd.model_io as _mio  # noqa: E402
 
 REPO = "stabilityai/stable-diffusion-xl-base-1.0"
 PROMPT = os.environ.get("SDXL_PROMPT", "an oil painting of a fox")
@@ -38,8 +39,18 @@ CFG = float(os.environ.get("SDXL_CFG", "7.0"))
 STRENGTH = float(os.environ.get("SDXL_STRENGTH", "0.7"))
 W = int(os.environ.get("SDXL_W", "512"))
 H = int(os.environ.get("SDXL_H", "512"))
+FLOAT16 = bool(int(os.environ.get("FLOAT16", "0")))  # production path = fp16 (U-Net/TE; VAE stays f32)
 
-sd = StableDiffusionXL(REPO, float16=False)
+# Point `_MODELS` at the cached `.fp16.` files so the reference loads offline (this machine has only
+# the fp16 variant). For FLOAT16=1 they're the exact fp16 weights; for FLOAT16=0 upcast to f32.
+if os.environ.get("SDXL_FP16_FILES", "1") == "1":
+    _m = _mio._MODELS[REPO]
+    _m["unet"] = "unet/diffusion_pytorch_model.fp16.safetensors"
+    _m["text_encoder"] = "text_encoder/model.fp16.safetensors"
+    _m["text_encoder_2"] = "text_encoder_2/model.fp16.safetensors"
+    _m["vae"] = "vae/diffusion_pytorch_model.fp16.safetensors"
+
+sd = StableDiffusionXL(REPO, float16=FLOAT16)
 sd.ensure_models_are_loaded()
 
 # A deterministic uint8 init image, target-sized (no resize). NHWC [H, W, 3].
@@ -106,7 +117,8 @@ meta = {
     "prompt": PROMPT, "negative": NEGATIVE, "seed": str(SEED), "steps": str(STEPS),
     "cfg": str(CFG), "strength": str(STRENGTH), "w": str(W), "h": str(H),
 }
-out = os.path.join(_GOLDEN_DIR, "sdxl_img2img_golden.safetensors")
+suffix = "_fp16" if FLOAT16 else ""
+out = os.path.join(_GOLDEN_DIR, f"sdxl_img2img{suffix}_golden.safetensors")
 mx.save_safetensors(out, tensors, meta)
 print(f"wrote {out}")
-print(f"  strength={STRENGTH} start_step={start_step} eff_steps={eff_steps}; image {tuple(image_u8.shape)}")
+print(f"  float16={FLOAT16} strength={STRENGTH} start_step={start_step} eff_steps={eff_steps}; image {tuple(image_u8.shape)}")

@@ -85,6 +85,18 @@ impl Weights {
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty()
     }
+
+    /// Cast every tensor to `dtype` in place — mirrors the way a reference loader downcasts the
+    /// whole checkpoint at load (e.g. the vendored SDXL `_load_safetensor_weights(..., float16=True)`
+    /// applies `v.astype(mx.float16)` to every tensor). A no-op when `dtype` already matches.
+    pub fn cast_all(&mut self, dtype: Dtype) -> Result<()> {
+        for v in self.tensors.values_mut() {
+            if v.dtype() != dtype {
+                *v = v.as_dtype(dtype)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Cast to a target compute dtype (e.g. bf16, mirroring mflux's torch_convert downcast).

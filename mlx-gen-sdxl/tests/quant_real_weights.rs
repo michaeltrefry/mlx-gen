@@ -148,11 +148,11 @@ fn render_gate(q: Quant, name: &str, tag: &str) {
 #[test]
 #[ignore = "needs the real SDXL snapshot + Q8 golden"]
 fn q8_render_matches_reference() {
-    render_gate(Quant::Q8, "sdxl_q8_golden.safetensors", "q8");
+    render_gate(Quant::Q8, "sdxl_q8_fp16_golden.safetensors", "q8");
 }
 
 #[test]
 #[ignore = "needs the real SDXL snapshot + Q4 golden"]
 fn q4_render_matches_reference() {
-    render_gate(Quant::Q4, "sdxl_q4_golden.safetensors", "q4");
+    render_gate(Quant::Q4, "sdxl_q4_fp16_golden.safetensors", "q4");
 }

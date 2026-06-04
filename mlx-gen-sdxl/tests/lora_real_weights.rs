@@ -26,9 +26,11 @@ use mlx_gen_sdxl::{apply_sdxl_adapters, load_unet};
 // Force-link the provider so its `inventory::submit!` registers `"sdxl"`.
 use mlx_gen_sdxl as _;
 
+// Production runs fp16 (sc-2721); the render gate uses the `float16=True` vendored-merge golden,
+// dumped on MLX 0.31.2. Build: FLOAT16=1 <mlx-0.31.2 python> tools/dump_sdxl_lora_golden.py
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../tools/golden/sdxl_lora_golden.safetensors"
+    "/../tools/golden/sdxl_lora_fp16_golden.safetensors"
 );
 
 fn snapshot() -> PathBuf {
@@ -127,10 +129,15 @@ fn lora_merge_count_matches_vendored() {
 #[test]
 #[ignore = "needs the real SDXL snapshot + LCM-LoRA + lora golden"]
 fn lora_render_matches_vendored() {
+    // The golden is the **vendored** 515-module merge; `model::load` defaults to the COMPLETE 809
+    // surface (sc-2671), so opt into the vendored surface to compare apples-to-apples. (Run this
+    // `#[ignore]` real-weights test on its own — it sets a process-global env.)
+    std::env::set_var("SDXL_LORA_VENDORED", "1");
     let g = Weights::from_file(GOLDEN).unwrap();
     let spec =
         LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![lora_spec(&g, 1.0)]);
     let img = render(&spec, &g);
+    std::env::remove_var("SDXL_LORA_VENDORED");
 
     let gpix: Vec<u8> = g.require("image_u8").unwrap().as_slice::<u8>().to_vec();
     let out_path =

@@ -33,8 +33,19 @@ VENDOR_PARENT = os.environ.get(
 sys.path.insert(0, VENDOR_PARENT)
 from mlx_sd import StableDiffusionXL  # noqa: E402
 from mlx_sd import lora as vlora  # noqa: E402
+import mlx_sd.model_io as _mio  # noqa: E402
 
 REPO = "stabilityai/stable-diffusion-xl-base-1.0"
+FLOAT16 = bool(int(os.environ.get("FLOAT16", "0")))  # production = fp16 (U-Net/TE; VAE f32)
+
+# This machine's HF cache has only the `.fp16.` variant — point `_MODELS` at it so the reference
+# loads offline (exact fp16 weights for FLOAT16=1; upcast to f32 for FLOAT16=0).
+if os.environ.get("SDXL_FP16_FILES", "1") == "1":
+    _m = _mio._MODELS[REPO]
+    _m["unet"] = "unet/diffusion_pytorch_model.fp16.safetensors"
+    _m["text_encoder"] = "text_encoder/model.fp16.safetensors"
+    _m["text_encoder_2"] = "text_encoder_2/model.fp16.safetensors"
+    _m["vae"] = "vae/diffusion_pytorch_model.fp16.safetensors"
 LORA = os.environ.get(
     "SDXL_LORA",
     os.path.expanduser(
@@ -51,7 +62,7 @@ W = int(os.environ.get("SDXL_W", "512"))
 H = int(os.environ.get("SDXL_H", "512"))
 SCALE = float(os.environ.get("SDXL_LORA_SCALE", "1.0"))
 
-sd = StableDiffusionXL(REPO, float16=False)
+sd = StableDiffusionXL(REPO, float16=FLOAT16)
 sd.ensure_models_are_loaded()
 
 # --- Delta bit-exactness check across ALL merged modules ---
@@ -132,7 +143,8 @@ meta = {
     "cfg": str(CFG), "w": str(W), "h": str(H), "scale": str(SCALE),
     "lora_path": LORA, "touched": str(touched), "delta_match": str(int(delta_match)),
 }
-out = os.path.join(_GOLDEN_DIR, "sdxl_lora_golden.safetensors")
+suffix = "_fp16" if FLOAT16 else ""
+out = os.path.join(_GOLDEN_DIR, f"sdxl_lora{suffix}_golden.safetensors")
 mx.save_safetensors(out, tensors, meta)
 print(f"wrote {out}")
-print(f"  prompt={PROMPT!r} seed={SEED} steps={STEPS} cfg={CFG} {W}x{H} scale={SCALE} touched={touched}")
+print(f"  float16={FLOAT16} prompt={PROMPT!r} seed={SEED} steps={STEPS} cfg={CFG} {W}x{H} scale={SCALE} touched={touched}")

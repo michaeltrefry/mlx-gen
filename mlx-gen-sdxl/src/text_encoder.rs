@@ -1,8 +1,8 @@
 //! CLIP text encoders — a Rust port of the vendored `_vendor/mlx_sd/clip.py` (`CLIPTextModel` +
 //! `CLIPEncoderLayer`). SDXL conditions on **two** of these: CLIP-L (`text_encoder`, 768-wide, no
 //! projection) and OpenCLIP-bigG (`text_encoder_2`, 1280-wide, with a final projection feeding the
-//! pooled micro-conditioning). Both run f32 (the checkpoints are f32 on disk; f32 activations are
-//! the parity/quality target and sidestep the 16-bit GEMM bug).
+//! pooled micro-conditioning). Both run **fp16**, matching the production reference
+//! (`StableDiffusionXL(float16=True)`); `load_text_encoder_*_dtype` keeps an f32 path for stage gates.
 //!
 //! The SDXL conditioning is `concat(te1.hidden_states[-2], te2.hidden_states[-2])` (the
 //! penultimate-layer hidden states, BEFORE the final layer-norm) over the full padded sequence, plus
@@ -11,12 +11,12 @@
 //! the UNet cross-attention).
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
-use mlx_rs::nn::gelu;
-use mlx_rs::ops::{add, multiply, sigmoid};
-use mlx_rs::Array;
+use mlx_rs::ops::add;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::array::{host_i32, scalar};
+use mlx_gen::array::host_i32;
+use mlx_gen::nn::{gelu_exact, gelu_quick};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -98,14 +98,12 @@ impl ClipEncoderLayer {
 
     fn activation(&self, x: &Array) -> Result<Array> {
         match self.act {
-            // quick_gelu = x * sigmoid(1.702 * x). NOT mlx-rs's `gelu_fast_approximate`, which uses
-            // the constant 1.773 — the vendored reference (`mlx.nn.gelu_fast_approx`) uses 1.702, so
-            // the built-in would inject a ~1.3e-3 divergence across CLIP-L's 12 layers (sc-2400 S2).
-            ClipActivation::QuickGelu => {
-                let s = sigmoid(&multiply(x, scalar(1.702))?)?;
-                Ok(multiply(x, &s)?)
-            }
-            ClipActivation::Gelu => Ok(gelu(x)?),
+            // CLIP-L "quick_gelu" = `x · sigmoid(1.702·x)` — the vendored `mlx.nn.gelu_fast_approx`
+            // (NOT mlx-rs `gelu_fast_approximate`, which uses 1.773). The core `gelu_quick` matches it
+            // byte-for-byte: dtype-weak `1.702` (an f32 scalar promotes f16→f32) + `mx.compile` (the
+            // fused fp16 rounding — see `gelu_exact`/sc-2721). CLIP-bigG uses exact `gelu`.
+            ClipActivation::QuickGelu => gelu_quick(x),
+            ClipActivation::Gelu => gelu_exact(x),
         }
     }
 
@@ -220,7 +218,7 @@ impl ClipTextEncoder {
         let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
         let mut x = add(&tok, &pos.reshape(&[1, n, dim])?)?;
 
-        let mask = causal_mask(n)?;
+        let mask = causal_mask(n, x.dtype())?;
         let mut hidden_states = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             x = layer.forward(&x, &mask)?;
@@ -260,20 +258,27 @@ impl ClipTextEncoder {
     }
 }
 
-/// Build the additive causal attention mask `[1, 1, N, N]` (f32): `0` where a query may attend to a
-/// key (`j <= i`), `-1e9` above the diagonal. Mirrors the vendored `CLIPTextModel._get_mask` for the
-/// f32 path.
-fn causal_mask(n: i32) -> Result<Array> {
+/// Build the additive causal attention mask `[1, 1, N, N]` in the model `dtype`: `0` where a query
+/// may attend to a key (`j <= i`), a large negative above the diagonal. Mirrors the vendored
+/// `CLIPTextModel._get_mask(N, dtype)` exactly, including its dtype-specific masked value —
+/// **`-6e4` for fp16** (≈ f16's finite floor; `-1e9` would overflow to `-inf`) and `-1e9` for f32.
+/// The mask must share the q/k/v dtype or `scaled_dot_product_attention` rejects it.
+fn causal_mask(n: i32, dtype: Dtype) -> Result<Array> {
     let nu = n as usize;
+    let masked = if dtype == Dtype::Float16 {
+        -6.0e4
+    } else {
+        -1.0e9
+    };
     let mut m = vec![0f32; nu * nu];
     for i in 0..nu {
         for (j, slot) in m[i * nu..(i + 1) * nu].iter_mut().enumerate() {
             if j > i {
-                *slot = -1e9;
+                *slot = masked;
             }
         }
     }
-    Ok(Array::from_slice(&m, &[1, 1, n, n]))
+    Ok(Array::from_slice(&m, &[1, 1, n, n]).as_dtype(dtype)?)
 }
 
 #[cfg(test)]
@@ -282,7 +287,7 @@ mod tests {
 
     #[test]
     fn causal_mask_is_lower_triangular() {
-        let m = causal_mask(3).unwrap();
+        let m = causal_mask(3, Dtype::Float32).unwrap();
         let v = m.reshape(&[9]).unwrap();
         let s = v.as_slice::<f32>();
         // row 0 attends only to 0; row 1 to {0,1}; row 2 to all.

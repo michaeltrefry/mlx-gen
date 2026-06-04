@@ -26,8 +26,20 @@ VENDOR_PARENT = os.environ.get(
 )
 sys.path.insert(0, VENDOR_PARENT)
 from mlx_sd import StableDiffusionXL  # noqa: E402
+import mlx_sd.model_io as _mio  # noqa: E402
 
 REPO = "stabilityai/stable-diffusion-xl-base-1.0"
+
+# If only the fp16 diffusers variant is cached (this machine), point `_MODELS` at the `.fp16.`
+# files so the reference loads offline. With float16=False they are upcast to f32 — identical
+# upcast weights on the Rust side (its f32 loader falls back to the fp16 file too) — which isolates
+# any cross-version kernel difference from a weight difference (sc-2721).
+if os.environ.get("SDXL_FP16_FILES", "1") == "1":
+    _m = _mio._MODELS[REPO]
+    _m["unet"] = "unet/diffusion_pytorch_model.fp16.safetensors"
+    _m["text_encoder"] = "text_encoder/model.fp16.safetensors"
+    _m["text_encoder_2"] = "text_encoder_2/model.fp16.safetensors"
+    _m["vae"] = "vae/diffusion_pytorch_model.fp16.safetensors"
 PROMPT = os.environ.get("SDXL_PROMPT", "a red fox in a forest")
 H = int(os.environ.get("SDXL_LATENT_H", "64"))  # 64 -> 512px image
 W = int(os.environ.get("SDXL_LATENT_W", "64"))

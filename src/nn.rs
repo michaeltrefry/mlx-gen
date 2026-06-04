@@ -9,9 +9,10 @@
 
 use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{
-    add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, multiply, power, sigmoid,
-    tanh,
+    add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, divide, erf, multiply,
+    power, sigmoid, tanh,
 };
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 use crate::array::scalar;
@@ -57,6 +58,45 @@ pub fn gelu_tanh(x: &Array) -> Result<Array> {
     let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
     let gate = add(&tanh(&inner)?, &s(1.0)?)?;
     Ok(multiply(&multiply(x, &s(0.5)?)?, &gate)?)
+}
+
+/// Exact GELU — `x · (1 + erf(x/√2)) / 2` — **dtype-preserving** and **byte-identical to MLX-Python's
+/// `nn.gelu`** (the activation in the SDXL GEGLU FFN — `y_a · gelu(y_b)`).
+///
+/// Two things are required to match the reference bit-for-bit, both fp16-only traps (f32-invisible):
+///   1. **Dtype-weak constants.** Each python-float constant is cast to `x.dtype()` so an f16 input
+///      stays f16. `mlx_rs::nn::gelu` builds `1/√2` / `2` as f32 *arrays* (`array!(2f32.sqrt())`),
+///      which promote an f16 input to f32 — the silent f16→f32 leak that made the SDXL fp16 U-Net run
+///      (and return) f32 (sc-2721). `√2` is taken in f64 (python `math.sqrt(2)`) before the cast.
+///   2. **`mx.compile`.** MLX-Python decorates `nn.gelu` with `@mx.compile`; the fused kernel rounds
+///      fp16 differently from the same ops run unfused (a 1-ULP/elem gap — measured as the *sole*
+///      SDXL fp16 U-Net divergence: replacing the reference's compiled gelu with an unfused literal
+///      reproduces the 57.7%-byte-exact / 5.3e-4 gap exactly). Compiling the identical graph here
+///      reproduces the fused rounding → bit-exact. f32-safe: an f32 input is unchanged either way.
+pub fn gelu_exact(x: &Array) -> Result<Array> {
+    let f = |x_: &Array| {
+        let dt = x_.dtype();
+        let inv_sqrt2 = scalar(std::f64::consts::SQRT_2 as f32).as_dtype(dt)?;
+        let one = scalar(1.0).as_dtype(dt)?;
+        let two = scalar(2.0).as_dtype(dt)?;
+        let inner = erf(&divide(x_, &inv_sqrt2)?)?; // erf(x / √2)
+        let gate = add(&one, &inner)?; // 1 + erf(x / √2)
+        divide(&multiply(x_, &gate)?, &two) // (x · gate) / 2
+    };
+    Ok(compile(f, true)(x)?)
+}
+
+/// Fast-approx GELU ("quick_gelu") — `x · sigmoid(1.702·x)` — **byte-identical to MLX-Python's
+/// `nn.gelu_fast_approx`** (the CLIP-L / `quick_gelu` activation). Same two requirements as
+/// [`gelu_exact`]: the `1.702` constant is weak-cast to `x.dtype()` (an f32 scalar would promote an
+/// f16 input to f32), and the graph is `mx.compile`'d so the fused fp16 rounding matches the
+/// reference. f32-safe (no-op cast, fusion numerically identical).
+pub fn gelu_quick(x: &Array) -> Result<Array> {
+    let f = |x_: &Array| {
+        let c = scalar(1.702).as_dtype(x_.dtype())?;
+        multiply(x_, &sigmoid(&multiply(x_, &c)?)?) // x · sigmoid(1.702·x)
+    };
+    Ok(compile(f, true)(x)?)
 }
 
 /// 2-D conv over NHWC `x` with an mlx `[out, kH, kW, in]` weight (+ optional bias).

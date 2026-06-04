@@ -17,6 +17,7 @@ use mlx_gen::{
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
     Result, WeightsSource,
 };
+use mlx_rs::Dtype;
 
 use crate::config::DiffusionConfig;
 use crate::loader;
@@ -94,20 +95,24 @@ pub struct Sdxl {
 ///
 /// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a
 /// `stabilityai/stable-diffusion-xl-base-1.0` snapshot (the diffusers multi-component tree —
-/// `tokenizer/`, `tokenizer_2/`, `text_encoder/`, `text_encoder_2/`, `unet/`, `vae/`). All weights
-/// load + run f32.
+/// `tokenizer/`, `tokenizer_2/`, `text_encoder/`, `text_encoder_2/`, `unet/`, `vae/`).
+///
+/// **Dtype:** the U-Net + both CLIP text encoders run **fp16**, matching the production reference
+/// (`StableDiffusionXL(float16=True)`); the **VAE stays f32** (the vendored always loads the
+/// autoencoder f32 — the SDXL VAE is fp16-unstable). The whole fp16 path is byte-identical to the
+/// reference on MLX 0.31.2 (sc-2721; needs sc-2772's NAX 16-bit fix + the compiled `gelu_exact`).
+/// The lower-level `load_unet`/`load_text_encoder_*` keep an f32 path for the tight stage gates.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
-        // The validated dense path runs f32 activations over f32 weights (sidesteps the pmetal
-        // 16-bit dense-GEMM bug and is the f32-quality target); an fp32 precision override is the
-        // default behaviour, not a separate mode, and a non-default precision flag is rejected
-        // rather than silently ignored.
+        // `Precision::Bf16` is the registry's dense sentinel; the dense path runs fp16 (the
+        // production dtype). A non-default precision flag is rejected rather than silently ignored.
         return Err(Error::Msg(
-            "sdxl: precision override is not wired; the dense path already runs f32 activations \
-             (drop the precision override)"
+            "sdxl: precision override is not wired; the dense path runs fp16 (the production \
+             reference dtype) — drop the precision override"
                 .into(),
         ));
     }
+    let dtype = Dtype::Float16;
     let root =
         match &spec.weights {
             WeightsSource::Dir(p) => p,
@@ -117,10 +122,11 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    let mut unet = loader::load_unet(root)?;
+    let mut unet = loader::load_unet_dtype(root, dtype)?;
     if !spec.adapters.is_empty() {
-        // Merge LoRA (kohya `lora_unet_` / PEFT, sc-2639) and LoKr (sc-2640) into the dense f32
-        // U-Net weights at load — the vendored `lora.py` merges pre-quantization, and merging (not a
+        // Merge LoRA (kohya `lora_unet_` / PEFT, sc-2639) and LoKr (sc-2640) into the dense fp16
+        // U-Net weights at load — the production reference merges into the `float16=True` U-Net too,
+        // and merging (not a
         // forward-time residual) keeps the chaos-sensitive ancestral sampler bit-exact. Out-of-surface
         // keys (mid_block/ff/conv) are surfaced in the report, not dropped.
         //
@@ -140,9 +146,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         };
         crate::adapters::apply_sdxl_adapters_with(&mut unet, &spec.adapters, coverage)?;
     }
-    let mut te1 = loader::load_text_encoder_1(root)?;
-    let mut te2 = loader::load_text_encoder_2(root)?;
-    let vae = loader::load_vae(root)?;
+    let mut te1 = loader::load_text_encoder_1_dtype(root, dtype)?;
+    let mut te2 = loader::load_text_encoder_2_dtype(root, dtype)?;
+    let vae = loader::load_vae(root)?; // VAE always f32 (vendored loads the autoencoder float16=False)
 
     if let Some(q) = spec.quantize {
         // Q4/Q8 (group_size 64) over every quantizable Linear of the U-Net + both CLIP encoders —
@@ -167,7 +173,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         te2,
         unet,
         vae,
-        sampler: EulerSampler::new(&DiffusionConfig::sdxl_base(), true),
+        sampler: EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, dtype),
     }))
 }
 

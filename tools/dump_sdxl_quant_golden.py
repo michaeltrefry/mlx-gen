@@ -32,8 +32,17 @@ os.makedirs(_GOLDEN_DIR, exist_ok=True)
 sys.path.insert(0, os.environ.get(
     "SDXL_VENDOR_PARENT", "/Users/michael/Repos/SceneWorks/apps/worker/scene_worker/_vendor"))
 from mlx_sd import StableDiffusionXL  # noqa: E402
+import mlx_sd.model_io as _mio  # noqa: E402
 
 REPO = "stabilityai/stable-diffusion-xl-base-1.0"
+FLOAT16 = bool(int(os.environ.get("FLOAT16", "0")))  # production = fp16 base, then quantize
+
+if os.environ.get("SDXL_FP16_FILES", "1") == "1":
+    _m = _mio._MODELS[REPO]
+    _m["unet"] = "unet/diffusion_pytorch_model.fp16.safetensors"
+    _m["text_encoder"] = "text_encoder/model.fp16.safetensors"
+    _m["text_encoder_2"] = "text_encoder_2/model.fp16.safetensors"
+    _m["vae"] = "vae/diffusion_pytorch_model.fp16.safetensors"
 PROMPT = os.environ.get("SDXL_PROMPT", "a red fox in a forest, highly detailed")
 NEGATIVE = os.environ.get("SDXL_NEGATIVE", "blurry, low quality")
 SEED = int(os.environ.get("SDXL_SEED", "42"))
@@ -105,10 +114,13 @@ print("wrote sdxl_quant_scales_ref.safetensors (probe query_proj, Q8+Q4)")
 del sd0
 
 # --- Reference Q8 + Q4 renders (UNet + both TEs, bf16-cast + nn.quantize Linear-only) ---
+# At float16=True the base is fp16 (production); quantize bf16-casts the Linear weights either way, so
+# the packed weights are identical, but the render runs f16 activations (matching `load(Q)` at fp16).
+_sfx = "_fp16" if FLOAT16 else ""
 for bits in (8, 4):
-    sd = StableDiffusionXL(REPO, float16=False)
+    sd = StableDiffusionXL(REPO, float16=FLOAT16)
     sd.ensure_models_are_loaded()
     quantize_model(sd, bits)
-    save(f"sdxl_q{bits}_golden", render(sd), bits)
+    save(f"sdxl_q{bits}{_sfx}_golden", render(sd), bits)
     del sd
     mx.clear_cache()

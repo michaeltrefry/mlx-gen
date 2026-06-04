@@ -36,8 +36,17 @@ VENDOR_PARENT = os.environ.get(
 sys.path.insert(0, VENDOR_PARENT)
 from mlx_sd import StableDiffusionXL  # noqa: E402
 from mlx_sd import lora as vlora  # noqa: E402
+import mlx_sd.model_io as _mio  # noqa: E402
 
 REPO = "stabilityai/stable-diffusion-xl-base-1.0"
+FLOAT16 = bool(int(os.environ.get("FLOAT16", "0")))  # production = fp16 (U-Net/TE; VAE f32)
+
+if os.environ.get("SDXL_FP16_FILES", "1") == "1":
+    _m = _mio._MODELS[REPO]
+    _m["unet"] = "unet/diffusion_pytorch_model.fp16.safetensors"
+    _m["text_encoder"] = "text_encoder/model.fp16.safetensors"
+    _m["text_encoder_2"] = "text_encoder_2/model.fp16.safetensors"
+    _m["vae"] = "vae/diffusion_pytorch_model.fp16.safetensors"
 LORA = os.environ.get(
     "SDXL_LORA",
     os.path.expanduser(
@@ -92,7 +101,9 @@ def merge_lokr(unet, adapter_path, scale=1.0):
                 w2 = tens[f"{stem}.lokr_w2"]
                 delta = (np.kron(w1, w2).astype(np.float32) * np.float32(scale))
                 mod = getattr(unet.down_blocks[1].attentions[a].transformer_blocks[tb].attn1, vend)
-                mod.weight = mod.weight + mx.array(delta)
+                # Match production's merge_dense_delta: cast δ to the weight dtype before adding, so a
+                # float16=True U-Net merges `W_f16 + δ.astype(f16)` (an f32 δ would promote W to f32).
+                mod.weight = mod.weight + mx.array(delta).astype(mod.weight.dtype)
                 n += 1
     return n
 
@@ -126,18 +137,20 @@ def save(name, image_u8, extra=None):
 
 adapter = build_lokr(os.path.join(_GOLDEN_DIR, "sdxl_lokr_adapter.safetensors"))
 
+_sfx = "_fp16" if FLOAT16 else ""
+
 # LoKr only.
-sd = StableDiffusionXL(REPO, float16=False)
+sd = StableDiffusionXL(REPO, float16=FLOAT16)
 sd.ensure_models_are_loaded()
 n = merge_lokr(sd.unet, adapter, scale=1.0)
-print(f"merged {n} LoKr modules")
-save("sdxl_lokr_golden", render(sd), {"lokr_path": adapter, "scale": "1.0"})
+print(f"merged {n} LoKr modules (float16={FLOAT16})")
+save(f"sdxl_lokr{_sfx}_golden", render(sd), {"lokr_path": adapter, "scale": "1.0"})
 
 # LCM-LoRA then LoKr (stacking). Fresh UNet.
-sd2 = StableDiffusionXL(REPO, float16=False)
+sd2 = StableDiffusionXL(REPO, float16=FLOAT16)
 sd2.ensure_models_are_loaded()
 touched = vlora.apply_loras_to_unet(sd2.unet, [{"path": LORA, "weight": 1.0}])
 n2 = merge_lokr(sd2.unet, adapter, scale=1.0)
 print(f"stacked: LoRA touched {touched} + LoKr merged {n2}")
-save("sdxl_lokr_stacked_golden", render(sd2),
+save(f"sdxl_lokr_stacked{_sfx}_golden", render(sd2),
      {"lora_path": LORA, "lokr_path": adapter, "scale": "1.0", "touched": str(touched)})
