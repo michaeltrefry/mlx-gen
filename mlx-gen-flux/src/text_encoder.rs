@@ -61,13 +61,14 @@ impl TokenEmbedding {
                 dequantize(&pw, &sc, &bi, *group_size, *bits)?
             }
         };
-        // Text encoders run f32 activations. This is MANDATORY on the pinned NAX MLX build, not a
-        // quality choice: T5 self-attention uses explicit `matmul(q, kᵀ)` with K=head_dim=64 (and
-        // `weights·v` with K=256), i.e. bf16×bf16 GEMMs with M≥2 & K≤512 — the dense 16-bit Metal
-        // GEMM bug ([[pmetal-mlx-bf16-matmul-bug]]). Forcing bf16 here returns garbage (T5/CLIP
-        // mean_rel ~1.0, full pipeline 85% px>8 — sc-2345 experiment). f32 acts (MLX promotes the
-        // bf16 weights per-op) sidestep it and are also the quality target. Do NOT switch to bf16.
-        Ok(out.as_dtype(Dtype::Float32)?)
+        // Return the native (bf16) embedding to match the mflux reference (sc-2787). CLIP genuinely
+        // runs bf16 (its `nn.LayerNorm` fast kernel returns bf16); T5 immediately upcasts to f32 in
+        // its `T5LayerNorm` (variance `astype(f32)`, which MLX promotion propagates through the whole
+        // encoder), so T5 stays f32-internally either way — the FLUX checkpoint is bf16-native, so the
+        // bf16↔f32 cast is lossless here. The old MANDATORY-f32 comment was bug-forced: T5/CLIP
+        // attention is bf16×bf16 K≤512 (the [[pmetal-mlx-bf16-matmul-bug]] dense 16-bit GEMM), now
+        // fixed by sc-2772 (NAX metal target ≥26.2) — so bf16 is correct AND the parity dtype.
+        Ok(out)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -458,7 +459,10 @@ impl T5FeedForward {
 }
 
 fn quick_gelu(x: &Array) -> Result<Array> {
-    Ok(multiply(x, &sigmoid(&multiply(x, scalar(1.702))?)?)?)
+    // Dtype-preserving (sc-2787): the fork's `1.702 * input_array` is a weak python scalar, so a bf16
+    // input stays bf16. A strong f32 `scalar(1.702)` would promote bf16→f32 and break CLIP bf16 parity.
+    let c = scalar(1.702).as_dtype(x.dtype())?;
+    Ok(multiply(x, &sigmoid(&multiply(x, &c)?)?)?)
 }
 
 /// T5's `T5LayerNorm` — RMS-normalize over the last axis with NO mean subtraction.

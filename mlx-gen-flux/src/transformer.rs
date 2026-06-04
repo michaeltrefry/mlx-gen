@@ -8,7 +8,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::nn::gelu;
-use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
+use mlx_rs::ops::{add, concatenate_axis, divide, multiply, power, split, subtract};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::FluxVariant;
@@ -298,16 +298,22 @@ impl TimeTextEmbed {
     }
 
     fn forward(&self, sigma_step: f32, pooled: &Array, guidance: f32) -> Result<Array> {
-        let t = Array::from_slice(&[sigma_step], &[1]);
+        // Match the fork's bf16 conditioning path (sc-2787). `time_step`/`guidance` are cast to the
+        // model precision (bf16) BEFORE the sinusoidal `time_proj` (so they carry bf16 rounding —
+        // `Transformer.compute_text_embeddings` does `.astype(config.precision)`); the pooled CLIP
+        // embedding enters as bf16; and the summed conditioning is cast back to bf16
+        // (`conditioning.astype(ModelConfig.precision)`). `time_proj` then upcasts to f32 for sin/cos,
+        // exactly like the fork. The transformer's main residual stream stays f32 (fork latents +
+        // prompt_embeds are f32), so only the modulation path is bf16.
+        let bf16 = Dtype::Bfloat16;
+        let t = Array::from_slice(&[sigma_step], &[1]).as_dtype(bf16)?;
         let mut out = self.timestep.forward(&time_proj(&t)?)?;
         if let Some(g) = &self.guidance {
-            let gstep = Array::from_slice(&[guidance], &[1]);
+            let gstep = Array::from_slice(&[guidance], &[1]).as_dtype(bf16)?;
             out = add(&out, &g.forward(&time_proj(&gstep)?)?)?;
         }
-        out = add(&out, &self.text.forward(pooled)?)?;
-        // Conditioning runs f32 (the whole transformer is f32 activations — the quality target;
-        // the fork's bf16 conditioning is the lossy reference, not the goal).
-        Ok(out)
+        out = add(&out, &self.text.forward(&pooled.as_dtype(bf16)?)?)?;
+        Ok(out.as_dtype(bf16)?)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -597,7 +603,7 @@ impl AdaLayerNormZero {
         let p = split(&self.linear.forward(&silu(emb)?)?, 6, 1)?;
         let normed = layer_norm(hidden, None, None, LN_EPS)?;
         let normed = add(
-            &multiply(&normed, &add(&p[1], scalar(1.0))?.expand_dims(1)?)?,
+            &multiply(&normed, &one_plus(&p[1])?.expand_dims(1)?)?,
             &p[0].expand_dims(1)?,
         )?;
         Ok((
@@ -614,7 +620,7 @@ impl AdaLayerNormZero {
         let p = split(&self.linear.forward(&silu(emb)?)?, 3, 1)?;
         let normed = layer_norm(hidden, None, None, LN_EPS)?;
         let normed = add(
-            &multiply(&normed, &add(&p[1], scalar(1.0))?.expand_dims(1)?)?,
+            &multiply(&normed, &one_plus(&p[1])?.expand_dims(1)?)?,
             &p[0].expand_dims(1)?,
         )?;
         Ok((normed, p[2].clone()))
@@ -640,7 +646,7 @@ impl AdaLayerNormContinuous {
         let p = split(&self.linear.forward(&silu(emb)?)?, 2, 1)?;
         let normed = layer_norm(x, None, None, LN_EPS)?;
         Ok(add(
-            &multiply(&normed, &add(&p[0], scalar(1.0))?.expand_dims(1)?)?,
+            &multiply(&normed, &one_plus(&p[0])?.expand_dims(1)?)?,
             &p[1].expand_dims(1)?,
         )?)
     }
@@ -713,47 +719,39 @@ impl FluxRope {
     }
 
     fn forward(&self, txt_seq: usize, latent_h: usize, latent_w: usize) -> Result<RopeTable> {
-        let omega = |dim: i32| -> Vec<f32> {
-            (0..dim / 2)
-                .map(|k| 1.0 / self.theta.powf((2 * k) as f32 / dim as f32))
-                .collect()
-        };
-        let freqs = [
-            omega(self.axes_dim[0]),
-            omega(self.axes_dim[1]),
-            omega(self.axes_dim[2]),
-        ];
-        let half = freqs.iter().map(Vec::len).sum::<usize>();
-        let total = txt_seq + latent_h * latent_w;
-        let mut cos = vec![1.0_f32; total * half];
-        let mut sin = vec![0.0_f32; total * half];
+        let total = (txt_seq + latent_h * latent_w) as i32;
+        // Per-axis positions (the fork's `ids[..., i]`): axis 0 is all-zero; axis 1 = latent row (h),
+        // axis 2 = latent col (w); text tokens sit at position 0 on every axis.
+        let mut pos1 = vec![0f32; total as usize];
+        let mut pos2 = vec![0f32; total as usize];
         for h in 0..latent_h {
             for w in 0..latent_w {
-                let row = (txt_seq + h * latent_w + w) * half;
-                let mut j = 0;
-                for &f in &freqs[0] {
-                    let a = 0.0 * f;
-                    cos[row + j] = a.cos();
-                    sin[row + j] = a.sin();
-                    j += 1;
-                }
-                for &f in &freqs[1] {
-                    let a = h as f32 * f;
-                    cos[row + j] = a.cos();
-                    sin[row + j] = a.sin();
-                    j += 1;
-                }
-                for &f in &freqs[2] {
-                    let a = w as f32 * f;
-                    cos[row + j] = a.cos();
-                    sin[row + j] = a.sin();
-                    j += 1;
-                }
+                let row = txt_seq + h * latent_w + w;
+                pos1[row] = h as f32;
+                pos2[row] = w as f32;
             }
         }
+        // Build each axis's cos/sin with MLX ops (sc-2787), bit-matching the fork's `EmbedND`:
+        // `omega = 1/(theta**scale)`, `out = pos·omega`, then `mx.cos`/`mx.sin`. The host libm trig +
+        // `powf` differ from MLX by ~4e-7, which the chaotic 57-block stack amplifies into the only
+        // remaining transformer parity gap (every kernel op is otherwise bit-identical at 0.31.2).
+        let axis = |dim: i32, pos: &[f32]| -> Result<(Array, Array)> {
+            let half = dim / 2;
+            let scale: Vec<f32> = (0..half).map(|k| (2 * k) as f32 / dim as f32).collect();
+            let omega = divide(
+                scalar(1.0),
+                power(scalar(self.theta), Array::from_slice(&scale, &[1, half]))?,
+            )?;
+            let out = multiply(Array::from_slice(pos, &[total, 1]), &omega)?;
+            Ok((out.cos()?, out.sin()?))
+        };
+        let zeros = vec![0f32; total as usize];
+        let (c0, s0) = axis(self.axes_dim[0], &zeros)?;
+        let (c1, s1) = axis(self.axes_dim[1], &pos1)?;
+        let (c2, s2) = axis(self.axes_dim[2], &pos2)?;
         Ok(RopeTable {
-            cos: Array::from_slice(&cos, &[total as i32, half as i32]),
-            sin: Array::from_slice(&sin, &[total as i32, half as i32]),
+            cos: concatenate_axis(&[&c0, &c1, &c2], 1)?,
+            sin: concatenate_axis(&[&s0, &s1, &s2], 1)?,
         })
     }
 }
@@ -830,7 +828,7 @@ fn apply_norm_ff(
     let hidden = add(hidden, &multiply(&gate_msa.expand_dims(1)?, attn)?)?;
     let norm = layer_norm(&hidden, None, None, LN_EPS)?;
     let norm = add(
-        &multiply(&norm, &add(scale_mlp, scalar(1.0))?.expand_dims(1)?)?,
+        &multiply(&norm, &one_plus(scale_mlp)?.expand_dims(1)?)?,
         &shift_mlp.expand_dims(1)?,
     )?;
     Ok(add(
@@ -840,12 +838,19 @@ fn apply_norm_ff(
 }
 
 fn time_proj(time_steps: &Array) -> Result<Array> {
-    let half = 128usize;
-    let max_period = 10000f32;
-    let freqs: Vec<f32> = (0..half)
-        .map(|i| (-(max_period.ln()) * i as f32 / half as f32).exp())
-        .collect();
-    let f = Array::from_slice(&freqs, &[1, half as i32]);
+    let half = 128i32;
+    let max_period = 10000f64;
+    // Build the sinusoidal freqs with MLX ops (sc-2787) to bit-match the fork's `_time_proj`:
+    // `exp(-log(max_period) * arange(half) / half)`. Host `exp`/`arange` differ from MLX by ~1e-7,
+    // which flips one element of the bf16 conditioning by a ULP and seeds the joint stack. `-log` is
+    // taken in f64 then cast to f32 (the fork's `math.log` is f64, weak-cast at the MLX multiply).
+    let neg_log = -(max_period.ln()) as f32;
+    let arange: Vec<f32> = (0..half).map(|i| i as f32).collect();
+    let exponent = divide(
+        multiply(Array::from_slice(&arange, &[1, half]), scalar(neg_log))?,
+        scalar(half as f32),
+    )?;
+    let f = exponent.exp()?;
     let emb = multiply(
         &time_steps
             .reshape(&[time_steps.shape()[0], 1])?
@@ -869,6 +874,14 @@ fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLin
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
+}
+
+/// `1 + scale` computed in `scale`'s own dtype (sc-2787). The fork's `1 + scale_msa` uses a weak
+/// python `1` that adopts the modulation dtype, so when conditioning is bf16 the add rounds in bf16
+/// (coarse near 1.0 — bf16 spacing ~2⁻⁷). A strong f32 `scalar(1.0)` would promote the sum to f32 and
+/// drop that rounding, breaking parity with the bf16 reference.
+fn one_plus(scale: &Array) -> Result<Array> {
+    Ok(add(scale, &scalar(1.0).as_dtype(scale.dtype())?)?)
 }
 
 fn join(prefix: &str, suffix: &str) -> String {

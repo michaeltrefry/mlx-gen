@@ -138,21 +138,26 @@ fn load_tokenizer(
     kind: FluxTokenizerKind,
     variant: FluxVariant,
 ) -> Result<TextTokenizer> {
-    let dir = root.join(kind.subdir());
     let config = TokenizerConfig {
         max_length: kind.max_length(variant),
         pad_token_id: kind.pad_token_id(),
         chat_template: ChatTemplate::None,
         pad_to_max_length: true,
     };
-    let fast = dir.join("tokenizer.json");
-    if fast.exists() {
-        return TextTokenizer::from_file(fast, config);
-    }
     match kind {
         FluxTokenizerKind::Clip => {
-            TextTokenizer::from_clip_bpe(dir.join("vocab.json"), dir.join("merges.txt"), config)
+            // The FLUX repo ships CLIP only as `vocab.json`+`merges.txt` (no `tokenizer.json`), and
+            // the core byte-level `from_clip_bpe` mis-tokenizes CLIP (GPT-2 byte-level vs CLIP's
+            // lowercased word-BPE with `</w>`), silently corrupting the pooled conditioning on every
+            // render (sc-2787). Load the vendored, HF-faithful CLIP `tokenizer.json` compiled into the
+            // crate and NEVER fall back to the broken path — a missing/invalid asset errors loudly.
+            const CLIP_TOKENIZER_JSON: &str = include_str!("../assets/clip_tokenizer.json");
+            TextTokenizer::from_json_str(CLIP_TOKENIZER_JSON, config)
         }
-        FluxTokenizerKind::T5 => TextTokenizer::from_file(fast, config),
+        FluxTokenizerKind::T5 => {
+            // T5 ships a real `tokenizer.json` in `tokenizer_2/` (verified fork-identical); use it,
+            // erroring loudly if absent rather than guessing.
+            TextTokenizer::from_file(root.join(kind.subdir()).join("tokenizer.json"), config)
+        }
     }
 }

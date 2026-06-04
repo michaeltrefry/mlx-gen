@@ -177,17 +177,21 @@ impl Generator for Flux1 {
         } else {
             0.0
         };
-        // Diffusion activations run in f32 (MLX promotes the bf16 weights per-op). Casting
-        // latents/embeds to bf16 would make `x_embedder` a bf16×bf16 GEMM with K=64 — the dense
-        // 16-bit Metal GEMM bug (M≥2 & K≤512) that returns garbage on the pinned MLX build — and
-        // also discards quality. Same f32-activation path as the Z-Image/Qwen txt2img ports.
+        // The FLUX diffusion path is MIXED precision, matching the mflux reference (sc-2787, verified
+        // against the bf16 golden's per-tensor dtypes): the latents (`create_noise` → f32) and the
+        // main residual stream stay f32 — the fork's scheduler casts the noise prediction to
+        // `latents.dtype` (f32) and its T5 `prompt_embeds` is f32 (T5LayerNorm upcast). Only the CLIP
+        // pooled embedding and the time/text/guidance conditioning run bf16 (handled in the encoders
+        // and `TimeTextEmbed`). So latents are NOT cast to bf16 here — that would diverge from the
+        // fork. (The old "f32 everywhere to dodge the x_embedder bf16 GEMM bug" is obsolete: that bug
+        // is fixed by sc-2772, and the fork runs the x_embedder in f32 anyway because latents are f32.)
         let (prompt_embeds, pooled_prompt_embeds) = self.encode_prompt(&req.prompt)?;
         let sigmas = build_linear_sigmas(
             steps,
             req.width,
             req.height,
             self.variant.requires_sigma_shift(),
-        );
+        )?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {

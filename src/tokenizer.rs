@@ -94,8 +94,24 @@ impl TextTokenizer {
         Ok(Self { inner, config })
     }
 
-    /// Load a CLIP/GPT-2-style byte-level BPE tokenizer from the split HF files
-    /// (`vocab.json` + `merges.txt`) and install the CLIP BOS/EOS post-processor.
+    /// Load from an in-memory `tokenizer.json` string — a vendored HF fast-tokenizer file compiled
+    /// into the crate (e.g. via `include_str!`). Use this when a model repo ships only
+    /// `vocab.json`+`merges.txt` and the byte-level [`from_clip_bpe`](Self::from_clip_bpe) path is
+    /// wrong for that tokenizer family (e.g. CLIP, which is lowercased word-BPE with `</w>`, not
+    /// GPT-2 byte-level): bundle the correct json and load it explicitly rather than silently
+    /// mis-tokenizing (sc-2787).
+    pub fn from_json_str(json: &str, config: TokenizerConfig) -> Result<Self> {
+        let inner = Tokenizer::from_bytes(json.as_bytes()).map_err(tok_err)?;
+        Ok(Self { inner, config })
+    }
+
+    /// Load a **GPT-2-style byte-level** BPE tokenizer from the split HF files (`vocab.json` +
+    /// `merges.txt`) and install a BOS/EOS post-processor.
+    ///
+    /// ⚠️ This is byte-level (GPT-2/RoBERTa) BPE, NOT CLIP's lowercased word-BPE with `</w>`
+    /// end-of-word suffixes — despite the historical name it does **not** reproduce CLIP ids. Prefer
+    /// [`from_file`](Self::from_file)/[`from_json_str`](Self::from_json_str) with a real
+    /// `tokenizer.json`. Kept only for byte-level-BPE callers (sc-2787).
     pub fn from_clip_bpe(
         vocab: impl AsRef<Path>,
         merges: impl AsRef<Path>,

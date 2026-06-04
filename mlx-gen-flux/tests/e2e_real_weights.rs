@@ -24,20 +24,24 @@ use mlx_rs::ops::{add, multiply};
 use mlx_rs::{Array, Dtype};
 
 /// Q8/Q4 verification. TWO checks:
-/// (a) build-independent quant gate — feed the fork-Q golden's OWN embeds+init into the Rust
-///     transformer.quantize(bits), run the denoise on the fork's sigmas, decode, and compare to the
-///     fork-Q golden (isolates the quantized transformer from the NAX-build text-encoder divergence);
+/// (a) the quant GATE — feed the fork-Q golden's OWN embeds+init into the Rust transformer.quantize,
+///     run the denoise on the fork's sigmas, and compare v0 to the fork-Q golden (isolates the
+///     quantized transformer from the 256² sampler chaos);
 /// (b) full public `load(spec.with_quant(Q)).generate()` render, saved for visual inspection.
-/// `quantized_matmul` is fp32-accumulated (correct on the NAX build), so this should land at the
-/// dense f32 transformer floor, not blow up.
+/// The bf16 (non-quant) FLUX path is now pixel-parity (sc-2787), so the quant FULL-GENERATE residual
+/// (schnell ~12% / dev <1% px>8 @256²) is NOT a quant bug — it's the core `adapters.rs` bf16→f32
+/// activation upcast (the now-unneeded sc-2772 workaround) running the quantized *text-embedder* `qmm`
+/// at f32 vs the fork's bf16, a ~1-bf16-ULP flip in the conditioning that the chaotic sampler
+/// amplifies. `quantized_matmul` itself is fp32-accumulated/correct. v0 is the gate; removing that
+/// upcast core-wide is sc-2719.
 fn verify_quant(quant: Quant, bits: i32) {
-    // f32-PRECISION quantized reference (QUANTIZE=N FLUX_PRECISION=f32). The Rust transformer runs
-    // f32 activations (the quality target + bf16-GEMM-avoidance invariant), so the honest reference
-    // is the fork quantized AND computing in f32. A bf16-precision Q golden conflates quantization
-    // with the fork's bf16 *activation* precision — which for FLUX.1-dev is large because the
-    // guidance modulation `time_proj(guidance*1000)` rounds heavily in bf16 and the guided 20-step
-    // sampler amplifies it (dev Q8 vs a bf16-precision golden = 75% px>8; vs f32-precision = 6%).
-    let g = Weights::from_file(golden_path(&format!("_q{bits}_f32"))).unwrap();
+    // bf16 quantized reference (QUANTIZE=N, no FLUX_PRECISION). Post-sc-2787 the Rust transformer
+    // matches the fork's MIXED precision: the conditioning/modulation path (incl. the dev guidance
+    // term `time_proj(guidance*1000)`) now ROUNDS in bf16 exactly like the fork, so the honest
+    // reference is the production bf16 quantized golden. (Pre-2787 the Rust ran f32 conditioning, so
+    // the gate used an `_f32`-precision Q golden to avoid conflating quant with the fork's bf16
+    // modulation precision; that rationale is now obsolete — both sides round the modulation in bf16.)
+    let g = Weights::from_file(golden_path(&format!("_q{bits}"))).unwrap();
     let stored: i32 = g.metadata("quantize").unwrap().parse().unwrap();
     assert_eq!(stored, bits, "golden dumped at a different bit-width");
     let w: u32 = g.metadata("w").unwrap().parse().unwrap();
@@ -158,13 +162,13 @@ fn verify_quant(quant: Quant, bits: i32) {
 }
 
 #[test]
-#[ignore = "needs real FLUX.1 weights + f32-precision Q8 golden (QUANTIZE=8 FLUX_PRECISION=f32)"]
+#[ignore = "needs real FLUX.1 weights + bf16 Q8 golden (QUANTIZE=8)"]
 fn e2e_q8_matches_fork() {
     verify_quant(Quant::Q8, 8);
 }
 
 #[test]
-#[ignore = "needs real FLUX.1 weights + f32-precision Q4 golden (QUANTIZE=4 FLUX_PRECISION=f32)"]
+#[ignore = "needs real FLUX.1 weights + bf16 Q4 golden (QUANTIZE=4)"]
 fn e2e_q4_matches_fork() {
     verify_quant(Quant::Q4, 4);
 }
@@ -196,13 +200,14 @@ fn golden_path(suffix: &str) -> String {
     )
 }
 
-/// The fork golden to compare against. The mlx-gen FLUX path runs f32 activations (the quality
-/// target), so the honest reference is the fork forced to f32 (`FLUX_PRECISION=f32`). Set
-/// `FLUX_GOLDEN=bf16` to compare against the fork's production bf16 path instead.
+/// The fork golden to compare against. Post-sc-2787 the mlx-gen FLUX path matches the fork's
+/// MIXED-precision reference (f32 latents/main-stream/T5, bf16 CLIP + conditioning), so the parity
+/// target is the production **bf16** golden (the default, dumped with no `FLUX_PRECISION`). Set
+/// `FLUX_GOLDEN=f32` to compare against the all-f32 reference instead (a diagnostic, not the target).
 fn golden() -> Weights {
     let suffix = match std::env::var("FLUX_GOLDEN").as_deref() {
-        Ok("bf16") => "",
-        _ => "_f32",
+        Ok("f32") => "_f32",
+        _ => "",
     };
     Weights::from_file(golden_path(suffix)).unwrap()
 }
@@ -258,6 +263,52 @@ fn f32a(a: &Array) -> Array {
 }
 
 #[test]
+#[ignore = "needs real FLUX.1 weights + local golden"]
+fn e2e_tokenizer_matches_golden() {
+    // The full pipeline TOKENIZES the prompt; every other test feeds the golden ids. This isolates
+    // whether the Rust tokenizer reproduces the fork's t5/clip input_ids (sc-2787 full-pipeline gap).
+    let g = golden();
+    let prompt = g.metadata("prompt").unwrap().to_string();
+    let t5_tok = mlx_gen_flux::load_t5_tokenizer(&snapshot(), variant()).unwrap();
+    let clip_tok = mlx_gen_flux::load_clip_tokenizer(&snapshot()).unwrap();
+    let t5_ids = t5_tok.tokenize(&prompt).unwrap().input_ids;
+    let clip_ids = clip_tok.tokenize(&prompt).unwrap().input_ids;
+    let gi = |k: &str| {
+        g.require(k)
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()
+            .to_vec()
+    };
+    let ri = |a: &Array| a.as_dtype(Dtype::Int32).unwrap().as_slice::<i32>().to_vec();
+    let (gt5, gclip) = (gi("t5_input_ids"), gi("clip_input_ids"));
+    let (rt5, rclip) = (ri(&t5_ids), ri(&clip_ids));
+    let t5_diff = rt5.iter().zip(&gt5).filter(|(a, b)| a != b).count();
+    let clip_diff = rclip.iter().zip(&gclip).filter(|(a, b)| a != b).count();
+    println!(
+        "t5 ids: rust_len={} golden_len={} mismatches={t5_diff} | clip ids: rust_len={} golden_len={} mismatches={clip_diff}",
+        rt5.len(),
+        gt5.len(),
+        rclip.len(),
+        gclip.len()
+    );
+    if t5_diff > 0 {
+        println!("  t5 rust[:12]  ={:?}", &rt5[..12.min(rt5.len())]);
+        println!("  t5 golden[:12]={:?}", &gt5[..12.min(gt5.len())]);
+    }
+    if clip_diff > 0 {
+        println!("  clip rust[:8]  ={:?}", &rclip[..8.min(rclip.len())]);
+        println!("  clip golden[:8]={:?}", &gclip[..8.min(gclip.len())]);
+    }
+    assert_eq!(rt5.len(), gt5.len(), "t5 ids length");
+    assert_eq!(rclip.len(), gclip.len(), "clip ids length");
+    assert_eq!(t5_diff, 0, "t5 tokenizer ids diverge from the fork");
+    assert_eq!(clip_diff, 0, "clip tokenizer ids diverge from the fork");
+    println!("✓ tokenizer ids match the fork golden");
+}
+
+#[test]
 #[ignore = "needs real FLUX.1-schnell weights + local golden"]
 fn e2e_t5_prompt_embeds_match_golden() {
     let g = golden();
@@ -271,7 +322,8 @@ fn e2e_t5_prompt_embeds_match_golden() {
         "T5 prompt_embeds: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
         out.shape()
     );
-    assert!(pr < 2e-2, "T5 prompt_embeds diverged: peak_rel {pr:.3e}");
+    // Bit-exact vs the bf16 fork (T5 runs f32 internally via T5LayerNorm's f32 upcast; sc-2787).
+    assert!(pr < 1e-4, "T5 prompt_embeds diverged: peak_rel {pr:.3e}");
     println!("✓ T5 prompt_embeds match the fork golden");
 }
 
@@ -289,8 +341,9 @@ fn e2e_clip_pooled_matches_golden() {
         "CLIP pooled: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
         out.shape()
     );
+    // Bit-exact vs the bf16 fork (CLIP genuinely runs bf16; sc-2787).
     assert!(
-        pr < 2e-2,
+        pr < 1e-4,
         "CLIP pooled diverged from the fork: peak_rel {pr:.3e}"
     );
     println!("✓ CLIP pooled matches the fork golden");
@@ -304,9 +357,10 @@ fn e2e_transformer_v0_matches_golden() {
     let guid = guidance(&g);
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
     let t = load_transformer(&snapshot(), variant()).unwrap();
-    // Production path runs f32 activations (model::generate no longer casts to bf16 — that hit the
-    // dense 16-bit GEMM bug on `x_embedder`, K=64). Feed the fork's f32 init + embeds. `guid` is the
-    // golden's guidance (0.0 schnell / 3.5 dev — dev sums a guidance embedding into time_text_embed).
+    // The transformer runs the fork's mixed precision: f32 latents/embeds/main-stream, bf16
+    // conditioning/modulation (sc-2787). The golden stores embeds as f32; `TimeTextEmbed` re-rounds
+    // pooled+time+guidance to bf16 internally, matching the fork. `guid` is the golden's guidance
+    // (0.0 schnell / 3.5 dev — dev sums a guidance embedding into time_text_embed).
     let init = f32a(g.require("init").unwrap());
     let pe = f32a(g.require("prompt_embeds").unwrap());
     let pooled = f32a(g.require("pooled_prompt_embeds").unwrap());
@@ -321,8 +375,9 @@ fn e2e_transformer_v0_matches_golden() {
         "transformer v0: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
         v.shape()
     );
+    // Bit-exact vs the bf16 fork after the RoPE/time_proj host→MLX fixes (sc-2787).
     assert!(
-        pr < 8e-2,
+        pr < 1e-3,
         "transformer single forward diverged: peak_rel {pr:.3e}"
     );
     println!("✓ transformer single forward matches golden");
@@ -435,7 +490,7 @@ fn e2e_sigmas_match_golden() {
     let (w, h) = wh(&g);
     let golden_sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
     let steps = golden_sigmas.len() - 1;
-    let sigmas = build_linear_sigmas(steps, w, h, variant().requires_sigma_shift());
+    let sigmas = build_linear_sigmas(steps, w, h, variant().requires_sigma_shift()).unwrap();
     assert_eq!(sigmas.len(), golden_sigmas.len(), "sigma count");
     let max_abs = sigmas
         .iter()
@@ -503,9 +558,9 @@ fn e2e_denoise_loop_matches_golden() {
         "denoise final_latents: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
         latents.shape()
     );
-    // 4 flow-match steps compound the per-step transformer drift; the fork's own f32-vs-bf16
-    // latents differ by ~15% mean_rel @256², so this is well inside the envelope.
-    assert!(mr < 1e-1, "denoise loop diverged: mean_rel {mr:.3e}");
+    // Bit-exact (sc-2787): with the transformer + sigmas bit-exact, the full denoise loop on the
+    // fork's own embeds reproduces the fork latents exactly (0.000e0). Tiny margin for safety.
+    assert!(mr < 1e-3, "denoise loop diverged: mean_rel {mr:.3e}");
 
     // Decode these (golden-embed) latents to pixels — isolates transformer+denoise+VAE px>8 from the
     // text-encoder f32-vs-bf16 contribution that the full-pipeline test additionally includes.
@@ -571,22 +626,18 @@ fn e2e_single_stack_injected_matches_golden() {
     );
 }
 
-/// Full prompt→image pipeline through the public Generator API vs the fork's render.
+/// Full prompt→image pipeline through the public Generator API vs the fork's **bf16** render.
 ///
-/// NOTE: this is a REGRESSION GUARD, not a pixel-parity claim. FLUX.1 is precision-chaotic — the
-/// *fork itself* renders a different image in f32 vs bf16, and the effect EXPLODES at low resolution
-/// (tiny latent grid, far from FLUX's 1024² design point):
-///   - schnell: fork f32-vs-bf16 ~4.4% px>8 @1024², ~20% @256². mlx-gen full pipeline ~32-35% @256².
-///   - dev:     fork f32-vs-bf16 = **76% px>8 @256²** (a completely different composition — close-up
-///     portrait vs full-body fox on a rock). mlx-gen dev full pipeline = 61.6% @256², which is
-///     INSIDE that envelope (Rust f32 tracks the fork's f32 composition; fork's own bf16 diverges
-///     further). Every component matches the f32 fork to <1e-3 and the dev mu-shift scheduler is
-///     exact (see the other tests) — the divergence is purely Rust's f32 T5/CLIP vs the fork's
-///     (bf16) embeds, amplified by the guided sampler.
+/// Post-sc-2787 this is a genuine PIXEL-PARITY gate. With bf16 TE/conditioning matching the fork's
+/// mixed precision + the RoPE/time_proj/sigma host→MLX fixes + the vendored CLIP tokenizer, and
+/// goldens dumped on the version-matched mlx 0.31.2, every stage is bit-exact (T5/CLIP/v0/all
+/// transformer substages/denoise = 0.000e0 — see the other tests), so the public render lands at the
+/// VAE's tiny cross-build floor: **schnell ~0.007% / dev ~0.026% px>8**.
 ///
-/// So px>8 here is NOT a parity metric; component f32 parity + the visual render are. The broken
-/// Codex state (bf16-GEMM garbage + wrong CLIP pooled) was 95%+ AND structurally incoherent, so the
-/// variant-aware bound below catches a regression to that without overclaiming parity.
+/// Historical note: this used to sit at ~32–42% px>8 and was rationalized as "FLUX is precision
+/// chaotic." That was wrong — the gap was three host-vs-MLX tables (RoPE freqs, time_proj freqs,
+/// `build_linear_sigmas` linspace, each ~1e-7 amplified by the 57-block stack) plus a CLIP-tokenizer
+/// bug (GPT-2 byte-level instead of CLIP word-BPE → wrong pooled conditioning). All fixed.
 #[test]
 #[ignore = "needs real FLUX.1 weights + local golden (FLUX_VARIANT selects schnell/dev)"]
 fn e2e_full_pipeline_matches_fork() {
@@ -652,22 +703,16 @@ fn e2e_full_pipeline_matches_fork() {
         img.pixels.len(),
         out_path.display()
     );
-    // Regression guard only (see the doc comment): the broken state was 95%+ px>8 AND incoherent.
-    // dev's 256² f32-vs-bf16 envelope is ~76%, so a correct dev render lands well above schnell's;
-    // the bound is loosened for dev to catch gross breakage without flagging precision chaos.
-    let bound = if variant() == FluxVariant::Dev {
-        0.85
-    } else {
-        0.5
-    };
+    // Pixel-parity: every stage is bit-exact, so only the VAE's tiny cross-build residual remains
+    // (observed schnell ~0.007% / dev ~0.026% px>8). 0.5% is a generous parity bound that still
+    // catches any real regression (the old broken/chaotic states were 32–95%).
     assert!(
-        frac < bound,
-        "full-pipeline image regressed badly ({:.1}% px>8, bound {:.0}%) — re-check for a gross bug",
-        frac * 100.0,
-        bound * 100.0
+        frac < 5e-3,
+        "full pipeline regressed from pixel-parity ({:.3}% px>8) — a stage is no longer bit-exact",
+        frac * 100.0
     );
     println!(
-        "full FLUX.1-{} pipeline rendered (px>8={:.1}%); component-level parity is the verification — see test doc",
+        "✓ full FLUX.1-{} pipeline is pixel-parity with the fork ({:.3}% px>8 — VAE cross-build floor)",
         variant_slug(),
         frac * 100.0
     );

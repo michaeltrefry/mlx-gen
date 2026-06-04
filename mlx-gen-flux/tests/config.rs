@@ -34,14 +34,20 @@ fn tokenizer_contract_matches_mflux_flux_definition() {
 
 #[test]
 fn linear_sigmas_match_unshifted_schnell_shape() {
-    let sigmas = build_linear_sigmas(4, 1024, 1024, false);
-    assert_eq!(sigmas, vec![1.0, 0.75, 0.5, 0.25, 0.0]);
+    let sigmas = build_linear_sigmas(4, 1024, 1024, false).unwrap();
+    // The fork's `mx.linspace(1.0, 0.25, 4)` — bit-matched (sc-2787). Note the second value is the
+    // MLX op's 0.74999994, NOT the host's exact 0.75 (this is what makes the full pipeline byte-match).
+    let expected = [1.0_f32, 0.749_999_94, 0.5, 0.25, 0.0];
+    assert_eq!(sigmas.len(), expected.len());
+    for (got, want) in sigmas.iter().zip(expected) {
+        assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+    }
 }
 
 #[test]
 fn shifted_dev_sigmas_use_flux_linear_mu() {
     assert_eq!(image_seq_len(1024, 1024), 4096);
-    let sigmas = build_linear_sigmas(4, 1024, 1024, true);
+    let sigmas = build_linear_sigmas(4, 1024, 1024, true).unwrap();
     // mflux LinearScheduler with base/max shift 0.5/1.15 and image_seq_len 4096.
     let expected = [1.0_f32, 0.904_531, 0.759_511, 0.512_844, 0.0];
     for (got, want) in sigmas.iter().zip(expected) {

@@ -2,6 +2,7 @@
 //! These mirror `FluxLatentCreator` and the fork's default `LinearScheduler`.
 
 use mlx_gen::{Error, Result};
+use mlx_rs::ops::{add, divide, linspace, subtract};
 use mlx_rs::{random, Array};
 
 pub fn image_seq_len(width: u32, height: u32) -> usize {
@@ -46,36 +47,35 @@ pub fn build_linear_sigmas(
     width: u32,
     height: u32,
     requires_sigma_shift: bool,
-) -> Vec<f32> {
-    let n = num_steps.max(1);
-    let mut sigmas: Vec<f32> = (0..n)
-        .map(|i| {
-            if n == 1 {
-                1.0
-            } else {
-                1.0 + ((1.0 / n as f32) - 1.0) * (i as f32) / ((n - 1) as f32)
-            }
-        })
-        .collect();
+) -> Result<Vec<f32>> {
+    let n = num_steps.max(1) as i32;
+    // `mx.linspace(1.0, 1.0/n, n)` computed in MLX (sc-2787): the host interpolation differs from the
+    // MLX op by ~6e-8, which the chaotic FLUX sampler amplifies into a different image. Pass the stop
+    // as f64 like the fork's Python `1.0/num_steps`. Default linspace dtype is f32.
+    let sigmas = linspace::<f64, f32>(1.0, 1.0 / n as f64, n)?;
 
-    if requires_sigma_shift {
-        let seq = image_seq_len(width, height) as f32;
-        let base_seq_len = 256.0_f32;
-        let max_seq_len = 4096.0_f32;
-        let base_shift = 0.5_f32;
-        let max_shift = 1.15_f32;
+    let sigmas = if requires_sigma_shift {
+        // FLUX.1-dev mu-shift, mirroring `LinearScheduler` exactly (constants in f64 like the fork's
+        // Python; the shift division/exp in MLX). `mu = m*width*height/256 + b == m*seq + b`.
+        let base_seq_len = 256.0_f64;
+        let max_seq_len = 4096.0_f64;
+        let base_shift = 0.5_f64;
+        let max_shift = 1.15_f64;
         let m = (max_shift - base_shift) / (max_seq_len - base_seq_len);
         let b = base_shift - m * base_seq_len;
-        let mu = m * seq + b;
-        let e = mu.exp();
-        sigmas = sigmas
-            .into_iter()
-            .map(|t| e / (e + (1.0 / t - 1.0)))
-            .collect();
-    }
+        let mu = (m * (width as f64) * (height as f64) / 256.0 + b) as f32;
+        let e = Array::from_slice(&[mu], &[1]).exp()?;
+        let one = Array::from_slice(&[1.0_f32], &[1]);
+        // shifted = exp(mu) / (exp(mu) + (1/sigmas - 1))
+        let inv = divide(&one, &sigmas)?;
+        divide(&e, &add(&e, &subtract(&inv, &one)?)?)?
+    } else {
+        sigmas
+    };
 
-    sigmas.push(0.0);
-    sigmas
+    let mut out = sigmas.as_slice::<f32>().to_vec();
+    out.push(0.0);
+    Ok(out)
 }
 
 fn validate_multiple_of_16(width: u32, height: u32) -> Result<()> {
