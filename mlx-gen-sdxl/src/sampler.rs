@@ -130,8 +130,8 @@ impl EulerSampler {
         let y_lo = scalar(self.sigmas[lo]);
         let y_hi = scalar(self.sigmas[hi]);
         Ok(add(
-            &multiply(&y_lo, &scalar(one_minus))?,
-            &multiply(&scalar(delta), &y_hi)?,
+            &multiply(&y_lo, scalar(one_minus))?,
+            &multiply(scalar(delta), &y_hi)?,
         )?)
     }
 
