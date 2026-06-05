@@ -7,11 +7,17 @@
 //! Sub-models (per the sc-3080 spike, all Tier-B native):
 //! - **ArcFace iresnet100** ([`iresnet`]) — the fidelity-critical 512-d recognition embedding,
 //!   a faithful port of antelopev2 `glintr100` (sc-3081).
-//! - SCRFD detector (sc-3082), 5-pt alignment / norm_crop (sc-3083), BiSeNet parsing (sc-3084),
-//!   and the unified `FaceAnalysis` API (sc-3085) land alongside.
+//! - **SCRFD detector** ([`scrfd`]) — 5-pt landmark + bbox detection (sc-3082).
+//! - **5-pt alignment** ([`align`]) — insightface-faithful `norm_crop` (112²) feeding ArcFace, plus
+//!   the facexlib `align_warp_face` (512²) crop for the EVA-CLIP / parsing path (sc-3083).
+//! - BiSeNet parsing (sc-3084) and the unified `FaceAnalysis` API (sc-3085) land alongside.
 
+pub mod align;
 pub mod iresnet;
 pub mod scrfd;
 
+pub use align::{
+    align_face_512, estimate_norm, norm_crop, to_arcface_input, warp_affine, Affine2x3,
+};
 pub use iresnet::ArcFace;
 pub use scrfd::{Detection, Scrfd};
