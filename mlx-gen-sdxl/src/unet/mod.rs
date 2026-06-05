@@ -4,6 +4,7 @@
 //! a conv head. Runs entirely in NHWC. Predicts the noise (`eps`) for one denoise step.
 
 mod block;
+mod controlnet;
 mod embeddings;
 mod resnet;
 mod transformer;
@@ -25,6 +26,8 @@ use transformer::Transformer2D;
 
 // Shared with the VAE (the vendored VAE reuses the UNet `ResnetBlock2D` without a time embedding).
 pub use resnet::ResnetBlock2D;
+
+pub use controlnet::{ControlNet, ControlResiduals};
 
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-5;
@@ -168,6 +171,33 @@ impl UNet2DConditionModel {
         text_emb: &Array,
         time_ids: &Array,
     ) -> Result<Array> {
+        self.forward_core(x, timestep, encoder_x, text_emb, time_ids, None)
+    }
+
+    /// Like [`forward`](Self::forward) but adds a ControlNet's residuals (sc-3058): each control
+    /// down residual is added to the matching skip connection, the control mid residual to the mid
+    /// output. The residuals are already scaled by `conditioning_scale` (see [`ControlNet::forward`]).
+    pub fn forward_with_control(
+        &self,
+        x: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        control: &ControlResiduals,
+    ) -> Result<Array> {
+        self.forward_core(x, timestep, encoder_x, text_emb, time_ids, Some(control))
+    }
+
+    fn forward_core(
+        &self,
+        x: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        control: Option<&ControlResiduals>,
+    ) -> Result<Array> {
         let batch = x.shape()[0];
         let dtype = x.dtype();
 
@@ -201,10 +231,28 @@ impl UNet2DConditionModel {
             residuals.extend(res);
         }
 
+        // ControlNet (sc-3058): add the (scaled) control down residuals to the skip connections.
+        if let Some(c) = control {
+            if c.down.len() != residuals.len() {
+                return Err(mlx_gen::Error::Msg(format!(
+                    "controlnet produced {} down residuals, UNet expects {}",
+                    c.down.len(),
+                    residuals.len()
+                )));
+            }
+            for (r, cr) in residuals.iter_mut().zip(&c.down) {
+                *r = add(&*r, cr)?;
+            }
+        }
+
         // Mid.
         x = self.mid_resnet0.forward(&x, Some(&temb))?;
         x = self.mid_transformer.forward(&x, encoder_x)?;
         x = self.mid_resnet1.forward(&x, Some(&temb))?;
+        // ControlNet: add the (scaled) control mid residual to the mid output.
+        if let Some(c) = control {
+            x = add(&x, &c.mid)?;
+        }
 
         // Up path — each block pops its skip residuals.
         for block in &self.up_blocks {

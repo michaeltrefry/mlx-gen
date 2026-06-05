@@ -236,9 +236,128 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
     })
 }
 
+/// Round-half-to-even (Python `round`), for pixel-geometry parity with the worker's `_contain_box`
+/// (Rust's `f64::round` is half-away-from-zero, which differs at exact `.5`). Positive inputs only.
+fn round_half_even(x: f64) -> i64 {
+    let f = x.floor();
+    let diff = x - f;
+    if diff < 0.5 {
+        f as i64
+    } else if diff > 0.5 {
+        f as i64 + 1
+    } else {
+        let fi = f as i64;
+        if fi % 2 == 0 {
+            fi
+        } else {
+            fi + 1
+        }
+    }
+}
+
+/// Where a `src_w`×`src_h` image lands when **contained** (long edge fits) and centered in a
+/// `width`×`height` box: `(new_w, new_h, left, top)`. Mirrors the worker's `_contain_box` (Python
+/// `round` = half-to-even) so the kept rect and a padded source line up exactly.
+pub fn contain_box(src_w: u32, src_h: u32, width: u32, height: u32) -> (u32, u32, i32, i32) {
+    let ratio = (width as f64 / src_w as f64).min(height as f64 / src_h as f64);
+    let new_w = round_half_even(src_w as f64 * ratio).max(1) as u32;
+    let new_h = round_half_even(src_h as f64 * ratio).max(1) as u32;
+    let left = (width as i32 - new_w as i32) / 2;
+    let top = (height as i32 - new_h as i32) / 2;
+    (new_w, new_h, left, top)
+}
+
+/// Outpaint inpaint mask (the worker's `outpaint_border_mask`): an RGB8 grayscale mask —
+/// **white (255) = the padded border to GENERATE, black (0) = the centered source rect to KEEP**
+/// (inpaint convention: white = repaint). Geometry matches a "pad"/contain fit so the mask aligns
+/// with the padded source. Pure host-side op; the engine consumes it as a `Conditioning::Mask`.
+///
+/// The worker's optional gaussian **feather** is intentionally omitted: the inpaint pipeline
+/// binarizes the mask (`do_binarize`), and a symmetric blur's 0.5 crossing stays on the original
+/// edge, so after the 8× latent downsample the feather is a no-op (it only rounds corners
+/// sub-latent-pixel). Callers that want the seam softened should feather post-decode, not here.
+pub fn outpaint_border_mask(src_w: u32, src_h: u32, width: u32, height: u32) -> Image {
+    let (w, h) = (width.max(1), height.max(1));
+    let (new_w, new_h, left, top) = contain_box(src_w, src_h, w, h);
+    let mut pixels = vec![255u8; (w * h * 3) as usize]; // white = generate
+    for y in 0..new_h as i32 {
+        let cy = top + y;
+        if cy < 0 || cy >= h as i32 {
+            continue;
+        }
+        for x in 0..new_w as i32 {
+            let cx = left + x;
+            if cx < 0 || cx >= w as i32 {
+                continue;
+            }
+            let idx = ((cy as u32 * w + cx as u32) * 3) as usize;
+            pixels[idx] = 0; // black = keep
+            pixels[idx + 1] = 0;
+            pixels[idx + 2] = 0;
+        }
+    }
+    Image {
+        width: w,
+        height: h,
+        pixels,
+    }
+}
+
+/// Per-pixel max ("white wins" — PIL `ImageChops.lighter`) of two equal-size RGB8 masks. Unions a
+/// user edit region with a generated outpaint border.
+pub fn union_masks(a: &Image, b: &Image) -> Result<Image> {
+    if (a.width, a.height) != (b.width, b.height) || a.pixels.len() != b.pixels.len() {
+        return Err(crate::Error::Msg(format!(
+            "union_masks: size mismatch {}x{} vs {}x{}",
+            a.width, a.height, b.width, b.height
+        )));
+    }
+    let pixels = a
+        .pixels
+        .iter()
+        .zip(&b.pixels)
+        .map(|(&x, &y)| x.max(y))
+        .collect();
+    Ok(Image {
+        width: a.width,
+        height: a.height,
+        pixels,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outpaint_border_mask_keeps_centered_source() {
+        // A 50×100 source contained in a 200×200 canvas: long edge (100) fits → ratio 2.0 →
+        // 100×200 kept rect, centered at left=50, top=0. White border L/R, black center column.
+        let m = outpaint_border_mask(50, 100, 200, 200);
+        assert_eq!((m.width, m.height), (200, 200));
+        let px = |x: u32, y: u32| m.pixels[((y * 200 + x) * 3) as usize];
+        assert_eq!(px(0, 100), 255, "left border = generate");
+        assert_eq!(px(199, 100), 255, "right border = generate");
+        assert_eq!(px(100, 100), 0, "center = keep");
+        assert_eq!(px(50, 100), 0, "kept rect starts at left=50");
+        assert_eq!(px(49, 100), 255, "just outside kept rect = generate");
+    }
+
+    #[test]
+    fn union_masks_white_wins() {
+        let a = Image {
+            width: 2,
+            height: 1,
+            pixels: vec![255, 255, 255, 0, 0, 0],
+        };
+        let b = Image {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 0, 0, 0],
+        };
+        let u = union_masks(&a, &b).unwrap();
+        assert_eq!(u.pixels, vec![255, 255, 255, 0, 0, 0]);
+    }
 
     /// `resize_u8` must be **bit-identical** to PIL `Image.BICUBIC` (the fixed-point integer path),
     /// not merely close — this is what gives the conditioning images pixel-parity with the fork

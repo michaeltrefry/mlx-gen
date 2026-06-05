@@ -211,6 +211,20 @@ impl EulerSampler {
         Ok(multiply(&noised, &factor)?)
     }
 
+    /// Add a **caller-supplied** noise tensor to clean latents at (float) time `t`, in the same
+    /// renormalized convention as [`Self::add_noise`]: `(x + noise·σ(t)) · rsqrt(σ(t)²+1)`. Unlike
+    /// `add_noise` it draws no RNG — the legacy inpaint blend (sc-3057) pins the kept region to the
+    /// init noised with the **fixed** prior noise at each step's `σ`, so it must reuse one noise
+    /// tensor (and not perturb the ancestral RNG stream). At `t = 0`, `σ = 0` ⇒ returns the clean
+    /// `x` (the diffusers final-step blend against the un-noised init).
+    pub fn add_noise_with(&self, x: &Array, noise: &Array, t: f32) -> Result<Array> {
+        use mlx_rs::ops::{add, rsqrt, square};
+        let s = self.sigma_arr(t, false)?;
+        let noised = add(x, &multiply(noise, &s)?)?;
+        let factor = rsqrt(&add(&square(&s)?, scalar(1.0))?)?;
+        Ok(multiply(&noised, &factor)?)
+    }
+
     /// One denoise step from `x_t` (at time `t`) to `x_{t_prev}`. Euler-ancestral when `ancestral`
     /// (draws fresh global-RNG noise scaled by `σ_up`); plain Euler otherwise.
     ///

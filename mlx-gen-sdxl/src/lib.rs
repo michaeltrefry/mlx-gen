@@ -19,6 +19,8 @@
 
 pub mod adapters;
 pub mod config;
+pub mod inpaint;
+pub mod ip_adapter;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
@@ -27,6 +29,7 @@ pub mod text_encoder;
 pub mod tokenizer;
 pub mod unet;
 pub mod vae;
+pub mod vision_encoder;
 
 pub use adapters::{
     apply_sdxl_adapters, apply_sdxl_adapters_with, lora_delta, LoraCoverage, SdxlLoraReport,
@@ -34,19 +37,21 @@ pub use adapters::{
 pub use config::{
     BetaSchedule, ClipActivation, ClipTextConfig, DiffusionConfig, UNetConfig, VaeConfig,
 };
+pub use inpaint::{preprocess_mask, InpaintBlend};
 pub use loader::{
-    load_text_encoder_1, load_text_encoder_1_dtype, load_text_encoder_2, load_text_encoder_2_dtype,
-    load_tokenizer, load_unet, load_unet_dtype, load_vae,
+    load_controlnet, load_text_encoder_1, load_text_encoder_1_dtype, load_text_encoder_2,
+    load_text_encoder_2_dtype, load_tokenizer, load_unet, load_unet_dtype, load_vae,
 };
 pub use model::{descriptor, load, Sdxl, MODEL_ID};
 pub use pipeline::{
-    decode_image, decoded_to_image, denoise, encode_conditioning, encode_init_latents,
-    preprocess_init_image, seeded_prior, text_time_ids, Denoiser,
+    decode_image, decoded_to_image, denoise, denoise_control, denoise_inpaint, encode_conditioning,
+    encode_init_latents, preprocess_control_image, preprocess_init_image, seeded_prior,
+    text_time_ids, ControlContext, Denoiser,
 };
 pub use sampler::EulerSampler;
 pub use text_encoder::{ClipOutput, ClipTextEncoder};
 pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
-pub use unet::UNet2DConditionModel;
+pub use unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 pub use vae::Autoencoder;
 
 use std::sync::atomic::{AtomicBool, Ordering};

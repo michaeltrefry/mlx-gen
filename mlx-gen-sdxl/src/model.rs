@@ -17,21 +17,27 @@ use mlx_gen::{
     Error, GenerationOutput, GenerationRequest, Generator, Image, LcmSampler, LightningSampler,
     LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, TcdSampler, WeightsSource,
 };
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Dtype;
 
 use crate::config::DiffusionConfig;
+use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::loader;
 use crate::pipeline::{
-    decode_image, denoise, encode_conditioning, encode_init_latents, text_time_ids, Denoiser,
+    decode_image, denoise, denoise_control, denoise_inpaint, encode_conditioning,
+    encode_init_latents, preprocess_control_image, text_time_ids, ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
 use crate::tokenizer::ClipBpeTokenizer;
-use crate::unet::UNet2DConditionModel;
+use crate::unet::{ControlNet, UNet2DConditionModel};
 use crate::vae::Autoencoder;
 
 /// img2img default strength (the vendored `generate_latents_from_image` default).
 const DEFAULT_STRENGTH: f32 = 0.8;
+/// Masked-inpaint / outpaint default strength — the worker's `SdxlDiffusersAdapter` uses 0.85 for
+/// `use_inpaint`/`outpaint` (vs 0.6 for a plain edit). An explicit request strength still wins.
+const INPAINT_DEFAULT_STRENGTH: f32 = 0.85;
 
 /// SDXL-base-1.0 production defaults (the SceneWorks `MlxSdxlAdapter`): 30 inference steps,
 /// CFG 7.0, native 1024². Used when a request omits the corresponding field (consumed by the
@@ -85,9 +91,15 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            // img2img Reference (sc-2638). LoRA (kohya `lora_unet_` + PEFT, sc-2639) and LoKr
-            // (sc-2640 — Rust is more capable than the vendored path, which rejects LoKr) are wired.
-            conditioning: vec![ConditioningKind::Reference],
+            // img2img Reference (sc-2638) + masked inpaint/outpaint (Mask, sc-3057) + tile-ControlNet
+            // detail (Control, sc-3058 — requires a control checkpoint via LoadSpec::control). LoRA
+            // (kohya `lora_unet_` + PEFT, sc-2639) and LoKr (sc-2640 — Rust is more capable than the
+            // vendored path, which rejects LoKr) are wired.
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::Mask,
+                ConditioningKind::Control,
+            ],
             supports_lora: true,
             supports_lokr: true,
             // `euler_ancestral` is the production default (full-CFG, 30-step); `lcm`/`lightning`/
@@ -115,6 +127,10 @@ pub struct Sdxl {
     te1: ClipTextEncoder,
     te2: ClipTextEncoder,
     unet: UNet2DConditionModel,
+    /// Optional ControlNet branch (sc-3058), loaded from `LoadSpec::control` — present only when a
+    /// detail / control checkpoint was supplied. `generate` requires it iff a `Control` conditioning
+    /// is passed.
+    control: Option<ControlNet>,
     vae: Autoencoder,
     sampler: EulerSampler,
     /// DDPM `alphas_cumprod` from the SDXL `scaled_linear` betas — shared by the acceleration
@@ -181,6 +197,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let mut te2 = loader::load_text_encoder_2_dtype(root, dtype)?;
     let vae = loader::load_vae(root)?; // VAE always f32 (vendored loads the autoencoder float16=False)
 
+    // Optional ControlNet branch (sc-3058) — loaded at the U-Net dtype (fp16). Quantized with the
+    // U-Net below when `spec.quantize` is set (the encoder-copy Linears; conv stem / cond-embedding /
+    // zero-convs stay dense, matching the U-Net scope).
+    let mut control = match &spec.control {
+        Some(src) => Some(loader::load_controlnet(src, dtype)?),
+        None => None,
+    };
+
     if let Some(q) = spec.quantize {
         // Q4/Q8 (group_size 64) over every quantizable Linear of the U-Net + both CLIP encoders —
         // applied AFTER the adapter merge (the merge needs the dense weight; `merge_dense_delta`
@@ -195,6 +219,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         unet.quantize(bits)?;
         te1.quantize(bits)?;
         te2.quantize(bits)?;
+        if let Some(cn) = &mut control {
+            cn.quantize(bits)?;
+        }
     }
 
     let cfg = DiffusionConfig::sdxl_base();
@@ -206,6 +233,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         te1,
         te2,
         unet,
+        control,
         vae,
         sampler: EulerSampler::new_with_dtype(&cfg, true, dtype),
         alpha_schedule,
@@ -242,6 +270,7 @@ impl Generator for Sdxl {
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let reference = self.resolve_reference(req)?;
+        let mask_img = self.resolve_mask(req)?;
         let max_time = self.sampler.max_time();
 
         // Acceleration variants are txt2img-only in v1 (epic 2755 "Image-only v1"); reject an init
@@ -252,6 +281,65 @@ impl Generator for Sdxl {
                  reference) in this build"
             )));
         }
+        // Inpaint (Mask) rides the ancestral img2img path and needs an init image to blend against.
+        if mask_img.is_some() {
+            if is_accel {
+                return Err(Error::Msg(
+                    "sdxl: inpaint masks are not supported with the acceleration samplers".into(),
+                ));
+            }
+            if reference.is_none() {
+                return Err(Error::Msg(
+                    "sdxl: inpaint requires an init image (a Reference) alongside the Mask".into(),
+                ));
+            }
+        }
+        // ControlNet (sc-3058): needs a loaded control checkpoint + the ancestral path; not combined
+        // with an inpaint mask in this build.
+        let control_req = self.resolve_control(req)?;
+        if control_req.is_some() {
+            if is_accel {
+                return Err(Error::Msg(
+                    "sdxl: ControlNet is not supported with the acceleration samplers".into(),
+                ));
+            }
+            if self.control.is_none() {
+                return Err(Error::Msg(
+                    "sdxl: a Control conditioning was passed but this model was loaded without a \
+                     control checkpoint (set LoadSpec::control)"
+                        .into(),
+                ));
+            }
+            if mask_img.is_some() {
+                return Err(Error::Msg(
+                    "sdxl: combining a ControlNet (Control) with an inpaint Mask is not supported"
+                        .into(),
+                ));
+            }
+        }
+
+        // Build the ControlNet context once (seed-independent): preprocess the control image to
+        // [0,1] NHWC and CFG-batch it to match the U-Net input.
+        let control_ctx = match control_req {
+            Some((image, scale)) => {
+                let cn = self
+                    .control
+                    .as_ref()
+                    .expect("control checkpoint validated above");
+                let img = preprocess_control_image(image, req.width, req.height)?;
+                let img = if cfg_on {
+                    concatenate_axis(&[&img, &img], 0)?
+                } else {
+                    img
+                };
+                Some(ControlContext {
+                    controlnet: cn,
+                    control_image: img,
+                    scale,
+                })
+            }
+            None => None,
+        };
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -271,12 +359,40 @@ impl Generator for Sdxl {
             // by the sampler's own schedule (`sampler.num_steps()`), so the trait owns the per-step
             // timestep, the input scaling, and the step math.
             let latent_shape = [1, (req.height / 8) as i32, (req.width / 8) as i32, 4];
-            let (latents, sampler): (mlx_rs::Array, Box<dyn DiffusionSampler + '_>) = if is_accel {
+            let (latents, sampler, blend): (
+                mlx_rs::Array,
+                Box<dyn DiffusionSampler + '_>,
+                Option<InpaintBlend>,
+            ) = if is_accel {
                 // Few-step acceleration (txt2img): unit-noise prior scaled into the sampler's space.
                 let s = self.build_accel_sampler(sampler_name, steps, eta);
                 let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
                 let lat = s.scale_initial_noise(&noise)?;
-                (lat, s)
+                (lat, s, None)
+            } else if let (Some((image, strength)), Some(mask)) = (reference, mask_img) {
+                // Masked inpaint (sc-3057): same ancestral img2img start, but keep the FIXED prior
+                // noise so the per-step blend can pin the black (keep) region to the init noised to
+                // each step's σ. Default strength 0.85 (the worker's inpaint default).
+                let strength = strength.unwrap_or(INPAINT_DEFAULT_STRENGTH).clamp(0.0, 1.0);
+                let x_0 = encode_init_latents(&self.vae, image, req.width, req.height)?;
+                let start_step = max_time * strength;
+                let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
+                let x_t = self.sampler.add_noise_with(&x_0, &noise, start_step)?;
+                let eff = (steps as f32 * strength) as usize;
+                let mask_latent = preprocess_mask(mask, req.width, req.height)?;
+                // The kept region is noised to each step's "next" time `t_prev` (schedule[i].1).
+                let t_prev: Vec<f32> = self
+                    .sampler
+                    .timesteps(eff, start_step)
+                    .into_iter()
+                    .map(|(_, tp)| tp)
+                    .collect();
+                let blend = InpaintBlend::new(&self.sampler, mask_latent, x_0, noise, t_prev);
+                (
+                    x_t,
+                    Box::new(AncestralEuler::new(&self.sampler, eff, start_step)),
+                    Some(blend),
+                )
             } else if let Some((image, strength)) = reference {
                 // img2img (ancestral; the vendored `generate_latents_from_image`): VAE-encode the
                 // init, start at `max_time·strength`, run `int(steps·strength)` steps — NO min-1
@@ -290,6 +406,7 @@ impl Generator for Sdxl {
                 (
                     x_t,
                     Box::new(AncestralEuler::new(&self.sampler, eff, start_step)),
+                    None,
                 )
             } else {
                 // txt2img (ancestral): seeded prior.
@@ -297,6 +414,7 @@ impl Generator for Sdxl {
                 (
                     prior,
                     Box::new(AncestralEuler::new(&self.sampler, steps, max_time)),
+                    None,
                 )
             };
 
@@ -304,16 +422,42 @@ impl Generator for Sdxl {
                 unet: &self.unet,
                 sampler: sampler.as_ref(),
             };
-            let latents = denoise(
-                &d,
-                latents,
-                &conditioning,
-                &pooled,
-                &time_ids,
-                cfg,
-                &req.cancel,
-                on_progress,
-            )?;
+            let latents = if let Some(cc) = &control_ctx {
+                denoise_control(
+                    &d,
+                    latents,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    cfg,
+                    &req.cancel,
+                    on_progress,
+                    cc,
+                )?
+            } else if let Some(b) = &blend {
+                denoise_inpaint(
+                    &d,
+                    latents,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    cfg,
+                    &req.cancel,
+                    on_progress,
+                    b,
+                )?
+            } else {
+                denoise(
+                    &d,
+                    latents,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    cfg,
+                    &req.cancel,
+                    on_progress,
+                )?
+            };
 
             on_progress(Progress::Decoding);
             images.push(decode_image(&self.vae, &latents)?);
@@ -377,6 +521,40 @@ impl Sdxl {
             }
         }
         Ok(reference)
+    }
+
+    /// Extract the single inpaint mask from the request's conditioning (sc-3057). White = repaint,
+    /// black = keep. SDXL supports one mask; more than one is an error.
+    fn resolve_mask<'a>(&self, req: &'a GenerationRequest) -> Result<Option<&'a Image>> {
+        let mut mask = None;
+        for c in &req.conditioning {
+            if let Conditioning::Mask { image } = c {
+                if mask.is_some() {
+                    return Err(Error::Msg(
+                        "sdxl: multiple inpaint masks are not supported".into(),
+                    ));
+                }
+                mask = Some(image);
+            }
+        }
+        Ok(mask)
+    }
+
+    /// Extract the single ControlNet control image + `conditioning_scale` (sc-3058). SDXL supports
+    /// one control branch; more than one `Control` is an error.
+    fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<Option<(&'a Image, f32)>> {
+        let mut control = None;
+        for c in &req.conditioning {
+            if let Conditioning::Control { image, scale, .. } = c {
+                if control.is_some() {
+                    return Err(Error::Msg(
+                        "sdxl: multiple control images are not supported".into(),
+                    ));
+                }
+                control = Some((image, *scale));
+            }
+        }
+        Ok(control)
     }
 }
 
