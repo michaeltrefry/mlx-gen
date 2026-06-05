@@ -17,19 +17,20 @@ use mlx_gen::{
     Error, GenerationOutput, GenerationRequest, Generator, Image, LcmSampler, LightningSampler,
     LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, TcdSampler, WeightsSource,
 };
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Dtype;
 
 use crate::config::DiffusionConfig;
 use crate::loader;
 use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::pipeline::{
-    decode_image, denoise, denoise_inpaint, encode_conditioning, encode_init_latents, text_time_ids,
-    Denoiser,
+    decode_image, denoise, denoise_control, denoise_inpaint, encode_conditioning,
+    encode_init_latents, preprocess_control_image, text_time_ids, ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
 use crate::tokenizer::ClipBpeTokenizer;
-use crate::unet::UNet2DConditionModel;
+use crate::unet::{ControlNet, UNet2DConditionModel};
 use crate::vae::Autoencoder;
 
 /// img2img default strength (the vendored `generate_latents_from_image` default).
@@ -90,10 +91,15 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            // img2img Reference (sc-2638) + masked inpaint/outpaint (Mask, sc-3057 — the diffusers
-            // legacy mask-blend). LoRA (kohya `lora_unet_` + PEFT, sc-2639) and LoKr (sc-2640 — Rust
-            // is more capable than the vendored path, which rejects LoKr) are wired.
-            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
+            // img2img Reference (sc-2638) + masked inpaint/outpaint (Mask, sc-3057) + tile-ControlNet
+            // detail (Control, sc-3058 — requires a control checkpoint via LoadSpec::control). LoRA
+            // (kohya `lora_unet_` + PEFT, sc-2639) and LoKr (sc-2640 — Rust is more capable than the
+            // vendored path, which rejects LoKr) are wired.
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::Mask,
+                ConditioningKind::Control,
+            ],
             supports_lora: true,
             supports_lokr: true,
             // `euler_ancestral` is the production default (full-CFG, 30-step); `lcm`/`lightning`/
@@ -121,6 +127,10 @@ pub struct Sdxl {
     te1: ClipTextEncoder,
     te2: ClipTextEncoder,
     unet: UNet2DConditionModel,
+    /// Optional ControlNet branch (sc-3058), loaded from `LoadSpec::control` — present only when a
+    /// detail / control checkpoint was supplied. `generate` requires it iff a `Control` conditioning
+    /// is passed.
+    control: Option<ControlNet>,
     vae: Autoencoder,
     sampler: EulerSampler,
     /// DDPM `alphas_cumprod` from the SDXL `scaled_linear` betas — shared by the acceleration
@@ -187,6 +197,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let mut te2 = loader::load_text_encoder_2_dtype(root, dtype)?;
     let vae = loader::load_vae(root)?; // VAE always f32 (vendored loads the autoencoder float16=False)
 
+    // Optional ControlNet branch (sc-3058) — loaded at the U-Net dtype (fp16). Quantized with the
+    // U-Net below when `spec.quantize` is set (the encoder-copy Linears; conv stem / cond-embedding /
+    // zero-convs stay dense, matching the U-Net scope).
+    let mut control = match &spec.control {
+        Some(src) => Some(loader::load_controlnet(src, dtype)?),
+        None => None,
+    };
+
     if let Some(q) = spec.quantize {
         // Q4/Q8 (group_size 64) over every quantizable Linear of the U-Net + both CLIP encoders —
         // applied AFTER the adapter merge (the merge needs the dense weight; `merge_dense_delta`
@@ -201,6 +219,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         unet.quantize(bits)?;
         te1.quantize(bits)?;
         te2.quantize(bits)?;
+        if let Some(cn) = &mut control {
+            cn.quantize(bits)?;
+        }
     }
 
     let cfg = DiffusionConfig::sdxl_base();
@@ -212,6 +233,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         te1,
         te2,
         unet,
+        control,
         vae,
         sampler: EulerSampler::new_with_dtype(&cfg, true, dtype),
         alpha_schedule,
@@ -272,6 +294,49 @@ impl Generator for Sdxl {
                 ));
             }
         }
+        // ControlNet (sc-3058): needs a loaded control checkpoint + the ancestral path; not combined
+        // with an inpaint mask in this build.
+        let control_req = self.resolve_control(req)?;
+        if control_req.is_some() {
+            if is_accel {
+                return Err(Error::Msg(
+                    "sdxl: ControlNet is not supported with the acceleration samplers".into(),
+                ));
+            }
+            if self.control.is_none() {
+                return Err(Error::Msg(
+                    "sdxl: a Control conditioning was passed but this model was loaded without a \
+                     control checkpoint (set LoadSpec::control)"
+                        .into(),
+                ));
+            }
+            if mask_img.is_some() {
+                return Err(Error::Msg(
+                    "sdxl: combining a ControlNet (Control) with an inpaint Mask is not supported"
+                        .into(),
+                ));
+            }
+        }
+
+        // Build the ControlNet context once (seed-independent): preprocess the control image to
+        // [0,1] NHWC and CFG-batch it to match the U-Net input.
+        let control_ctx = match control_req {
+            Some((image, scale)) => {
+                let cn = self.control.as_ref().expect("control checkpoint validated above");
+                let img = preprocess_control_image(image, req.width, req.height)?;
+                let img = if cfg_on {
+                    concatenate_axis(&[&img, &img], 0)?
+                } else {
+                    img
+                };
+                Some(ControlContext {
+                    controlnet: cn,
+                    control_image: img,
+                    scale,
+                })
+            }
+            None => None,
+        };
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -354,8 +419,8 @@ impl Generator for Sdxl {
                 unet: &self.unet,
                 sampler: sampler.as_ref(),
             };
-            let latents = match &blend {
-                Some(b) => denoise_inpaint(
+            let latents = if let Some(cc) = &control_ctx {
+                denoise_control(
                     &d,
                     latents,
                     &conditioning,
@@ -364,18 +429,16 @@ impl Generator for Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
-                    b,
-                )?,
-                None => denoise(
-                    &d,
-                    latents,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
-                    cfg,
-                    &req.cancel,
-                    on_progress,
-                )?,
+                    cc,
+                )?
+            } else if let Some(b) = &blend {
+                denoise_inpaint(
+                    &d, latents, &conditioning, &pooled, &time_ids, cfg, &req.cancel, on_progress, b,
+                )?
+            } else {
+                denoise(
+                    &d, latents, &conditioning, &pooled, &time_ids, cfg, &req.cancel, on_progress,
+                )?
             };
 
             on_progress(Progress::Decoding);
@@ -455,6 +518,24 @@ impl Sdxl {
             }
         }
         Ok(mask)
+    }
+
+    /// Extract the single ControlNet control image + `conditioning_scale` (sc-3058). SDXL supports
+    /// one control branch; more than one `Control` is an error.
+    fn resolve_control<'a>(
+        &self,
+        req: &'a GenerationRequest,
+    ) -> Result<Option<(&'a Image, f32)>> {
+        let mut control = None;
+        for c in &req.conditioning {
+            if let Conditioning::Control { image, scale, .. } = c {
+                if control.is_some() {
+                    return Err(Error::Msg("sdxl: multiple control images are not supported".into()));
+                }
+                control = Some((image, *scale));
+            }
+        }
+        Ok(control)
     }
 }
 

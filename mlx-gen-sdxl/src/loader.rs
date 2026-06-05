@@ -106,6 +106,21 @@ pub fn load_unet(root: &Path) -> Result<UNet2DConditionModel> {
     load_unet_dtype(root, Dtype::Float32)
 }
 
+/// Load an SDXL **ControlNet** branch (sc-3058) from a diffusers `ControlNetModel` checkpoint — a
+/// single `.safetensors` file or a directory containing `diffusion_pytorch_model.safetensors`. Cast
+/// to `dtype` (fp16 in production, matching the U-Net it injects into).
+pub fn load_controlnet(
+    src: &mlx_gen::WeightsSource,
+    dtype: Dtype,
+) -> Result<crate::unet::ControlNet> {
+    let mut w = match src {
+        mlx_gen::WeightsSource::File(p) => Weights::from_file(p)?,
+        mlx_gen::WeightsSource::Dir(p) => Weights::from_dir(p)?,
+    };
+    w.cast_all(dtype)?;
+    crate::unet::ControlNet::from_weights(&w, &UNetConfig::sdxl_base())
+}
+
 /// Load the SDXL VAE (encoder + decoder). The VAE always runs **f32**, even when the U-Net/TEs are
 /// fp16 — the vendored `StableDiffusion.__init__` loads `load_autoencoder(model, float16=False)`
 /// unconditionally (the SDXL VAE is fp16-unstable). Prefers the f32 master; if only the fp16 variant

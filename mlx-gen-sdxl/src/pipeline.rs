@@ -17,7 +17,7 @@ use mlx_gen::{CancelFlag, DiffusionSampler, Error, Image, Progress, Result};
 use crate::inpaint::InpaintBlend;
 use crate::sampler::EulerSampler;
 use crate::text_encoder::ClipTextEncoder;
-use crate::unet::UNet2DConditionModel;
+use crate::unet::{ControlNet, UNet2DConditionModel};
 use crate::vae::Autoencoder;
 
 /// VAE spatial downscale (latent is image/8 per side).
@@ -60,6 +60,15 @@ pub struct Denoiser<'a> {
     pub sampler: &'a dyn DiffusionSampler,
 }
 
+/// ControlNet conditioning for the denoise loop (sc-3058): the loaded branch, the preprocessed
+/// control image (NHWC `[B, H, W, 3]` in `[0,1]`, already CFG-batched to match the UNet input), and
+/// the `conditioning_scale`. Each step runs the branch on the model input and injects its residuals.
+pub struct ControlContext<'a> {
+    pub controlnet: &'a ControlNet,
+    pub control_image: Array,
+    pub scale: f32,
+}
+
 /// Run the denoise loop with CFG, driven entirely by the sampler's own schedule
 /// (`sampler.num_steps()` iterations). `latents` is the seeded init `[1, h, w, 4]`;
 /// `conditioning`/`pooled`/`time_ids` carry the CFG batch (B = 2 when `cfg > 1`). Returns the final
@@ -85,6 +94,7 @@ pub fn denoise(
         cfg,
         cancel,
         on_progress,
+        None,
         None,
     )
 }
@@ -114,6 +124,36 @@ pub fn denoise_inpaint(
         cancel,
         on_progress,
         Some(blend),
+        None,
+    )
+}
+
+/// Like [`denoise`] but runs a ControlNet branch each step and injects its residuals into the UNet
+/// (sc-3058). Works on the txt2img or img2img init (set up by the caller); `scale = 0` ⇒ identical
+/// to [`denoise`] (the residuals vanish).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    control: &ControlContext,
+) -> Result<Array> {
+    denoise_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        None,
+        Some(control),
     )
 }
 
@@ -128,6 +168,7 @@ fn denoise_core(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     inpaint: Option<&InpaintBlend>,
+    control: Option<&ControlContext>,
 ) -> Result<Array> {
     let steps = d.sampler.num_steps();
     // A zero-step denoise (img2img at strength ≤ 1/steps) is a no-op: return the init latents
@@ -155,13 +196,24 @@ fn denoise_core(
         } else {
             x_in
         };
-        let eps = d.unet.forward(
-            &x_unet,
-            d.sampler.timestep(i),
-            conditioning,
-            pooled,
-            time_ids,
-        )?;
+        let timestep = d.sampler.timestep(i);
+        let eps = match control {
+            // ControlNet (sc-3058): run the branch on the model input, inject its residuals.
+            Some(cc) => {
+                let res = cc.controlnet.forward(
+                    &x_unet,
+                    &cc.control_image,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    cc.scale,
+                )?;
+                d.unet
+                    .forward_with_control(&x_unet, timestep, conditioning, pooled, time_ids, &res)?
+            }
+            None => d.unet.forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
+        };
         let eps = if cfg_on {
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
             let eps_text = row(0)?;
@@ -230,6 +282,27 @@ pub fn preprocess_init_image(
         resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
     };
     let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
+    Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))
+}
+
+/// Preprocess a ControlNet control image (sc-3058): LANCZOS resize to the target dims, normalize
+/// `[0,255] → [0,1]` (the diffusers control image processor uses `do_normalize=False` ⇒ `[0,1]`, NOT
+/// the `[-1,1]` of a VAE init), lay out NHWC `[1, H, W, 3]` f32.
+pub fn preprocess_control_image(image: &Image, target_width: u32, target_height: u32) -> Result<Array> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    let (tw, th) = (target_width as usize, target_height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(Error::Msg(format!(
+            "sdxl control image pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    let resized: Vec<f32> = if (ih, iw) == (th, tw) {
+        image.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+    };
+    let norm: Vec<f32> = resized.iter().map(|&v| v / 255.0).collect();
     Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))
 }
 
