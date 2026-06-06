@@ -20,8 +20,8 @@
 //! cache (`mlx-community/gemma-3-12b-it-bf16`).
 //!
 //! **Quantization (sc-2686).** The transformer ships **selectively quantized** (attn/ff Linears
-//! packed U32 + `scales`); the **bits/group ride on the checkpoint's `split_model.json`** — `eros`
-//! and `ltx_2_3_base_q4` are **Q4**, `ltx_2_3_base_q8` is **Q8**, group 64 — read into the DiT
+//! packed U32 + `scales`); the **bits/group ride on the checkpoint's `split_model.json`** —
+//! `ltx_2_3_base_q4` is **Q4**, `ltx_2_3_base_q8` is **Q8**, group 64 — read into the DiT
 //! [`Precision`], never hardcoded. `LoadSpec::quantize`, when set, only *asserts* the expected level
 //! (LTX can't re-quantize a dense checkpoint — there is no dense LTX transformer; it ships pre-packed),
 //! so a mismatch with the manifest is a load error. Connector / VAE / upsampler are dense bf16 (the
@@ -235,7 +235,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )),
         };
     // Quantization geometry rides on the checkpoint's `split_model.json` (sc-2686): the transformer is
-    // shipped selectively quantized (Q4 for `eros`/`base_q4`, Q8 for `base_q8`), bits/group from the
+    // shipped selectively quantized (Q4 for `base_q4`, Q8 for `base_q8`), bits/group from the
     // manifest — never hardcoded. The per-Linear `.scales` predicate (in `transformer.rs`) then picks
     // which Linears are quantized, matching `generate_av.py`'s `_should_quantize`.
     let split = SplitModel::from_model_dir(root)?;

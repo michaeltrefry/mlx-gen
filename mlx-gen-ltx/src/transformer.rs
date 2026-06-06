@@ -15,8 +15,8 @@
 //!
 //! **Quant.** The shipped transformer stores the attn/ff Linears selectively quantized (U32 +
 //! `scales` + `biases`) — there is no dense bf16 checkpoint. The **bits/group ride on the checkpoint's
-//! `split_model.json`** ([`crate::config::SplitModel`]): `base_q8`/`eros`-style at 8 bits, `base_q4`
-//! at 4 bits, group 64 — read into [`Precision`], never hardcoded (sc-2686). The per-Linear predicate
+//! `split_model.json`** ([`crate::config::SplitModel`]): `base_q8` at 8 bits, `base_q4` at 4 bits,
+//! group 64 — read into [`Precision`], never hardcoded (sc-2686). The per-Linear predicate
 //! (quantize iff the weights carry `.scales`) mirrors `generate_av.py`'s `_should_quantize`.
 //!
 //! [`Precision::quant_f32`] is the production quality target: **f32 activations × `quantized_matmul`**

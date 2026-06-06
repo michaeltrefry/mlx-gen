@@ -1,14 +1,15 @@
 //! sc-3233 byte-parity validation for the native LTX-2.3 converter
-//! ([`mlx_gen_ltx::convert_and_assemble`]).
+//! ([`mlx_gen_ltx::convert_and_assemble`]), generic over the LTX-2.3 family.
 //!
-//! `#[ignore]`d: needs the real single-file source `10Eros_v1_bf16.safetensors` (~46 GB on disk,
-//! mmap'd) and the golden split dir `ltx_2_3_eros` (~42 GB). Converts the source in-process and
-//! asserts the produced split components reproduce the golden **byte-for-byte** — every component's
-//! keyset, and every tensor's shape, dtype, and exact bytes (bf16 bit-identical; the Q4 transformer's
-//! u32-packed weights + bf16 scales/biases exact). The configs are compared semantically.
+//! `#[ignore]`d: converts a real single-file checkpoint in-process and asserts the produced split
+//! components reproduce the corresponding golden **byte-for-byte** — every component's keyset, and
+//! every tensor's shape, dtype, and exact bytes (bf16 bit-identical; the quantized transformer's
+//! u32-packed weights + bf16 scales/biases exact); configs compared semantically. Covered:
+//!   * the base `Lightricks/LTX-2.3` distilled checkpoint at Q4 **and** Q8 (`ltx_2_3_base_q4`/`q8`),
+//!   * a community fine-tune at Q4 (`TenStrip/LTX2.3-10Eros` → `ltx_2_3_eros`).
 //!
 //! Run with: `cargo test -p mlx-gen-ltx --test convert_parity -- --ignored --nocapture`
-//! Override paths with `LTX_EROS_DIR` (golden) / `LTX_EROS_SRC` (source file).
+//! Path overrides: `LTX_BASE_SRC`, `LTX_EROS_DIR` / `LTX_EROS_SRC`.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -17,8 +18,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen_ltx::convert::{convert_and_assemble, LtxConvertOpts};
 use mlx_rs::ops::array_eq;
 
-/// The golden split dir (`LTX_EROS_DIR` or the default SceneWorks data path).
-fn golden_dir() -> PathBuf {
+/// The eros golden split dir (`LTX_EROS_DIR` or the default SceneWorks data path).
+fn eros_golden_dir() -> PathBuf {
     if let Ok(d) = std::env::var("LTX_EROS_DIR") {
         return PathBuf::from(d);
     }
@@ -26,8 +27,8 @@ fn golden_dir() -> PathBuf {
     PathBuf::from(home).join("Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_eros")
 }
 
-/// The single-file source (`LTX_EROS_SRC` or the HF cache snapshot).
-fn source_file() -> PathBuf {
+/// The eros single-file source (`LTX_EROS_SRC` or the HF cache snapshot).
+fn eros_source_file() -> PathBuf {
     if let Ok(p) = std::env::var("LTX_EROS_SRC") {
         return PathBuf::from(p);
     }
@@ -116,8 +117,8 @@ fn assert_json_eq(golden: &std::path::Path, produced: &std::path::Path, name: &s
 #[test]
 #[ignore = "needs 10Eros_v1_bf16.safetensors (~46 GB) + golden ltx_2_3_eros (~42 GB)"]
 fn eros_q4_convert_matches_golden() {
-    let golden = golden_dir();
-    let source = source_file();
+    let golden = eros_golden_dir();
+    let source = eros_source_file();
     assert!(golden.is_dir(), "golden dir missing: {}", golden.display());
     assert!(
         source.is_file(),
@@ -163,7 +164,7 @@ fn eros_q4_convert_matches_golden() {
 #[test]
 #[ignore = "needs golden ltx_2_3_eros upscaler component (~1 GB)"]
 fn eros_upscaler_roundtrip_matches_golden() {
-    let golden = golden_dir();
+    let golden = eros_golden_dir();
     assert!(golden.is_dir(), "golden dir missing: {}", golden.display());
 
     // Stage a fake upscaler dir holding the golden's x2-1.1 component under the source filename.

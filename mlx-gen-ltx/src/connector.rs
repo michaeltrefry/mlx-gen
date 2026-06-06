@@ -1,6 +1,6 @@
 //! `Embeddings1DConnector` — the LTX-2.3 text-feature connector (S1).
 //!
-//! Port of `text_encoder.py`'s `Embeddings1DConnector` as configured for the eros 2.3 model
+//! Port of `text_encoder.py`'s `Embeddings1DConnector` as configured for the LTX-2.3 models
 //! (`connector.safetensors`): an **8-layer** pre-norm transformer over the Gemma feature-extractor
 //! output, dim **4096** (32 heads × 128), **gated** attention with q/k RMSNorm, a plain
 //! gelu MLP (inner 16384), **128 learnable registers** that replace left-padding, and a

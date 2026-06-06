@@ -2,12 +2,12 @@
 //! mirroring the reference `generate_av.py` build logic (lines 1464–1529 of the
 //! `mlx-video-with-audio` package).
 //!
-//! The shipped SceneWorks model (`ltx_2_3_eros`) is an `AVTransformer3DModel`: gated attention,
-//! adaLN coefficient 9, **no** PixArt caption-projection linears (so `caption_channels` is the
-//! connector output `connector_heads × connector_head_dim = 4096`, not the 2.0 default 3840), and
-//! an 8-layer learnable-register connector. The 2.0 `generate.py` path hardcodes a different
-//! (non-gated, coeff-6, caption-proj-true, 3840) config and cannot run against this checkpoint —
-//! hence "read `embedded_config.json`, don't hardcode 2.0 values" (sc-2679 S0).
+//! The shipped LTX-2.3 models are `AVTransformer3DModel`s: gated attention, adaLN coefficient 9,
+//! **no** PixArt caption-projection linears (so `caption_channels` is the connector output
+//! `connector_heads × connector_head_dim = 4096`, not the 2.0 default 3840), and an 8-layer
+//! learnable-register connector. The 2.0 `generate.py` path hardcodes a different (non-gated,
+//! coeff-6, caption-proj-true, 3840) config and cannot run against these checkpoints — hence "read
+//! `embedded_config.json`, don't hardcode 2.0 values" (sc-2679 S0).
 //!
 //! This core is **VideoOnly**: only the video-stack transformer fields are consumed by the
 //! denoise path. The audio + connector fields are read here (so the reader is complete and the
@@ -339,9 +339,9 @@ pub struct LtxVaeConfig {
 }
 
 impl LtxVaeConfig {
-    /// The base / eros 2.3 VAE structure (used as the fallback when no `embedded_config.json` is
-    /// present, and as the unit-test reference). Channel sizes are not encoded here — they ride on
-    /// the weights — only the block order, res counts, and compress kinds.
+    /// The LTX-2.3 VAE structure (used as the fallback when no `embedded_config.json` is present, and
+    /// as the unit-test reference). Channel sizes are not encoded here — they ride on the weights —
+    /// only the block order, res counts, and compress kinds.
     pub fn defaults() -> Self {
         let b = |kind: &str, n: i32, m: i32| VaeBlock {
             kind: kind.to_string(),
@@ -659,8 +659,8 @@ impl VocoderConfig {
 /// The `split_model.json` manifest's quantization fields. The reference `generate_av.py` drives
 /// **selective transformer quant** from these (and `convert.py` writes them): `quantized` gates it,
 /// `quantization_bits` (reference default **4**) and `quantization_group_size` (default **64**) set
-/// the packing geometry. The shipped `ltx_2_3_base_q4` / `eros` checkpoints are bits 4, `base_q8` is
-/// bits 8 — so the geometry is **read from the manifest, never hardcoded** (sc-2686). The per-Linear
+/// the packing geometry. The shipped checkpoints are bits 4 (`base_q4`) or bits 8 (`base_q8`) — so
+/// the geometry is **read from the manifest, never hardcoded** (sc-2686). The per-Linear
 /// `_should_quantize` predicate (a layer is quantized iff its weights carry `.scales`) is applied at
 /// load in [`crate::transformer`], matching `generate_av.py`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -772,8 +772,8 @@ fn get_i32_3(v: &Value, key: &str, default: [i32; 3]) -> [i32; 3] {
 mod tests {
     use super::*;
 
-    /// The exact `transformer` block of `ltx_2_3_eros/embedded_config.json`.
-    fn eros_transformer() -> Value {
+    /// An LTX-2.3 `transformer` block of `embedded_config.json`.
+    fn ltx23_transformer() -> Value {
         serde_json::json!({
             "_class_name": "AVTransformer3DModel",
             "attention_head_dim": 128,
@@ -812,8 +812,8 @@ mod tests {
     }
 
     #[test]
-    fn eros_config_matches_reference_build_logic() {
-        let cfg = LtxConfig::from_embedded_transformer(&eros_transformer());
+    fn ltx23_config_matches_reference_build_logic() {
+        let cfg = LtxConfig::from_embedded_transformer(&ltx23_transformer());
         // Gated family → adaLN coeff 9.
         assert!(cfg.apply_gated_attention);
         assert_eq!(cfg.adaln_embedding_coefficient, 9);
