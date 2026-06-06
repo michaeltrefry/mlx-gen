@@ -4,17 +4,22 @@
 //! `.pth` (zip-of-pickle) — read via [`crate::pth`]. This module ports the reference sanitizers that
 //! map the native key layout onto the MLX model layout the Wan loaders consume.
 //!
-//! **sc-3237 (this slice): the Wan2.2 VAE path.** [`convert_vae22`] reads `Wan2.2_VAE.pth`, applies
+//! **sc-3237: the Wan2.2 VAE path.** [`convert_vae22`] reads `Wan2.2_VAE.pth`, applies
 //! [`sanitize_wan22_vae`] (the reference `sanitize_wan22_vae_weights`), and writes
-//! `vae.safetensors` in f32 (official Wan runs VAE decode in float32). The transformer + T5 +
-//! orchestration (single-model TI2V-5B, dual-expert I2V-14B) are sc-3238 / sc-3239.
+//! `vae.safetensors` in f32 (official Wan runs VAE decode in float32).
+//!
+//! **sc-3238: the TI2V-5B single-model converter.** [`convert_ti2v_5b`] assembles a full MLX dir —
+//! the transformer (native safetensors shards → [`sanitize_wan_transformer`], bf16), the T5
+//! (`.pth` → [`sanitize_wan_t5`], bf16), the VAE (f32), and `config.json`. The dual-expert
+//! I2V-14B converter is sc-3239.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::transforms::eval;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 /// Channels-last transpose of a PyTorch conv weight: Conv3d `[O,I,D,H,W]→[O,D,H,W,I]`, Conv2d
 /// `[O,I,H,W]→[O,H,W,I]`. Other ranks pass through.
@@ -118,6 +123,191 @@ pub fn convert_vae22(
         out_file.as_ref(),
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// sc-3238: Wan2.2 TI2V-5B full converter (transformer + T5 + config + orchestration)
+// ---------------------------------------------------------------------------
+
+/// Collect a [`Weights`] into a plain key→Array map (lazy clones).
+fn weights_to_map(w: &Weights) -> HashMap<String, Array> {
+    w.keys()
+        .map(|k| {
+            (
+                k.to_string(),
+                w.require(k).expect("key from keys()").clone(),
+            )
+        })
+        .collect()
+}
+
+/// Cast every tensor in `map` to `dtype` in place.
+fn cast_map(map: &mut HashMap<String, Array>, dtype: Dtype) -> Result<()> {
+    for v in map.values_mut() {
+        if v.dtype() != dtype {
+            *v = v.as_dtype(dtype)?;
+        }
+    }
+    Ok(())
+}
+
+/// Materialize + write a key→Array map to `path`.
+fn save_map(path: PathBuf, map: &HashMap<String, Array>) -> Result<()> {
+    let arrays: Vec<&Array> = map.values().collect();
+    eval(arrays)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Array::save_safetensors(
+        map.iter().map(|(k, v)| (k.as_str(), v)),
+        None::<&HashMap<String, String>>,
+        path,
+    )?;
+    Ok(())
+}
+
+fn write_json(path: PathBuf, v: &serde_json::Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(v)
+        .map_err(|e| Error::Msg(format!("serialize {}: {e}", path.display())))?;
+    std::fs::write(&path, text)?;
+    Ok(())
+}
+
+/// Port of `sanitize_wan_transformer_weights`: native Wan transformer keys → MLX `WanTransformer`
+/// keys. `patch_embedding.weight` `[dim,in,1,2,2]` flattens to `[dim, in·4]` → `patch_embedding_proj`;
+/// the `text/time_embedding` Sequentials (`.0`/`.2`) → `_0`/`_1`; `time_projection.1` → bare;
+/// `ffn.0`/`ffn.2` → `ffn.fc1`/`ffn.fc2`; the `freqs` buffer is dropped. Everything else (attn, norms,
+/// modulation, head) passes through unchanged.
+pub fn sanitize_wan_transformer(raw: &HashMap<String, Array>) -> Result<HashMap<String, Array>> {
+    let mut out = HashMap::new();
+    for (key, value) in raw {
+        if key == "patch_embedding.weight" {
+            let s = value.shape();
+            let cols: i32 = s[1..].iter().product();
+            out.insert(
+                "patch_embedding_proj.weight".into(),
+                value.reshape(&[s[0], cols])?,
+            );
+            continue;
+        }
+        if key == "patch_embedding.bias" {
+            out.insert("patch_embedding_proj.bias".into(), value.clone());
+            continue;
+        }
+        let renamed_seq = [
+            ("text_embedding.0.", "text_embedding_0."),
+            ("text_embedding.2.", "text_embedding_1."),
+            ("time_embedding.0.", "time_embedding_0."),
+            ("time_embedding.2.", "time_embedding_1."),
+            ("time_projection.1.", "time_projection."),
+        ]
+        .iter()
+        .find_map(|(p, r)| key.strip_prefix(p).map(|rest| format!("{r}{rest}")));
+        if let Some(new) = renamed_seq {
+            out.insert(new, value.clone());
+            continue;
+        }
+        if key == "freqs" {
+            continue;
+        }
+        let new = key
+            .replace(".ffn.0.", ".ffn.fc1.")
+            .replace(".ffn.2.", ".ffn.fc2.");
+        out.insert(new, value.clone());
+    }
+    Ok(out)
+}
+
+/// Port of `sanitize_wan_t5_weights`: the sole rename `.ffn.gate.0.` → `.ffn.gate_proj.` (the gate
+/// Linear); every other UMT5 key passes through.
+pub fn sanitize_wan_t5(raw: &HashMap<String, Array>) -> HashMap<String, Array> {
+    raw.iter()
+        .map(|(k, v)| (k.replace(".ffn.gate.0.", ".ffn.gate_proj."), v.clone()))
+        .collect()
+}
+
+/// The `WanModelConfig.wan22_ti2v_5b().to_dict()` config.json (matches the golden semantically).
+fn wan22_ti2v_5b_config() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "ti2v",
+        "model_version": "2.2",
+        "patch_size": [1, 2, 2],
+        "text_len": 512,
+        "in_dim": 48,
+        "dim": 3072,
+        "ffn_dim": 14336,
+        "freq_dim": 256,
+        "text_dim": 4096,
+        "out_dim": 48,
+        "num_heads": 24,
+        "num_layers": 30,
+        "window_size": [-1, -1],
+        "qk_norm": true,
+        "cross_attn_norm": true,
+        "eps": 1e-6,
+        "vae_stride": [4, 16, 16],
+        "vae_z_dim": 48,
+        "dual_model": false,
+        "boundary": 0.0,
+        "sample_shift": 5.0,
+        "sample_steps": 40,
+        "sample_guide_scale": 5.0,
+        "num_train_timesteps": 1000,
+        "sample_fps": 24,
+        "frame_num": 81,
+        "sample_neg_prompt": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+        "max_area": 901120,
+        "t5_vocab_size": 256384,
+        "t5_dim": 4096,
+        "t5_dim_attn": 4096,
+        "t5_dim_ffn": 10240,
+        "t5_num_heads": 64,
+        "t5_num_layers": 24,
+        "t5_num_buckets": 32
+    })
+}
+
+/// Convert a native Wan2.2 **TI2V-5B** checkpoint dir into an MLX model dir at `out_dir`: the
+/// transformer (native `diffusion_pytorch_model-*.safetensors` shards) → `model.safetensors` (bf16),
+/// the T5 (`models_t5_umt5-xxl-enc-bf16.pth`) → `t5_encoder.safetensors` (bf16), the VAE
+/// (`Wan2.2_VAE.pth`) → `vae.safetensors` (f32), plus `config.json`. The UMT5 `tokenizer.json` (at
+/// `google/umt5-xxl/tokenizer.json` in the native repo) is copied by the install flow, not emitted
+/// here — matching the reference `convert_wan`.
+pub fn convert_ti2v_5b(
+    checkpoint_dir: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+) -> Result<PathBuf> {
+    let checkpoint_dir = checkpoint_dir.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    // 1. Transformer — native single-model safetensors (the 3 shards merge in `from_dir`).
+    let w = Weights::from_dir(checkpoint_dir)?;
+    let map = weights_to_map(&w);
+    let mut transformer = sanitize_wan_transformer(&map)?;
+    cast_map(&mut transformer, Dtype::Bfloat16)?;
+    save_map(out_dir.join("model.safetensors"), &transformer)?;
+    drop((w, map, transformer));
+
+    // 2. Config.
+    write_json(out_dir.join("config.json"), &wan22_ti2v_5b_config())?;
+
+    // 3. T5 encoder — native `.pth` (pickle) → f32 → sanitize → bf16.
+    let t5_pth = checkpoint_dir.join("models_t5_umt5-xxl-enc-bf16.pth");
+    let raw_t5 = crate::pth::load_pth_f32(&t5_pth)?;
+    let mut t5 = sanitize_wan_t5(&raw_t5);
+    cast_map(&mut t5, Dtype::Bfloat16)?;
+    save_map(out_dir.join("t5_encoder.safetensors"), &t5)?;
+    drop((raw_t5, t5));
+
+    // 4. VAE — TI2V keeps the encoder; saved f32.
+    convert_vae22(
+        checkpoint_dir.join("Wan2.2_VAE.pth"),
+        out_dir.join("vae.safetensors"),
+        true,
+    )?;
+
+    Ok(out_dir.to_path_buf())
 }
 
 #[cfg(test)]
@@ -237,5 +427,102 @@ mod tests {
             &Array::from_slice(&[0.0f32, 2.0, 1.0, 3.0], &[1, 1, 1, 2, 2])
         ));
         assert_eq!(s["decoder.middle.0.norm.gamma"].shape(), &[3]);
+    }
+
+    /// Transformer sanitizer: patch_embedding flatten, Sequential→_0/_1, time_projection.1→bare,
+    /// ffn.0/2→fc1/fc2, freqs dropped, attn/modulation pass-through.
+    #[test]
+    fn transformer_renames() {
+        let s = sanitize_wan_transformer(&m(&[
+            // [dim=2, in=3, 1, 2, 2] → patch_embedding_proj.weight [2, 12]
+            (
+                "patch_embedding.weight",
+                Array::ones::<f32>(&[2, 3, 1, 2, 2]).unwrap(),
+            ),
+            ("patch_embedding.bias", Array::ones::<f32>(&[2]).unwrap()),
+            (
+                "text_embedding.0.weight",
+                Array::ones::<f32>(&[2, 4]).unwrap(),
+            ),
+            ("text_embedding.2.bias", Array::ones::<f32>(&[2]).unwrap()),
+            (
+                "time_embedding.0.weight",
+                Array::ones::<f32>(&[2, 4]).unwrap(),
+            ),
+            (
+                "time_embedding.2.weight",
+                Array::ones::<f32>(&[2, 2]).unwrap(),
+            ),
+            (
+                "time_projection.1.weight",
+                Array::ones::<f32>(&[12, 2]).unwrap(),
+            ),
+            (
+                "blocks.0.ffn.0.weight",
+                Array::ones::<f32>(&[8, 2]).unwrap(),
+            ),
+            (
+                "blocks.0.ffn.2.weight",
+                Array::ones::<f32>(&[2, 8]).unwrap(),
+            ),
+            (
+                "blocks.0.self_attn.q.weight",
+                Array::ones::<f32>(&[2, 2]).unwrap(),
+            ),
+            (
+                "blocks.0.modulation",
+                Array::ones::<f32>(&[1, 6, 2]).unwrap(),
+            ),
+            ("freqs", Array::ones::<f32>(&[2, 2]).unwrap()),
+        ]))
+        .unwrap();
+        let mut keys: Vec<&str> = s.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "blocks.0.ffn.fc1.weight",
+                "blocks.0.ffn.fc2.weight",
+                "blocks.0.modulation",
+                "blocks.0.self_attn.q.weight",
+                "patch_embedding_proj.bias",
+                "patch_embedding_proj.weight",
+                "text_embedding_0.weight",
+                "text_embedding_1.bias",
+                "time_embedding_0.weight",
+                "time_embedding_1.weight",
+                "time_projection.weight",
+            ]
+        );
+        assert_eq!(s["patch_embedding_proj.weight"].shape(), &[2, 12]); // 3·1·2·2 = 12
+        assert!(!s.contains_key("freqs"));
+    }
+
+    /// T5 sanitizer: only `.ffn.gate.0.` → `.ffn.gate_proj.`; everything else unchanged.
+    #[test]
+    fn t5_gate_rename() {
+        let s = sanitize_wan_t5(&m(&[
+            (
+                "blocks.0.ffn.gate.0.weight",
+                Array::ones::<f32>(&[4, 2]).unwrap(),
+            ),
+            (
+                "blocks.0.ffn.fc1.weight",
+                Array::ones::<f32>(&[4, 2]).unwrap(),
+            ),
+            (
+                "blocks.0.attn.q.weight",
+                Array::ones::<f32>(&[2, 2]).unwrap(),
+            ),
+            (
+                "token_embedding.weight",
+                Array::ones::<f32>(&[5, 2]).unwrap(),
+            ),
+        ]));
+        assert!(s.contains_key("blocks.0.ffn.gate_proj.weight"));
+        assert!(!s.keys().any(|k| k.contains("gate.0")));
+        assert!(s.contains_key("blocks.0.ffn.fc1.weight"));
+        assert!(s.contains_key("blocks.0.attn.q.weight"));
+        assert!(s.contains_key("token_embedding.weight"));
     }
 }
