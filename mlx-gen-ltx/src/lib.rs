@@ -36,6 +36,7 @@ pub mod audio_vae;
 pub mod conditioning;
 pub mod config;
 pub mod connector;
+pub mod convert;
 pub mod enhance;
 pub mod gemma;
 pub mod model;
@@ -55,6 +56,7 @@ pub use audio_vae::AudioDecoder;
 pub use conditioning::{apply_conditioning, apply_denoise_mask, I2vConditioning};
 pub use config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
+pub use convert::{convert_and_assemble, LtxConvertOpts};
 pub use enhance::{clean_response, EnhanceConfig, SampleParams};
 pub use model::{descriptor, load, Ltx, MODEL_ID};
 pub use pipeline::{
