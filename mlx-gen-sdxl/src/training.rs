@@ -49,12 +49,13 @@ use mlx_gen::train::lora::{
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::{
-    LoadSpec, Modality, NetworkType, Result, Trainer, TrainerDescriptor, TrainerRegistration,
-    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
+    LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
+    TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::subtract;
-use mlx_rs::optimizers::{clip_grad_norm, AdamW, Optimizer};
+use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -160,11 +161,10 @@ impl Trainer for SdxlTrainer {
         if req.config.rank == 0 {
             return Err("sdxl trainer: rank must be > 0".into());
         }
-        let opt = req.config.optimizer.to_ascii_lowercase();
-        if opt != "adamw" && opt != "adam" {
+        if !TrainOptimizer::is_supported(&req.config.optimizer) {
             return Err(format!(
-                "sdxl trainer: optimizer '{}' is not available on MLX (only adamw/adam; \
-                 Prodigy/Rose tracked as sc-3048)",
+                "sdxl trainer: optimizer '{}' is not available on MLX training (supported: \
+                 adamw, adam, rose, prodigy)",
                 req.config.optimizer
             )
             .into());
@@ -240,8 +240,7 @@ impl Trainer for SdxlTrainer {
         } else {
             cfg.weight_decay
         };
-        let mut opt = AdamW::new(cfg.learning_rate);
-        opt.weight_decay = Array::from_slice(&[weight_decay], &[1]);
+        let mut opt = TrainOptimizer::from_config(&cfg.optimizer, cfg.learning_rate, weight_decay)?;
 
         let accum = cfg.gradient_accumulation.max(1);
         let (total_updates, warmup_updates) =
@@ -295,9 +294,9 @@ impl Trainer for SdxlTrainer {
             accumulate_grads(&mut accumulated, grads)?;
 
             if step % accum == 0 || step == cfg.steps {
-                let lr = cfg.learning_rate
-                    * lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.lr = Array::from_slice(&[lr], &[1]);
+                let mult =
+                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
+                opt.set_lr_scaled(mult);
                 let avg = average_grads(
                     accumulated
                         .take()
@@ -305,11 +304,11 @@ impl Trainer for SdxlTrainer {
                     accum,
                 )?;
                 let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                for (k, g) in clipped.iter() {
-                    let mut p = params[k].clone();
-                    opt.update_single(k, g.as_ref(), &mut p)?;
-                    params.insert(k.clone(), p);
-                }
+                let clipped: LoraParams = clipped
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into_owned()))
+                    .collect();
+                opt.step(&mut params, &clipped)?;
                 eval(params.values())?;
                 update_idx += 1;
             }

@@ -47,8 +47,8 @@ pub use sampler::{
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling};
 pub use train::{
-    LrSchedule, NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
-    TrainingOutput, TrainingProgress, TrainingRequest,
+    LrSchedule, NetworkType, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
+    TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 pub use transform::{
     TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,

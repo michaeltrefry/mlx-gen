@@ -52,12 +52,13 @@ use mlx_gen::train::lora::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    LoadSpec, Modality, NetworkType, Result, Trainer, TrainerDescriptor, TrainerRegistration,
-    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
+    LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
+    TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
-use mlx_rs::optimizers::{clip_grad_norm, AdamW, Optimizer};
+use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -120,7 +121,7 @@ struct ExpertState {
     band: (f32, f32),     // the timestep band this expert is sampled in
     adapter: TrainAdapter,
     params: LoraParams,
-    opt: AdamW,
+    opt: TrainOptimizer,
     accumulated: Option<LoraParams>,
     micro: u32,      // micro-steps routed to this expert so far (drives accumulation)
     update_idx: u32, // optimizer updates applied (drives the LR schedule)
@@ -273,11 +274,10 @@ impl Trainer for WanMoeTrainer {
         if req.config.rank == 0 {
             return Err(format!("{id} trainer: rank must be > 0").into());
         }
-        let opt = req.config.optimizer.to_ascii_lowercase();
-        if opt != "adamw" && opt != "adam" {
+        if !TrainOptimizer::is_supported(&req.config.optimizer) {
             return Err(format!(
-                "{id} trainer: optimizer '{}' is not available on MLX (only adamw/adam; \
-                 Prodigy/Rose tracked as sc-3048)",
+                "{id} trainer: optimizer '{}' is not available on MLX training (supported: \
+                 adamw, adam, rose, prodigy)",
                 req.config.optimizer
             )
             .into());
@@ -391,8 +391,7 @@ impl Trainer for WanMoeTrainer {
             let expert_micro = (cfg.steps / n_experts as u32).max(1);
             let (total_updates, warmup_updates) =
                 schedule_updates(expert_micro, accum, cfg.lr_warmup_steps);
-            let mut opt = AdamW::new(cfg.learning_rate);
-            opt.weight_decay = Array::from_slice(&[weight_decay], &[1]);
+            let opt = TrainOptimizer::from_config(&cfg.optimizer, cfg.learning_rate, weight_decay)?;
             states.push(ExpertState {
                 suffix,
                 band,
@@ -465,14 +464,13 @@ impl Trainer for WanMoeTrainer {
             accumulate_grads(&mut st.accumulated, grads)?;
             // Fire an optimizer update every `accum` micro-steps for THIS expert (or on the final step).
             if st.micro.is_multiple_of(accum) || step == cfg.steps {
-                let lr = cfg.learning_rate
-                    * lr_multiplier(
-                        cfg.lr_scheduler,
-                        st.update_idx,
-                        st.total_updates,
-                        st.warmup_updates,
-                    );
-                st.opt.lr = Array::from_slice(&[lr], &[1]);
+                let mult = lr_multiplier(
+                    cfg.lr_scheduler,
+                    st.update_idx,
+                    st.total_updates,
+                    st.warmup_updates,
+                );
+                st.opt.set_lr_scaled(mult);
                 let avg = average_grads(
                     st.accumulated
                         .take()
@@ -480,11 +478,11 @@ impl Trainer for WanMoeTrainer {
                     accum,
                 )?;
                 let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                for (k, g) in clipped.iter() {
-                    let mut p = st.params[k].clone();
-                    st.opt.update_single(k, g.as_ref(), &mut p)?;
-                    st.params.insert(k.clone(), p);
-                }
+                let clipped: LoraParams = clipped
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into_owned()))
+                    .collect();
+                st.opt.step(&mut st.params, &clipped)?;
                 eval(st.params.values())?;
                 st.update_idx += 1;
             }

@@ -16,10 +16,12 @@
 pub mod checkpoint;
 pub mod dataset;
 pub mod lora;
+pub mod optim;
 pub mod schedule;
 
 use std::path::PathBuf;
 
+pub use optim::TrainOptimizer;
 pub use schedule::LrSchedule;
 
 use crate::generator::Modality;

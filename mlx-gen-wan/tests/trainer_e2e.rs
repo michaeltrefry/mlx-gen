@@ -91,10 +91,10 @@ fn assert_reloads(
     );
 }
 
-/// The shared lifecycle driver: load `model_id` from `snapshot`, train a tiny LoRA, assert the
-/// windowed loss falls, then reload each written adapter through `merge_wan_adapters`.
-fn run_trainer_e2e(model_id: &str, snapshot: PathBuf, experts: &[ExpertFile]) {
-    let tmp = std::env::temp_dir().join(format!("{model_id}_trainer_e2e"));
+/// The shared lifecycle driver: load `model_id` from `snapshot`, train a tiny LoRA with `optimizer`,
+/// assert the windowed loss falls, then reload each written adapter through `merge_wan_adapters`.
+fn run_trainer_e2e(model_id: &str, snapshot: PathBuf, experts: &[ExpertFile], optimizer: &str) {
+    let tmp = std::env::temp_dir().join(format!("{model_id}_{optimizer}_trainer_e2e"));
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen::load_trainer(
@@ -112,6 +112,7 @@ fn run_trainer_e2e(model_id: &str, snapshot: PathBuf, experts: &[ExpertFile]) {
         save_every: 0,
         seed: 7,
         network_type: NetworkType::Lora,
+        optimizer: optimizer.to_string(),
         ..Default::default()
     };
     let req = TrainingRequest {
@@ -191,22 +192,40 @@ fn wan_t2v_a14b_trainer_trains_both_experts_and_reloads() {
         "WAN_A14B_MODEL_DIR",
         ".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16",
     );
-    run_trainer_e2e(
-        "wan2_2_t2v_14b",
-        snap,
-        &[
-            ExpertFile {
-                suffix: "high_noise",
-                weights_file: "high_noise_model.safetensors",
-                expert: Some(MoeExpert::High),
-            },
-            ExpertFile {
-                suffix: "low_noise",
-                weights_file: "low_noise_model.safetensors",
-                expert: Some(MoeExpert::Low),
-            },
-        ],
-    );
+    run_trainer_e2e("wan2_2_t2v_14b", snap, &moe_experts(), "adamw");
+}
+
+/// The dual-expert (high/low) reload spec for the A14B MoE trainers.
+fn moe_experts() -> Vec<ExpertFile> {
+    vec![
+        ExpertFile {
+            suffix: "high_noise",
+            weights_file: "high_noise_model.safetensors",
+            expert: Some(MoeExpert::High),
+        },
+        ExpertFile {
+            suffix: "low_noise",
+            weights_file: "low_noise_model.safetensors",
+            expert: Some(MoeExpert::Low),
+        },
+    ]
+}
+
+/// Resolve the dense TI2V-5B snapshot (env override else the SceneWorks model dir).
+fn ti2v_5b_snapshot() -> PathBuf {
+    snapshot(
+        "WAN_TI2V_5B_MODEL_DIR",
+        "Library/Application Support/SceneWorks/data/models/mlx/wan_2_2_ti2v_5b",
+    )
+}
+
+/// The dense single-file reload spec for the TI2V-5B trainer.
+fn dense_expert() -> Vec<ExpertFile> {
+    vec![ExpertFile {
+        suffix: "",
+        weights_file: "model.safetensors",
+        expert: None,
+    }]
 }
 
 #[test]
@@ -217,39 +236,42 @@ fn wan_i2v_a14b_trainer_trains_both_experts_and_reloads() {
         "WAN_I2V_A14B_MODEL_DIR",
         ".cache/mlx-gen-models/wan2_2_i2v_a14b_mlx_bf16",
     );
-    run_trainer_e2e(
-        "wan2_2_i2v_14b",
-        snap,
-        &[
-            ExpertFile {
-                suffix: "high_noise",
-                weights_file: "high_noise_model.safetensors",
-                expert: Some(MoeExpert::High),
-            },
-            ExpertFile {
-                suffix: "low_noise",
-                weights_file: "low_noise_model.safetensors",
-                expert: Some(MoeExpert::Low),
-            },
-        ],
-    );
+    run_trainer_e2e("wan2_2_i2v_14b", snap, &moe_experts(), "adamw");
 }
 
 #[test]
 #[ignore = "needs the converted Wan2.2-TI2V-5B dense bf16 checkpoint (with z48 vae)"]
 fn wan_ti2v_5b_trainer_trains_dense_and_reloads() {
     assert_eq!(mlx_gen_wan::MODEL_ID, "wan2_2_ti2v_5b");
-    let snap = snapshot(
-        "WAN_TI2V_5B_MODEL_DIR",
-        "Library/Application Support/SceneWorks/data/models/mlx/wan_2_2_ti2v_5b",
-    );
     run_trainer_e2e(
         "wan2_2_ti2v_5b",
-        snap,
-        &[ExpertFile {
-            suffix: "",
-            weights_file: "model.safetensors",
-            expert: None,
-        }],
+        ti2v_5b_snapshot(),
+        &dense_expert(),
+        "adamw",
+    );
+}
+
+// sc-3048 — the ported Rose + Prodigy optimizers drive a real training run end-to-end (loss falls +
+// the adapter reloads), on the fast dense TI2V-5B. The optimizers themselves are numerically
+// validated against the torch reference in the core `train::optim` unit tests.
+#[test]
+#[ignore = "needs the converted Wan2.2-TI2V-5B dense bf16 checkpoint (with z48 vae)"]
+fn wan_ti2v_5b_trainer_rose_optimizer() {
+    run_trainer_e2e(
+        "wan2_2_ti2v_5b",
+        ti2v_5b_snapshot(),
+        &dense_expert(),
+        "rose",
+    );
+}
+
+#[test]
+#[ignore = "needs the converted Wan2.2-TI2V-5B dense bf16 checkpoint (with z48 vae)"]
+fn wan_ti2v_5b_trainer_prodigy_optimizer() {
+    run_trainer_e2e(
+        "wan2_2_ti2v_5b",
+        ti2v_5b_snapshot(),
+        &dense_expert(),
+        "prodigy",
     );
 }
