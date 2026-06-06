@@ -10,14 +10,23 @@
 //!
 //! **sc-3238: the TI2V-5B single-model converter.** [`convert_ti2v_5b`] assembles a full MLX dir —
 //! the transformer (native safetensors shards → [`sanitize_wan_transformer`], bf16), the T5
-//! (`.pth` → [`sanitize_wan_t5`], bf16), the VAE (f32), and `config.json`. The dual-expert
-//! I2V-14B converter is sc-3239.
+//! (`.pth` → [`sanitize_wan_t5`], bf16), the VAE (f32), and `config.json`.
+//!
+//! **sc-3239: the I2V-A14B dual-expert converter.** [`convert_i2v_14b`] converts both the
+//! `low_noise_model` + `high_noise_model` experts (in_dim 36, optionally Q4/Q8 via
+//! [`quantize_wan_transformer`]), the z16 Wan2.1 VAE ([`sanitize_wan_vae_weights`]), the T5, and the
+//! I2V-14B `config.json`. ⚠ No golden dir exists for I2V-14B and its native source is not cached
+//! (~114 GB), so this path is **structurally** validated (sanitizers + config round-trip + the
+//! byte-proven [`sanitize_wan_transformer`]/pickle-reader/`quantize`) but not yet byte-parity'd
+//! end-to-end — `tests/convert_i2v_14b_parity.rs` is wired and `#[ignore]`d, ready for when a
+//! reference is generated.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+use mlx_rs::ops::quantize;
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
@@ -310,6 +319,193 @@ pub fn convert_ti2v_5b(
     Ok(out_dir.to_path_buf())
 }
 
+// ---------------------------------------------------------------------------
+// sc-3239: Wan2.2 I2V-A14B dual-expert converter (in_dim 36, z16 VAE, optional Q4/Q8)
+// ---------------------------------------------------------------------------
+
+/// The reference `_quantize_predicate`: a Wan transformer Linear is quantized iff its weight key
+/// (minus `.weight`) ends with one of these — attention q/k/v/o (self + cross) and the FFN fc1/fc2.
+/// Norms / modulation / embeddings / head stay dense.
+const WAN_QUANT_SUFFIXES: &[&str] = &[
+    ".self_attn.q",
+    ".self_attn.k",
+    ".self_attn.v",
+    ".self_attn.o",
+    ".cross_attn.q",
+    ".cross_attn.k",
+    ".cross_attn.v",
+    ".cross_attn.o",
+    ".ffn.fc1",
+    ".ffn.fc2",
+];
+
+/// Port of `sanitize_wan_vae_weights` (the Wan2.1 z16 VAE — `convert_wan.py`): channels-last conv
+/// transposes only (Conv3d/Conv2d weights gated on `"weight" in key`), **no** key renames. Distinct
+/// from the bespoke z48 [`sanitize_wan22_vae`].
+pub fn sanitize_wan_vae_weights(raw: &HashMap<String, Array>) -> Result<HashMap<String, Array>> {
+    let mut out = HashMap::with_capacity(raw.len());
+    for (k, v) in raw {
+        let value = if k.contains("weight") {
+            conv_channels_last(v)?
+        } else {
+            v.clone()
+        };
+        out.insert(k.clone(), value);
+    }
+    Ok(out)
+}
+
+/// Selectively Q4/Q8-quantize a (sanitized) Wan transformer expert in place: each
+/// [`WAN_QUANT_SUFFIXES`]-matched Linear `{base}.weight` (bf16) becomes the packed triple
+/// `{base}.weight` (u32), `{base}.scales`, `{base}.biases` via MLX `quantize` (byte-identical to
+/// `nn.quantize`); the bias and all other tensors pass through.
+pub fn quantize_wan_transformer(
+    map: HashMap<String, Array>,
+    bits: i32,
+    group_size: i32,
+) -> Result<HashMap<String, Array>> {
+    let mut out = HashMap::with_capacity(map.len());
+    for (k, v) in map {
+        let base = k.strip_suffix(".weight");
+        let is_q = base.is_some_and(|b| WAN_QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)));
+        if let (true, Some(base)) = (is_q, base) {
+            let (wq, scales, biases) = quantize(&v, group_size, bits)?;
+            out.insert(format!("{base}.weight"), wq);
+            out.insert(format!("{base}.scales"), scales);
+            out.insert(format!("{base}.biases"), biases);
+        } else {
+            out.insert(k, v);
+        }
+    }
+    Ok(out)
+}
+
+/// The `WanModelConfig.wan22_i2v_14b().to_dict()` config.json (round-trips through
+/// `WanModelConfig::from_config_json`; the dual guide scale is a 2-element array).
+fn wan22_i2v_14b_config(quantize: Option<(i32, i32)>) -> serde_json::Value {
+    let mut cfg = serde_json::json!({
+        "model_type": "i2v",
+        "model_version": "2.2",
+        "patch_size": [1, 2, 2],
+        "text_len": 512,
+        "in_dim": 36,
+        "dim": 5120,
+        "ffn_dim": 13824,
+        "freq_dim": 256,
+        "text_dim": 4096,
+        "out_dim": 16,
+        "num_heads": 40,
+        "num_layers": 40,
+        "window_size": [-1, -1],
+        "qk_norm": true,
+        "cross_attn_norm": true,
+        "eps": 1e-6,
+        "vae_stride": [4, 8, 8],
+        "vae_z_dim": 16,
+        "dual_model": true,
+        "boundary": 0.9,
+        "sample_shift": 5.0,
+        "sample_steps": 40,
+        "sample_guide_scale": [3.5, 3.5],
+        "num_train_timesteps": 1000,
+        "sample_fps": 16,
+        "frame_num": 81,
+        "sample_neg_prompt": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+        "max_area": 901120,
+        "t5_vocab_size": 256384,
+        "t5_dim": 4096,
+        "t5_dim_attn": 4096,
+        "t5_dim_ffn": 10240,
+        "t5_num_heads": 64,
+        "t5_num_layers": 24,
+        "t5_num_buckets": 32
+    });
+    if let Some((bits, group_size)) = quantize {
+        cfg["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
+    }
+    cfg
+}
+
+/// Convert one native transformer expert dir (`low_noise_model` / `high_noise_model`) → a sanitized,
+/// bf16 (optionally quantized) component file.
+fn convert_expert(
+    expert_dir: &Path,
+    out_file: PathBuf,
+    quantize: Option<(i32, i32)>,
+) -> Result<()> {
+    let w = Weights::from_dir(expert_dir)?;
+    let map = weights_to_map(&w);
+    let mut t = sanitize_wan_transformer(&map)?;
+    cast_map(&mut t, Dtype::Bfloat16)?;
+    let t = match quantize {
+        Some((bits, group)) => quantize_wan_transformer(t, bits, group)?,
+        None => t,
+    };
+    save_map(out_file, &t)?;
+    Ok(())
+}
+
+/// Convert a native Wan2.2 **I2V-A14B** checkpoint dir into an MLX model dir: the two MoE experts
+/// (`low_noise_model` / `high_noise_model` → `*.safetensors`, in_dim 36, optionally Q4/Q8), the z16
+/// Wan2.1 VAE (`Wan2.1_VAE.pth`, falling back to `Wan2.2_VAE.pth`), the T5, and `config.json`.
+/// `quantize = Some((bits, group_size))` enables selective transformer quantization on both experts.
+///
+/// ⚠ Unlike [`convert_ti2v_5b`] this path has no golden + the native source (~114 GB) is uncached, so
+/// it is validated structurally (sanitizers + config round-trip), not yet byte-parity'd end-to-end.
+pub fn convert_i2v_14b(
+    checkpoint_dir: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    quantize: Option<(i32, i32)>,
+) -> Result<PathBuf> {
+    let checkpoint_dir = checkpoint_dir.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    // 1. Dual experts.
+    for (sub, out) in [
+        ("low_noise_model", "low_noise_model.safetensors"),
+        ("high_noise_model", "high_noise_model.safetensors"),
+    ] {
+        let expert_dir = checkpoint_dir.join(sub);
+        if !expert_dir.is_dir() {
+            return Err(Error::Msg(format!(
+                "missing expert dir: {}",
+                expert_dir.display()
+            )));
+        }
+        convert_expert(&expert_dir, out_dir.join(out), quantize)?;
+    }
+
+    // 2. Config.
+    write_json(out_dir.join("config.json"), &wan22_i2v_14b_config(quantize))?;
+
+    // 3. T5 encoder.
+    let t5_pth = checkpoint_dir.join("models_t5_umt5-xxl-enc-bf16.pth");
+    let raw_t5 = crate::pth::load_pth_f32(&t5_pth)?;
+    let mut t5 = sanitize_wan_t5(&raw_t5);
+    cast_map(&mut t5, Dtype::Bfloat16)?;
+    save_map(out_dir.join("t5_encoder.safetensors"), &t5)?;
+    drop((raw_t5, t5));
+
+    // 4. VAE — prefer the z16 Wan2.1 VAE; fall back to the z48 Wan2.2 VAE (encoder kept for i2v).
+    let vae21 = checkpoint_dir.join("Wan2.1_VAE.pth");
+    let vae22 = checkpoint_dir.join("Wan2.2_VAE.pth");
+    if vae21.is_file() {
+        let raw = crate::pth::load_pth_f32(&vae21)?;
+        let sanitized = sanitize_wan_vae_weights(&raw)?;
+        save_map(out_dir.join("vae.safetensors"), &sanitized)?;
+    } else if vae22.is_file() {
+        convert_vae22(&vae22, out_dir.join("vae.safetensors"), true)?;
+    } else {
+        return Err(Error::Msg(format!(
+            "no VAE (.pth) found in {} — provide Wan2.1_VAE.pth or Wan2.2_VAE.pth",
+            checkpoint_dir.display()
+        )));
+    }
+
+    Ok(out_dir.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +720,98 @@ mod tests {
         assert!(s.contains_key("blocks.0.ffn.fc1.weight"));
         assert!(s.contains_key("blocks.0.attn.q.weight"));
         assert!(s.contains_key("token_embedding.weight"));
+    }
+
+    /// z16 VAE sanitizer (`sanitize_wan_vae_weights`): conv transpose only, no key renames.
+    #[test]
+    fn z16_vae_transpose_only() {
+        // Conv2d [O=1,I=2,H=2,W=1] 0..3 → [O,H,W,I]=[1,2,1,2] values [0,2,1,3]; keys unchanged.
+        let s = sanitize_wan_vae_weights(&m(&[
+            (
+                "decoder.conv1.weight",
+                Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0], &[1, 2, 2, 1]),
+            ),
+            (
+                "decoder.middle.0.residual.0.bias",
+                Array::ones::<f32>(&[3]).unwrap(),
+            ),
+        ]))
+        .unwrap();
+        // raw keys preserved (NOT renamed to layer_N like the z48 vae22 sanitizer)
+        assert!(s.contains_key("decoder.conv1.weight"));
+        assert!(s.contains_key("decoder.middle.0.residual.0.bias"));
+        assert!(exact_eq(
+            &s["decoder.conv1.weight"],
+            &Array::from_slice(&[0.0f32, 2.0, 1.0, 3.0], &[1, 2, 1, 2])
+        ));
+    }
+
+    /// Wan quant predicate: attn q/k/v/o (self + cross) + ffn fc1/fc2; norms/modulation/head dense.
+    #[test]
+    fn wan_quant_predicate() {
+        let q = |k: &str| {
+            k.strip_suffix(".weight")
+                .is_some_and(|b| WAN_QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)))
+        };
+        for k in [
+            "blocks.0.self_attn.q.weight",
+            "blocks.5.cross_attn.o.weight",
+            "blocks.0.ffn.fc1.weight",
+            "blocks.0.ffn.fc2.weight",
+        ] {
+            assert!(q(k), "should quantize: {k}");
+        }
+        for k in [
+            "blocks.0.self_attn.q.bias",
+            "blocks.0.self_attn.norm_q.weight",
+            "blocks.0.modulation",
+            "patch_embedding_proj.weight",
+            "head.head.weight",
+        ] {
+            assert!(!q(k), "should stay dense: {k}");
+        }
+    }
+
+    /// Quantizing a Wan transformer emits packed weight + scales/biases for matched Linears, keeps
+    /// the bias, and leaves norms dense.
+    #[test]
+    fn quantize_wan_transformer_packs() {
+        let bf = |a: Array| a.as_dtype(Dtype::Bfloat16).unwrap();
+        let q = quantize_wan_transformer(
+            m(&[
+                (
+                    "blocks.0.self_attn.q.weight",
+                    bf(Array::ones::<f32>(&[64, 128]).unwrap()),
+                ),
+                (
+                    "blocks.0.self_attn.q.bias",
+                    bf(Array::ones::<f32>(&[64]).unwrap()),
+                ),
+                (
+                    "blocks.0.norm1.weight",
+                    bf(Array::ones::<f32>(&[64]).unwrap()),
+                ),
+            ]),
+            4,
+            64,
+        )
+        .unwrap();
+        assert!(q.contains_key("blocks.0.self_attn.q.scales"));
+        assert!(q.contains_key("blocks.0.self_attn.q.biases"));
+        assert!(q.contains_key("blocks.0.self_attn.q.bias")); // bias preserved
+        assert_ne!(q["blocks.0.self_attn.q.weight"].dtype(), Dtype::Bfloat16); // packed (u32)
+        assert!(q.contains_key("blocks.0.norm1.weight")); // dense
+        assert!(!q.contains_key("blocks.0.norm1.scales"));
+    }
+
+    /// The I2V-14B config.json round-trips through the loader's parser to the `wan22_i2v_14b` preset
+    /// (no golden exists, so this is the validation oracle), with the quant block when requested.
+    #[test]
+    fn i2v_14b_config_round_trips() {
+        use crate::config::WanModelConfig;
+        let cfg = WanModelConfig::from_config_json(&wan22_i2v_14b_config(None));
+        assert_eq!(cfg, WanModelConfig::wan22_i2v_14b());
+        let cfgq = WanModelConfig::from_config_json(&wan22_i2v_14b_config(Some((4, 64))));
+        assert!(cfgq.quantization.is_some());
     }
 }
