@@ -485,8 +485,7 @@ impl Trainer for ZImageTurboTrainer {
         }
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
-        let n_layers = self.transformer.cfg.n_layers;
-        let target_paths = resolve_target_paths(cfg, n_layers);
+        let target_paths = resolve_target_paths(&self.transformer, cfg);
         let rank = cfg.rank as f32;
         let (adapter, mut params) = match cfg.network_type {
             NetworkType::Lora => {
@@ -618,10 +617,13 @@ impl Trainer for ZImageTurboTrainer {
     }
 }
 
-/// Expand the config's target-module suffixes (default `to_q`/`to_k`/`to_v`/`to_out.0`) across the
-/// DiT's main `layers` attention blocks into dotted paths. (Attention-scoped for now — FFN/adaLN
-/// and the refiner stacks are a sc-3044 coverage follow-up.)
-fn resolve_target_paths(cfg: &TrainingConfig, n_layers: usize) -> Vec<String> {
+/// Resolve the config's target-module *suffixes* (default `to_q`/`to_k`/`to_v`/`to_out.0`) to full
+/// dotted paths by matching them against every adapter-routable module on the DiT — the same
+/// suffix-match PEFT's `LoraConfig(target_modules=…)` does. This trains the attention projections in
+/// the main `layers` AND the noise/context refiner stacks (matching the torch trainer), and handles
+/// non-attention suffixes (FFN `w1`/`w2`/`w3`, `adaLN_modulation.0`) when configured — not just a
+/// hardcoded `layers.{i}.attention.{suffix}`.
+fn resolve_target_paths(transformer: &ZImageTransformer, cfg: &TrainingConfig) -> Vec<String> {
     let suffixes: Vec<String> = if cfg.lora_target_modules.is_empty() {
         ["to_q", "to_k", "to_v", "to_out.0"]
             .iter()
@@ -630,13 +632,14 @@ fn resolve_target_paths(cfg: &TrainingConfig, n_layers: usize) -> Vec<String> {
     } else {
         cfg.lora_target_modules.clone()
     };
-    let mut out = Vec::with_capacity(n_layers * suffixes.len());
-    for i in 0..n_layers {
-        for s in &suffixes {
-            out.push(format!("layers.{i}.attention.{s}"));
-        }
-    }
-    out
+    AdaptableHost::adaptable_paths(transformer)
+        .into_iter()
+        .filter(|path| {
+            suffixes
+                .iter()
+                .any(|s| path == s || path.ends_with(&format!(".{s}")))
+        })
+        .collect()
 }
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].

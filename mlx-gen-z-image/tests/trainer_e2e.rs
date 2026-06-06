@@ -200,13 +200,20 @@ fn z_image_trainer_lokr_trains_and_reloads() {
         "LoKr windowed loss-mean should fall: {first_q:.5} -> {last_q:.5}"
     );
 
-    // Adapter carries LoKr keys + metadata.
+    // Adapter carries LoKr keys + metadata; one `lokr_w1` per trained target.
     let w = Weights::from_file(&out.adapter_path).unwrap();
     assert_eq!(w.metadata("networkType"), Some("lokr"));
     assert!(w.metadata("decomposeFactor").is_some());
     assert!(
         w.keys().any(|k| k == "layers.0.attention.to_q.lokr_w1"),
         "adapter should contain LoKr factor keys"
+    );
+    // Suffix-match over the DiT covers attention in the main layers AND the refiner stacks (matching
+    // PEFT's target_modules suffix match) — 30 layers + 2 noise + 2 context refiners, x4 projections.
+    let n_targets = w.keys().filter(|k| k.ends_with(".lokr_w1")).count();
+    assert_eq!(
+        n_targets, 136,
+        "attention across layers + noise/context refiners"
     );
 
     // Round-trip contract: free the trainer's model, then reload the adapter through the REAL
@@ -227,7 +234,7 @@ fn z_image_trainer_lokr_trains_and_reloads() {
         }],
     )
     .expect("LoKr adapter should reload through the inference path");
-    assert_eq!(report.applied, 120, "30 layers x 4 attention projections");
+    assert_eq!(report.applied, n_targets, "every saved LoKr target reloads");
     assert!(
         report.unmatched_paths.is_empty(),
         "every LoKr target should resolve"
@@ -251,5 +258,7 @@ fn z_image_trainer_lokr_trains_and_reloads() {
     let v = t.forward(&x, 0.5, &cap).unwrap();
     let s = v.sum(None).unwrap().item::<f32>();
     assert!(s.is_finite(), "reloaded LoKr forward should be finite");
-    println!("[trainer-lokr] e2e OK — reloaded LoKr applied to 120 targets, forward finite");
+    println!(
+        "[trainer-lokr] e2e OK — reloaded LoKr applied to {n_targets} targets, forward finite"
+    );
 }
