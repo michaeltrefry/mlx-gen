@@ -72,6 +72,11 @@ pub struct GenerationRequest {
     pub conditioning: Vec<Conditioning>,
     /// img2img strength when a single `Reference` is supplied without its own strength.
     pub strength: Option<f32>,
+    /// Wan-VACE control strength — the diffusers `conditioning_scale` / per-vace-layer
+    /// `control_hidden_states_scale` (`hidden += proj_out(control)·scale`), broadcast to every
+    /// `vace_layers` entry. `None` ⇒ the diffusers default `1.0`. Only the `wan_vace` model reads it;
+    /// other models ignore it. (sc-3441)
+    pub control_scale: Option<f32>,
 
     // --- Video (Option; consumed by video models at the follow-on port) ---
     pub frames: Option<u32>,
@@ -120,6 +125,7 @@ impl Default for GenerationRequest {
             scheduler_shift: None,
             conditioning: Vec::new(),
             strength: None,
+            control_scale: None,
             frames: None,
             fps: None,
             duration: None,

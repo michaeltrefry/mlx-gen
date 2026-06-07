@@ -266,7 +266,9 @@ impl Generator for WanVace {
         // Control latent dims: [96, T_lat(+num_ref), h, w] → the noisy latent matches its frame/space.
         let csh = control.shape();
         let (t_total, h_lat, w_lat) = (csh[1], csh[2], csh[3]);
-        let scales = vec![1.0f32; self.config.vace_layers.len()];
+        // Per-vace-layer control_hidden_states_scale (diffusers `conditioning_scale`), broadcast from
+        // the request (sc-3441). `None` ⇒ the diffusers default 1.0.
+        let scales = vec![req.control_scale.unwrap_or(1.0); self.config.vace_layers.len()];
 
         // Seeded init noise [z16, T_lat(+num_ref), h, w].
         let key = random::key(seed)?;
