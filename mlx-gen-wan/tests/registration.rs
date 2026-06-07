@@ -10,11 +10,11 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    registry, AdapterKind, AdapterSpec, Conditioning, GenerationRequest, Image, LoadSpec, Modality,
-    Precision, Quant, WeightsSource,
+    registry, AdapterKind, AdapterSpec, Conditioning, ConditioningKind, GenerationRequest, Image,
+    LoadSpec, Modality, Precision, Quant, ReplacementMode, WeightsSource,
 };
 
-use mlx_gen_wan::{MODEL_ID, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B};
+use mlx_gen_wan::{MODEL_ID, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, MODEL_ID_VACE};
 
 /// The 5B's serialized `config.json` (the `convert_wan.py` schema; model_type ti2v + dim 3072).
 const TI2V_5B_CONFIG: &str = r#"{
@@ -545,5 +545,136 @@ fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
     )
     .is_ok());
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ===========================================================================================
+// Wan-VACE (`wan_vace`, epic 3040 / sc-3388, S3) — registration + load + validate (no weights).
+// ===========================================================================================
+
+/// A native-schema VACE `config.json` (Wan2.1-VACE-1.3B-ish small dims + the two VACE fields).
+const VACE_CONFIG: &str = r#"{
+  "model_type": "t2v",
+  "model_version": "2.1",
+  "patch_size": [1, 2, 2],
+  "in_dim": 16,
+  "dim": 1536,
+  "ffn_dim": 8960,
+  "out_dim": 16,
+  "num_heads": 12,
+  "num_layers": 30,
+  "vae_z_dim": 16,
+  "vae_stride": [4, 8, 8],
+  "dual_model": false,
+  "sample_shift": 5.0,
+  "sample_steps": 50,
+  "sample_guide_scale": 5.0,
+  "sample_fps": 16,
+  "vace_layers": [0, 5, 10, 15, 20, 25],
+  "vace_in_channels": 96
+}"#;
+
+fn control_clip_request(num_frames: usize) -> GenerationRequest {
+    let frames: Vec<Image> = (0..num_frames).map(|_| dummy_image()).collect();
+    let mask: Vec<Image> = (0..num_frames).map(|_| dummy_image()).collect();
+    GenerationRequest {
+        prompt: "a person".into(),
+        width: 64,
+        height: 64,
+        frames: Some(num_frames as u32),
+        conditioning: vec![Conditioning::ControlClip {
+            frames,
+            mask,
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: ReplacementMode::FaceOnly,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn wan_vace_is_registered() {
+    let reg = registry::generators()
+        .find(|r| (r.descriptor)().id == MODEL_ID_VACE)
+        .expect("wan_vace not registered");
+    let d = (reg.descriptor)();
+    assert_eq!(d.id, "wan_vace");
+    assert_eq!(d.family, "wan");
+    assert_eq!(d.modality, Modality::Video);
+    assert!(d.capabilities.supports_guidance);
+    assert!(d.capabilities.supports_negative_prompt);
+    // The universal VACE input is a masked control clip; optional reference images.
+    assert!(d
+        .capabilities
+        .conditioning
+        .contains(&ConditioningKind::ControlClip));
+    assert!(d
+        .capabilities
+        .conditioning
+        .contains(&ConditioningKind::Reference));
+    assert!(d.capabilities.samplers.contains(&"unipc"));
+}
+
+#[test]
+fn wan_vace_load_reads_config_and_validates() {
+    let dir = temp_model_dir_with("vace", VACE_CONFIG);
+    let g = registry::load(
+        MODEL_ID_VACE,
+        &LoadSpec::new(WeightsSource::Dir(dir.clone())),
+    )
+    .expect("load wan_vace");
+    assert_eq!(g.descriptor().id, MODEL_ID_VACE);
+
+    // A 5-frame (1 + 4·1) control clip validates; a control clip with no control errors; a frame
+    // count that is not 1 + 4·k errors; mismatched frames/mask lengths error.
+    assert!(g.validate(&control_clip_request(5)).is_ok());
+
+    let mut no_clip = control_clip_request(5);
+    no_clip.conditioning.clear();
+    assert!(
+        g.validate(&no_clip).is_err(),
+        "missing ControlClip must error"
+    );
+
+    assert!(
+        g.validate(&control_clip_request(4)).is_err(),
+        "frame count 4 (not 1+4k) must error"
+    );
+
+    let mut mism = control_clip_request(5);
+    if let Conditioning::ControlClip { mask, .. } = &mut mism.conditioning[0] {
+        mask.pop();
+    }
+    assert!(
+        g.validate(&mism).is_err(),
+        "frames/mask length mismatch must error"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn wan_vace_rejects_bad_source_and_adapters() {
+    let dir = temp_model_dir_with("vace_bad", VACE_CONFIG);
+    // A single-file source is rejected (expects a converted snapshot dir).
+    assert!(registry::load(
+        MODEL_ID_VACE,
+        &LoadSpec::new(WeightsSource::File(dir.join("model.safetensors")))
+    )
+    .is_err());
+    // LoRA/LoKr adapters are not yet wired for VACE (diffusers-name routing — a tracked follow-on).
+    let lora = vec![AdapterSpec {
+        path: dir.join("x.safetensors"),
+        scale: 1.0,
+        kind: AdapterKind::Lora,
+        pass_scales: None,
+        moe_expert: None,
+    }];
+    assert!(registry::load(
+        MODEL_ID_VACE,
+        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lora)
+    )
+    .is_err());
     std::fs::remove_dir_all(&dir).ok();
 }

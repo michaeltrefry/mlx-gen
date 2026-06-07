@@ -362,6 +362,138 @@ impl WanModelConfig {
     }
 }
 
+/// Configuration for a **Wan-VACE** model (sc-3388 / epic 3040) — the base Wan DiT plus the two
+/// VACE-only fields. VACE (Video All-in-one Creation and Editing) is purely additive on the base
+/// `WanModelConfig`: the same dimension-parametric DiT, plus `vace_layers` (which main layers receive
+/// a control hint, must include 0) and `vace_in_channels` (the control-latent channel count, 96 =
+/// 32 video latent + 64 mask unfold). Mirrors diffusers `WanVACETransformer3DModel`'s two extra
+/// config fields over `WanTransformer3DModel`.
+///
+/// The VACE checkpoint ships in **diffusers layout** (the SceneWorks worker loads it via
+/// `WanVACEPipeline.from_pretrained`), so [`crate::vace`] reads diffusers tensor names directly — no
+/// native conversion. The base dims here are still the native [`WanModelConfig`] (reused for the VAE,
+/// scheduler, and resolution math); only the transformer-shaping fields + the two VACE fields drive
+/// the DiT.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WanVaceConfig {
+    /// The base Wan DiT / VAE / inference config (dims, VAE, scheduler knobs).
+    pub base: WanModelConfig,
+    /// Which main-block indices receive a VACE control hint (diffusers default
+    /// `[0, 5, 10, 15, 20, 25, 30, 35]`; must include 0 so block 0 carries `proj_in`).
+    pub vace_layers: Vec<usize>,
+    /// The control-latent channel count (diffusers default 96 = 32 video + 64 mask-unfold).
+    pub vace_in_channels: usize,
+}
+
+impl WanVaceConfig {
+    /// Build from a parsed config (native `WanModelConfig` field names + `vace_layers` /
+    /// `vace_in_channels`). The base config is resolved by [`WanModelConfig::from_config_json`]; the
+    /// two VACE fields default to the diffusers 14B defaults when absent.
+    pub fn from_config_json(v: &Value) -> Self {
+        let base = WanModelConfig::from_config_json(v);
+        let vace_layers = v
+            .get("vace_layers")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![0, 5, 10, 15, 20, 25, 30, 35]);
+        let vace_in_channels = v
+            .get("vace_in_channels")
+            .and_then(Value::as_u64)
+            .unwrap_or(96) as usize;
+        Self {
+            base,
+            vace_layers,
+            vace_in_channels,
+        }
+    }
+
+    /// Build from a **diffusers** `transformer/config.json` (the layout the real VACE checkpoint
+    /// ships). Maps the diffusers field names (`num_attention_heads`, `attention_head_dim`,
+    /// `in_channels`, `out_channels`, `text_dim`, `freq_dim`, `ffn_dim`, `num_layers`,
+    /// `cross_attn_norm`, `eps`, `patch_size`, `vace_layers`, `vace_in_channels`) onto the native
+    /// base config (started from the Wan2.1 dense preset — VACE is Wan2.1-based: z16 VAE, stride
+    /// 4×8×8). VAE/scheduler knobs not present in the transformer config keep the Wan2.1 defaults.
+    pub fn from_diffusers_json(v: &Value) -> Self {
+        let heads = v
+            .get("num_attention_heads")
+            .and_then(Value::as_u64)
+            .unwrap_or(40) as usize;
+        let head_dim = v
+            .get("attention_head_dim")
+            .and_then(Value::as_u64)
+            .unwrap_or(128) as usize;
+        let mut base = if heads * head_dim <= 1536 {
+            WanModelConfig::wan21_t2v_1_3b()
+        } else {
+            WanModelConfig::wan21_t2v_14b()
+        };
+        base.dim = heads * head_dim;
+        base.num_heads = heads;
+        set_usize(v, "in_channels", &mut base.in_dim);
+        set_usize(v, "out_channels", &mut base.out_dim);
+        set_usize(v, "text_dim", &mut base.text_dim);
+        set_usize(v, "freq_dim", &mut base.freq_dim);
+        set_usize(v, "ffn_dim", &mut base.ffn_dim);
+        set_usize(v, "num_layers", &mut base.num_layers);
+        set_bool(v, "cross_attn_norm", &mut base.cross_attn_norm);
+        set_f64(v, "eps", &mut base.eps);
+        set_usize3(v, "patch_size", &mut base.patch_size);
+        let vace_layers = v
+            .get("vace_layers")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![0, 5, 10, 15, 20, 25, 30, 35]);
+        let vace_in_channels = v
+            .get("vace_in_channels")
+            .and_then(Value::as_u64)
+            .unwrap_or(96) as usize;
+        Self {
+            base,
+            vace_layers,
+            vace_in_channels,
+        }
+    }
+
+    /// Load a VACE config from a model directory: a diffusers `transformer/config.json` if present
+    /// (the real checkpoint layout), else a native `config.json`, else the diffusers 14B defaults.
+    pub fn from_model_dir(root: &Path) -> Result<Self> {
+        let diffusers = root.join("transformer").join("config.json");
+        if diffusers.exists() {
+            let text = std::fs::read_to_string(&diffusers)?;
+            let v: Value = serde_json::from_str(&text)
+                .map_err(|e| Error::Msg(format!("wan-vace: parse transformer/config.json: {e}")))?;
+            return Ok(Self::from_diffusers_json(&v));
+        }
+        let native = root.join("config.json");
+        if native.exists() {
+            let text = std::fs::read_to_string(&native)?;
+            let v: Value = serde_json::from_str(&text)
+                .map_err(|e| Error::Msg(format!("wan-vace: parse config.json: {e}")))?;
+            return Ok(Self::from_config_json(&v));
+        }
+        Ok(Self {
+            base: WanModelConfig::wan21_t2v_14b(),
+            vace_layers: vec![0, 5, 10, 15, 20, 25, 30, 35],
+            vace_in_channels: 96,
+        })
+    }
+
+    /// Per-head dimension (`dim / num_heads`).
+    pub fn head_dim(&self) -> usize {
+        self.base.head_dim()
+    }
+}
+
 fn parse_guide_scale(v: Option<&Value>) -> Option<GuideScale> {
     match v {
         Some(Value::Number(n)) => n.as_f64().map(|x| GuideScale::Single(x as f32)),
