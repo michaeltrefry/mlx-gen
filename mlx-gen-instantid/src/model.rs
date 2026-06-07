@@ -151,6 +151,19 @@ impl InstantId {
         Ok(self)
     }
 
+    /// Quantize the stack to `bits` (8 or 4) — Q8/Q4 (sc-3116), the same scope as the SDXL provider
+    /// (sc-2641): the UNet (with the now-installed face IP K/V pairs), both CLIP text encoders, and the
+    /// IdentityNet ControlNet. The face **Resampler** stays fp16 (tiny, runs once per generation) and
+    /// the **VAE** stays f32. Call after [`load`](Self::load) (so the IP pairs quantize with the UNet),
+    /// before [`with_face`](Self::with_face).
+    pub fn quantize(mut self, bits: i32) -> Result<Self> {
+        self.unet.quantize(bits)?;
+        self.te1.quantize(bits)?;
+        self.te2.quantize(bits)?;
+        self.identitynet.quantize(bits)?;
+        Ok(self)
+    }
+
     /// Detect the largest face in `img` (RGB `u8` HWC, `h×w`) and return it (bbox + 5 kps + 512-d
     /// embedding). Requires [`with_face`](Self::with_face).
     pub fn largest_face(&self, img: &[u8], h: usize, w: usize) -> Result<Face> {

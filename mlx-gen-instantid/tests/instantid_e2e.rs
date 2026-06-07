@@ -79,11 +79,14 @@ fn save_png(name: &str, img: &Image) {
     println!("  wrote {path:?}");
 }
 
-#[test]
-#[ignore = "needs SDXL base + InstantID + converted ip-adapter + face goldens + reference"]
-fn instantid_t2i_preserves_identity() {
-    let size = env_usize("INSTANTID_SIZE", 1024) as u32;
+/// Load (optionally quantized) → detect reference face → generate → re-detect → ArcFace-cosine.
+/// `quant_bits`: None = fp16, Some(8)/Some(4) = Q8/Q4 (sc-3116). Returns the identity cosine.
+fn run_identity(quant_bits: Option<i32>, size_override: Option<u32>, out_png: &str) -> f32 {
+    let size = size_override.unwrap_or_else(|| env_usize("INSTANTID_SIZE", 1024) as u32);
     let steps = env_usize("INSTANTID_STEPS", 30);
+    let label = quant_bits
+        .map(|b| format!("Q{b}"))
+        .unwrap_or_else(|| "fp16".into());
 
     let paths = InstantIdPaths {
         sdxl_base: sdxl_base(),
@@ -92,8 +95,11 @@ fn instantid_t2i_preserves_identity() {
     };
     let scrfd = golden("scrfd_10g.safetensors");
     let arcface = golden("arcface_iresnet100.safetensors");
-    let model = InstantId::load(&paths)
-        .expect("load InstantID")
+    let mut model = InstantId::load(&paths).expect("load InstantID");
+    if let Some(bits) = quant_bits {
+        model = model.quantize(bits).expect("quantize");
+    }
+    let model = model
         .with_face(&scrfd, &arcface)
         .expect("attach face stack");
 
@@ -114,7 +120,7 @@ fn instantid_t2i_preserves_identity() {
         .expect("detect reference face");
     let kps: Vec<(f32, f32)> = ref_face.kps.iter().map(|p| (p[0], p[1])).collect();
     println!(
-        "[instantid e2e] ref face det_score={:.3} kps[0]=({:.1},{:.1})",
+        "[instantid {label}] ref face det_score={:.3} kps[0]=({:.1},{:.1})",
         ref_face.det_score, kps[0].0, kps[0].1
     );
 
@@ -142,7 +148,7 @@ fn instantid_t2i_preserves_identity() {
         nonzero > out.pixels.len() / 100,
         "output looks degenerate ({nonzero} nonzero bytes)"
     );
-    save_png("instantid_e2e_out.png", &out);
+    save_png(out_png, &out);
 
     // Re-detect the generated face and measure identity preservation.
     let out_face = model
@@ -150,17 +156,50 @@ fn instantid_t2i_preserves_identity() {
         .expect("detect generated face");
     let cos = cosine(&ref_face.embedding, &out_face.embedding);
     println!(
-        "[instantid e2e] {size}x{size} steps={steps} | generated face det_score={:.3} | \
+        "[instantid {label}] {size}x{size} steps={steps} | generated face det_score={:.3} | \
          ArcFace-cosine(ref, generated) = {cos:.4}",
         out_face.det_score
     );
+    cos
+}
 
-    // Directional gate (epic 3109: identity + coherence, NOT bit-exact). Measured **0.8214** at the
-    // default 1024²/30-step settings — essentially the sc-2009 torch baseline (≈0.876). A broken
-    // pipeline (wrong token wiring / no IP / no IdentityNet) collapses toward 0 (the 4-step smoke sits
-    // at ~0.21). Gate at 0.6: a strong identity signal with margin for MLX-version / machine variance.
+// Directional gate (epic 3109: identity + coherence, NOT bit-exact). fp16 measures **0.8214** at the
+// default 1024²/30-step settings — essentially the sc-2009 torch baseline (≈0.876). A broken pipeline
+// (wrong token wiring / no IP / no IdentityNet) collapses toward 0 (the 4-step smoke sits at ~0.21).
+
+#[test]
+#[ignore = "needs SDXL base + InstantID + converted ip-adapter + face goldens + reference"]
+fn instantid_t2i_preserves_identity() {
+    let cos = run_identity(None, None, "instantid_e2e_out.png");
     assert!(
         cos > 0.6,
-        "identity not preserved: ArcFace-cosine {cos:.4} (expected ≳0.8 at 1024²/30 steps)"
+        "fp16 identity not preserved: ArcFace-cosine {cos:.4} (expected ≳0.8 at 1024²/30 steps)"
+    );
+}
+
+// sc-3116 quant tests run at **512²**, not 1024²: the stock SDXL **quantized UNet collapses to a flat
+// image at 1024²** (a pre-existing base-SDXL-quant defect — `mlx-gen-sdxl tests/q8_1024_probe.rs`
+// reproduces it on plain SDXL Q8 txt2img, independent of InstantID; tracked separately). At 512² the
+// full InstantID quant stack (UNet + IP K/V + CLIP TEs + IdentityNet) is healthy and preserves
+// identity. The IdentityNet + TE quant are fine at 1024² (only the base UNet quant is affected).
+
+#[test]
+#[ignore = "needs SDXL base + InstantID + converted ip-adapter + face goldens + reference"]
+fn instantid_t2i_q8_preserves_identity() {
+    let cos = run_identity(Some(8), Some(512), "instantid_e2e_q8_out.png");
+    assert!(
+        cos > 0.5,
+        "Q8 identity not preserved: ArcFace-cosine {cos:.4}"
+    );
+}
+
+#[test]
+#[ignore = "needs SDXL base + InstantID + converted ip-adapter + face goldens + reference"]
+fn instantid_t2i_q4_preserves_identity() {
+    // Q4 is more aggressive; identity should still be clearly preserved (looser floor).
+    let cos = run_identity(Some(4), Some(512), "instantid_e2e_q4_out.png");
+    assert!(
+        cos > 0.45,
+        "Q4 identity not preserved: ArcFace-cosine {cos:.4}"
     );
 }
