@@ -286,6 +286,45 @@ mod tests {
     }
 
     #[test]
+    fn ic_lora_union_control_keys_map_to_av_blocks() {
+        // The production LTX-2.3 IC-LoRA (Lightricks LTX-2.3-22b-IC-LoRA-Union-Control, used for
+        // extend_clip / video_bridge / replace_person) ships 960 PEFT bf16 tensors named
+        // `diffusion_model.transformer_blocks.N.{attn1,attn2}.to_{q,k,v}.lora_{A,B}.weight`,
+        // `...to_out.0...`, and `...ff.net.{0.proj,2}...`. Confirmed against the real file: every key
+        // strips to a (suffix, role) and normalizes to an AvDiT video-block module path — so the
+        // IC-LoRA loads via the existing `apply_ltx_adapters` seam with no new code (epic 3040).
+        let cases = [
+            (
+                "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight",
+                "transformer_blocks.0.attn1.to_q",
+            ),
+            (
+                "diffusion_model.transformer_blocks.0.attn1.to_out.0.lora_B.weight",
+                "transformer_blocks.0.attn1.to_out",
+            ),
+            (
+                "diffusion_model.transformer_blocks.27.attn2.to_k.lora_A.weight",
+                "transformer_blocks.27.attn2.to_k",
+            ),
+            (
+                "diffusion_model.transformer_blocks.27.ff.net.0.proj.lora_A.weight",
+                "transformer_blocks.27.ff.proj_in",
+            ),
+            (
+                "diffusion_model.transformer_blocks.27.ff.net.2.lora_B.weight",
+                "transformer_blocks.27.ff.proj_out",
+            ),
+        ];
+        for (key, want) in cases {
+            let stem = SUFFIXES
+                .iter()
+                .find_map(|(suf, _)| key.strip_suffix(suf))
+                .unwrap_or_else(|| panic!("no LoRA suffix matched {key}"));
+            assert_eq!(normalize_ltx_key(stem), want, "key {key}");
+        }
+    }
+
+    #[test]
     fn normalize_other_prefixes_and_audio_analogues() {
         assert_eq!(
             normalize_ltx_key("model.diffusion_model.transformer_blocks.0.attn1.to_q"),
