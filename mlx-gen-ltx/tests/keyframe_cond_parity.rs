@@ -20,7 +20,7 @@ const GOLDEN: &str = concat!(
 );
 
 fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let d = abs(&subtract(a, b).unwrap()).unwrap();
+    let d = abs(subtract(a, b).unwrap()).unwrap();
     max_op(&d, None).unwrap().item::<f32>()
 }
 
@@ -42,7 +42,8 @@ fn check_case(g: &Weights, keyframe: &Array, tag: &str, frame_idx: i32, strength
     let take = |x: &Array, axis: i32| {
         let n = x.shape()[axis as usize];
         let idx: Vec<i32> = (1..n).collect();
-        x.take_axis(Array::from_slice(&idx, &[n - 1]), axis).unwrap()
+        x.take_axis(Array::from_slice(&idx, &[n - 1]), axis)
+            .unwrap()
     };
     let app_latent = take(&out.latent, 1);
     let app_mask = take(&out.denoise_mask, 1);
@@ -54,7 +55,9 @@ fn check_case(g: &Weights, keyframe: &Array, tag: &str, frame_idx: i32, strength
     assert!(d_lat < 1e-5, "{tag} latent max|Δ| {d_lat}");
     assert!(d_mask < 1e-6, "{tag} mask max|Δ| {d_mask}");
     assert!(d_pos < 1e-5, "{tag} positions max|Δ| {d_pos}");
-    println!("{tag} (frame_idx={frame_idx}, s={strength}): Δlat {d_lat} Δmask {d_mask} Δpos {d_pos}");
+    println!(
+        "{tag} (frame_idx={frame_idx}, s={strength}): Δlat {d_lat} Δmask {d_mask} Δpos {d_pos}"
+    );
 }
 
 #[test]

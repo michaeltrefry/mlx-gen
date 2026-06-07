@@ -43,7 +43,10 @@ impl EdmSchedule {
                 (max_inv + ramp * (min_inv - max_inv)).powf(rho) as f32
             })
             .collect();
-        let timesteps: Vec<f32> = sigmas.iter().map(|&s| 0.25 * (s as f64).ln() as f32).collect();
+        let timesteps: Vec<f32> = sigmas
+            .iter()
+            .map(|&s| 0.25 * (s as f64).ln() as f32)
+            .collect();
         sigmas.push(0.0); // final_sigmas_type = "zero"
         Self { sigmas, timesteps }
     }
@@ -63,7 +66,7 @@ impl EdmSchedule {
 /// `scale_model_input`: `x / sqrt(σ² + 1)` (the EDM `c_in`), applied before the UNet each step.
 pub fn scale_model_input(x: &Array, sigma: f32) -> Result<Array> {
     let c_in = (1.0 / ((sigma as f64).powi(2) + 1.0).sqrt()) as f32;
-    Ok(multiply(x, &Array::from_f32(c_in))?)
+    Ok(multiply(x, Array::from_f32(c_in))?)
 }
 
 /// v-prediction → predicted clean sample (diffusers `step`):
@@ -73,16 +76,16 @@ pub fn v_pred_denoised(model_output: &Array, sample: &Array, sigma: f32) -> Resu
     let c_out = (-(sigma as f64) / (s2 + 1.0).sqrt()) as f32;
     let c_skip = (1.0 / (s2 + 1.0)) as f32;
     Ok(add(
-        &multiply(model_output, &Array::from_f32(c_out))?,
-        &multiply(sample, &Array::from_f32(c_skip))?,
+        multiply(model_output, Array::from_f32(c_out))?,
+        multiply(sample, Array::from_f32(c_skip))?,
     )?)
 }
 
 /// Euler step (`s_churn=0` → `sigma_hat=σ`): `x' = x + (x − x̂0)/σ · (σ_next − σ)`.
 pub fn euler_step(sample: &Array, denoised: &Array, sigma: f32, sigma_next: f32) -> Result<Array> {
-    let derivative = divide(&subtract(sample, denoised)?, &Array::from_f32(sigma))?;
+    let derivative = divide(subtract(sample, denoised)?, Array::from_f32(sigma))?;
     let dt = sigma_next - sigma;
-    Ok(add(sample, &multiply(&derivative, &Array::from_f32(dt))?)?)
+    Ok(add(sample, multiply(derivative, Array::from_f32(dt))?)?)
 }
 
 #[cfg(test)]

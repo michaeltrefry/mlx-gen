@@ -660,7 +660,9 @@ impl Ltx {
         let mut out = Vec::new();
         for clip in req.video_clips() {
             if clip.frames.is_empty() {
-                return Err(Error::Msg("ltx_2_3: video conditioning clip is empty".into()));
+                return Err(Error::Msg(
+                    "ltx_2_3: video conditioning clip is empty".into(),
+                ));
             }
             let idx = if clip.frame_idx < 0 {
                 lf + clip.frame_idx
@@ -684,7 +686,9 @@ impl Ltx {
         // LTX path is region-driven; `replacement_mode` only affects the diffusers WanVACE path).
         if let Some(cc) = req.control_clip() {
             if cc.frames.is_empty() {
-                return Err(Error::Msg("ltx_2_3: replace_person control clip is empty".into()));
+                return Err(Error::Msg(
+                    "ltx_2_3: replace_person control clip is empty".into(),
+                ));
             }
             if cc.frames.len() != cc.mask.len() {
                 return Err(Error::Msg(format!(

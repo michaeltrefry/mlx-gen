@@ -30,7 +30,7 @@ use mlx_gen::{Error, Image, Result};
 use crate::audio_vae::AudioDecoder;
 use crate::conditioning::{
     append_keyframe_clip, apply_conditioning, apply_denoise_mask, apply_keyframes, unpatchify_grid,
-    Keyframe, I2vConditioning, VideoTokenState,
+    I2vConditioning, Keyframe, VideoTokenState,
 };
 use crate::positions::{DEFAULT_FPS, SPATIAL_SCALE, TEMPORAL_SCALE};
 use crate::transformer::{to_denoised, AvDiT, LtxDiT};
@@ -221,7 +221,10 @@ pub fn preprocess_conditioning_clip(
         .collect::<Result<_>>()?;
     let refs: Vec<&Array> = per_frame.iter().collect();
     let clip = mlx_rs::ops::concatenate_axis(&refs, 2)?;
-    debug_assert_eq!(clip.shape(), &[1, 3, frames.len() as i32, th as i32, tw as i32]);
+    debug_assert_eq!(
+        clip.shape(),
+        &[1, 3, frames.len() as i32, th as i32, tw as i32]
+    );
     Ok(clip)
 }
 
@@ -457,9 +460,9 @@ pub struct StageKeyframe<'a> {
 
 /// Build the per-stage [`I2vConditioning`] for a stage's `keyframes` over `base` (zeros for stage 1,
 /// the upscaled latent for stage 2), casting each conditioning latent to the base dtype. Empty → T2V.
-fn stage_keyframe_state<'k>(
+fn stage_keyframe_state(
     base: &Array,
-    keyframes: &'k [StageKeyframe],
+    keyframes: &[StageKeyframe],
     stage1: bool,
 ) -> Result<Option<I2vConditioning>> {
     if keyframes.is_empty() {
@@ -570,9 +573,9 @@ pub fn denoise_av_tokens(
 ///
 /// A non-empty `video_keyframes` switches the **video** stream to replace-latent conditioning (I2V /
 /// first_last_frame / multi-keyframe; the audio is always pure-noise, matching `generate_av.py`'s
-/// I2V+Audio): each stage injects the VAE-encoded keyframe latents at their frame indices (clean latent
-/// + `1 − strength` mask), seeds the loop via the [`I2vConditioning::noised`] noiser, and runs the
-/// conditioned `denoise_av`.
+/// I2V+Audio): each stage injects the VAE-encoded keyframe latents at their frame indices (clean
+/// latent plus a `1 − strength` mask), seeds the loop via the [`I2vConditioning::noised`] noiser, and
+/// runs the conditioned `denoise_av`.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_av_latents(
     dit: &AvDiT,
@@ -597,7 +600,8 @@ pub fn generate_av_latents(
     crate::set_compile_glue(true);
     // Stage 1: video init = conditioned+noised (replace-latent) or pure noise (T2V); audio = noise.
     let (vlat1, vstate1): (Array, Option<I2vConditioning>) = {
-        let zeros = Array::zeros::<f32>(video_s1_noise.shape())?.as_dtype(video_s1_noise.dtype())?;
+        let zeros =
+            Array::zeros::<f32>(video_s1_noise.shape())?.as_dtype(video_s1_noise.dtype())?;
         match stage_keyframe_state(&zeros, video_keyframes, true)? {
             Some(st) => {
                 let st = st.noised(video_s1_noise, STAGE1_SIGMAS[0])?;

@@ -16,7 +16,7 @@ const GOLDEN: &str = concat!(
 );
 
 fn max_abs(a: &Array, b: &Array) -> f32 {
-    max_op(&abs(&subtract(a, b).unwrap()).unwrap(), None)
+    max_op(abs(subtract(a, b).unwrap()).unwrap(), None)
         .unwrap()
         .item::<f32>()
 }
@@ -39,7 +39,10 @@ fn svd_scheduler_matches_diffusers() {
         assert!((a - b).abs() < 1e-4, "timestep[{i}] {a} vs {b}");
     }
     let g_ins = g.require("init_noise_sigma").unwrap().as_slice::<f32>()[0];
-    assert!((sched.init_noise_sigma() - g_ins).abs() < 1e-2, "init_noise_sigma");
+    assert!(
+        (sched.init_noise_sigma() - g_ins).abs() < 1e-2,
+        "init_noise_sigma"
+    );
 
     // One step at index 5: scale_model_input, v_pred, euler.
     let sigma = sched.sigmas[5];
@@ -48,7 +51,10 @@ fn svd_scheduler_matches_diffusers() {
     let v = g.require("v").unwrap();
 
     let scaled = scale_model_input(x, sigma).unwrap();
-    assert!(max_abs(&scaled, g.require("scaled").unwrap()) < 1e-4, "scale_model_input");
+    assert!(
+        max_abs(&scaled, g.require("scaled").unwrap()) < 1e-4,
+        "scale_model_input"
+    );
 
     let pred = v_pred_denoised(v, x, sigma).unwrap();
     let d_pred = max_abs(&pred, g.require("pred_x0").unwrap());

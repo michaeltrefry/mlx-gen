@@ -92,8 +92,8 @@ impl Default for ImageEncoderConfig {
     }
 }
 
-/// `EulerDiscreteScheduler` (EDM) config for SVD. `use_karras_sigmas` + `timestep_type="continuous"`
-/// + `prediction_type="v_prediction"` → the sigma schedule is pure Karras over the **config**
+/// `EulerDiscreteScheduler` (EDM) config for SVD (`use_karras_sigmas`, `timestep_type="continuous"`,
+/// `prediction_type="v_prediction"`). The sigma schedule is pure Karras over the **config**
 /// `sigma_min`/`sigma_max` (the betas/alphas path is unused) and the model timestep is `0.25·ln(σ)`.
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {

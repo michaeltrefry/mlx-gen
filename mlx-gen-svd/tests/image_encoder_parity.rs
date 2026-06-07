@@ -6,7 +6,7 @@
 //! Run: `cargo test -p mlx-gen-svd --test image_encoder_parity -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_svd::{ImageEncoderConfig, SvdImageEncoder};
@@ -54,9 +54,9 @@ fn svd_image_encoder_matches_transformers() {
     let want = g.require("image_embeds").unwrap();
     assert_eq!(embeds.shape(), want.shape(), "image_embeds shape");
 
-    let diff = abs(&subtract(&embeds, want).unwrap()).unwrap();
+    let diff = abs(subtract(&embeds, want).unwrap()).unwrap();
     let max_abs = max_op(&diff, None).unwrap().item::<f32>();
-    let denom = max_op(&abs(want).unwrap(), None).unwrap().item::<f32>();
+    let denom = max_op(abs(want).unwrap(), None).unwrap().item::<f32>();
     let rel = max_abs / denom.max(1e-6);
     println!("image_encoder parity: max|Δ| {max_abs}, peak-rel {rel}");
     // ~0.2% peak-rel is f32 cross-backend accumulation over the 32-layer ViT (matmul/sdpa ordering),

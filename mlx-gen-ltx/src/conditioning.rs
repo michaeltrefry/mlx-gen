@@ -93,8 +93,14 @@ pub fn apply_keyframes(base_latent: &Array, keyframes: &[Keyframe]) -> Result<I2
     let sh = base_latent.shape(); // (B, C, F, H, W)
     let (b, c, f, h, w) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
 
-    let mask_gen = broadcast_to(&scalar(1.0, dt)?.reshape(&[1, 1, 1, 1, 1])?, &[b, 1, 1, 1, 1])?;
-    let zero_frame = broadcast_to(&scalar(0.0, dt)?.reshape(&[1, 1, 1, 1, 1])?, &[b, c, 1, h, w])?;
+    let mask_gen = broadcast_to(
+        &scalar(1.0, dt)?.reshape(&[1, 1, 1, 1, 1])?,
+        &[b, 1, 1, 1, 1],
+    )?;
+    let zero_frame = broadcast_to(
+        &scalar(0.0, dt)?.reshape(&[1, 1, 1, 1, 1])?,
+        &[b, c, 1, h, w],
+    )?;
 
     // Per-output-frame assignment: which keyframe (if any) owns this frame, and its source sub-index.
     // Later keyframes override earlier ones (sequential `apply_to`).
@@ -129,8 +135,10 @@ pub fn apply_keyframes(base_latent: &Array, keyframes: &[Keyframe]) -> Result<I2
                 let cond = frame(kf.latent, sub)?;
                 latent_frames.push(cond.clone());
                 clean_frames.push(cond);
-                let mask_keep =
-                    broadcast_to(&scalar(1.0 - kf.strength, dt)?.reshape(&[1, 1, 1, 1, 1])?, &[b, 1, 1, 1, 1])?;
+                let mask_keep = broadcast_to(
+                    &scalar(1.0 - kf.strength, dt)?.reshape(&[1, 1, 1, 1, 1])?,
+                    &[b, 1, 1, 1, 1],
+                )?;
                 mask_frames.push(mask_keep);
             }
             None => {
@@ -318,8 +326,12 @@ pub fn append_keyframe_clip(
     let (b, cf, h, w) = (cs[0], cs[2] as usize, cs[3] as usize, cs[4] as usize);
     let tokens = patchify_grid(&clip_latent.as_dtype(dt)?)?; // (B, cf·h·w, C)
     let n = tokens.shape()[1];
-    let denoise_mask = broadcast_to(&scalar(1.0 - strength, dt)?.reshape(&[1, 1, 1])?, &[b, n, 1])?;
-    let positions = keyframe_append_positions(cf, h, w, frame_idx, temporal_scale, spatial_scale, fps);
+    let denoise_mask = broadcast_to(
+        &scalar(1.0 - strength, dt)?.reshape(&[1, 1, 1])?,
+        &[b, n, 1],
+    )?;
+    let positions =
+        keyframe_append_positions(cf, h, w, frame_idx, temporal_scale, spatial_scale, fps);
     let positions = if b > 1 {
         broadcast_to(&positions, &[b, 3, n, 2])?
     } else {
@@ -382,8 +394,16 @@ mod tests {
         let st = apply_keyframes(
             &base,
             &[
-                Keyframe { latent: &a, frame_idx: 0, strength: 1.0 },
-                Keyframe { latent: &bb, frame_idx: 3, strength: 0.5 },
+                Keyframe {
+                    latent: &a,
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
+                Keyframe {
+                    latent: &bb,
+                    frame_idx: 3,
+                    strength: 0.5,
+                },
             ],
         )
         .unwrap();
@@ -406,8 +426,16 @@ mod tests {
         let st = apply_keyframes(
             &base,
             &[
-                Keyframe { latent: &a, frame_idx: 0, strength: 1.0 },
-                Keyframe { latent: &bb, frame_idx: 0, strength: 1.0 },
+                Keyframe {
+                    latent: &a,
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
+                Keyframe {
+                    latent: &bb,
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
             ],
         )
         .unwrap();
@@ -483,7 +511,7 @@ mod tests {
         assert_eq!(st2.positions.shape(), &[1, 3, 2, 2]);
         assert_eq!(st2.denoise_mask.shape(), &[1, 2, 1]);
         assert_eq!(st2.target_tokens, 1); // unchanged
-        // appended latent token == clip tokens; appended mask = 1-strength = 0.
+                                          // appended latent token == clip tokens; appended mask = 1-strength = 0.
         let lat = st2.latent.as_slice::<f32>(); // (1,2,2): [tok0=[3,4], tok1=[7,9]]
         assert_eq!(&lat[2..4], &[7.0, 9.0]);
         let m = st2.denoise_mask.as_slice::<f32>();

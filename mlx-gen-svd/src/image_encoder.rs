@@ -51,6 +51,9 @@ impl SvdImageEncoder {
         let cls = last.take_axis(Array::from_int(0), 1)?; // [B, hidden] (CLS token, axis dropped)
         let pooled = layer_norm(&cls, Some(&self.post_ln_w), Some(&self.post_ln_b), LN_EPS)?;
         // visual_projection is a bias-free Linear with weight [proj, hidden] → embeds = pooled · Wᵀ.
-        Ok(matmul(&pooled, &self.visual_projection.transpose_axes(&[1, 0])?)?)
+        Ok(matmul(
+            &pooled,
+            &self.visual_projection.transpose_axes(&[1, 0])?,
+        )?)
     }
 }

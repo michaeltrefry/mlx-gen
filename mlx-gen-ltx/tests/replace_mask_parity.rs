@@ -18,7 +18,11 @@ fn image_from(g: &Weights, key: &str) -> Image {
     let a = g.require(key).unwrap();
     let sh = a.shape(); // (H, W, 3)
     let (h, w) = (sh[0] as u32, sh[1] as u32);
-    let pixels = a.as_dtype(mlx_rs::Dtype::Uint8).unwrap().as_slice::<u8>().to_vec();
+    let pixels = a
+        .as_dtype(mlx_rs::Dtype::Uint8)
+        .unwrap()
+        .as_slice::<u8>()
+        .to_vec();
     Image {
         width: w,
         height: h,
