@@ -270,7 +270,11 @@ fn load_eva(path: &Path) -> Result<EvaVisionTransformer> {
 ///   * `PULID_EVA_WEIGHTS` — converted EVA02-CLIP-L-14-336 safetensors.
 ///   * `PULID_FACE_WEIGHTS_DIR` — dir with scrfd_10g / arcface_iresnet100 / bisenet_parsing.
 pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    // FLUX.1-dev backbone (its loader validates the snapshot dir).
+    // FLUX.1-dev backbone (its loader validates the snapshot dir). Q8/Q4 (sc-3076) composes for free:
+    // `spec.quantize` flows through `load_flux1`, quantizing ONLY the FLUX backbone linears. The PuLID
+    // conditioning (EVA tower, IDFormer, the 20 CA modules) stays f32 — it runs once per image, not
+    // per step, so the memory win is the backbone, and the f32 CA residual injects into the (still
+    // f32) DiT image stream unchanged. No quant-specific wiring needed here.
     let flux = load_flux1(FluxVariant::Dev, spec)?;
 
     // PuLID encoder + CA weights, cast f32 (conditioning path).
