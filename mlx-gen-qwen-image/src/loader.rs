@@ -18,9 +18,10 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, Result, WeightsSource};
 use mlx_rs::Array;
 
+use crate::control_transformer::{QwenControlNet, QwenControlNetConfig};
 use crate::text_encoder::vision::{VisionConfig, VisionTransformer};
 use crate::text_encoder::{QwenTextEncoder, QwenTextEncoderConfig, QwenVisionLanguageEncoder};
 use crate::transformer::{QwenTransformer, QwenTransformerConfig};
@@ -116,6 +117,21 @@ pub fn load_transformer_edit(root: &Path) -> Result<QwenTransformer> {
     let mut w = Weights::from_dir(root.join("transformer"))?;
     remap_transformer_keys(&mut w);
     QwenTransformer::from_weights(&w, "", &QwenTransformerConfig::qwen_image_edit())
+}
+
+/// Load the InstantX `Qwen-Image-ControlNet-Union` control transformer (epic 3401). The checkpoint
+/// is a single `diffusion_pytorch_model.safetensors` (`File`) or a dir of shards (`Dir`). Its block
+/// keys (`transformer_blocks.{i}.attn.to_out.0`, `…img_mod.1`, `…img_mlp.net.0.proj`, …) are the
+/// same diffusers names as the base, so we apply the same [`remap_transformer_keys`]; the control
+/// top-level modules (`img_in`/`txt_in`/`txt_norm`/`time_text_embed`/`controlnet_x_embedder`/
+/// `controlnet_blocks.{i}`) match 1:1 and pass through unchanged.
+pub fn load_controlnet(control: &WeightsSource) -> Result<QwenControlNet> {
+    let mut w = match control {
+        WeightsSource::File(p) => Weights::from_file(p)?,
+        WeightsSource::Dir(p) => Weights::from_dir(p)?,
+    };
+    remap_transformer_keys(&mut w);
+    QwenControlNet::from_weights(&w, "", &QwenControlNetConfig::qwen_image_union())
 }
 
 /// Load the causal-Conv3d VAE, applying the diffusers→internal key remap (structural renames +

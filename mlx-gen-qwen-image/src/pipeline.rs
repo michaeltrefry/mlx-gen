@@ -14,6 +14,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::{CancelFlag, DiffusionSampler, Error, FlowMatchEuler, Image, Progress, Result};
 
+use crate::control_transformer::QwenControlNet;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
 
@@ -243,6 +244,79 @@ pub fn denoise_with_progress(
         let velocity = match neg_embeds {
             Some(neg) => {
                 let neg = transformer.forward(&latents, neg, None, sigma, lh, lw, &[])?;
+                compute_guided_noise(&pos, &neg, guidance)?
+            }
+            None => pos,
+        };
+        latents = sampler.step(&velocity, &latents, t)?;
+        on_progress(Progress::Step {
+            current: (t - start_step) as u32 + 1,
+            total,
+        });
+    }
+    Ok(latents)
+}
+
+/// Qwen-Image **ControlNet** (strict pose) denoise loop (epic 3401 / sc-3572). Like
+/// [`denoise_with_progress`], but each step first runs the control branch
+/// ([`QwenControlNet::forward`]) over the current latents + the (constant) packed control image to
+/// get the per-block residuals, then runs the base transformer with those residuals injected
+/// ([`QwenTransformer::forward_control`]) scaled by `control_scale`. Under true CFG the control
+/// branch runs once per guidance branch (positive + negative), mirroring diffusers; the Lightning
+/// CFG-off path (`neg_embeds = None`) runs it once. `control_scale = 0` reproduces the base T2I
+/// forward (the residuals are zeroed at the injection).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control_with_progress(
+    transformer: &QwenTransformer,
+    controlnet: &QwenControlNet,
+    sampler: &dyn DiffusionSampler,
+    latents: Array,
+    control_cond: &Array,
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    control_scale: f32,
+    width: u32,
+    height: u32,
+    start_step: usize,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    crate::transformer::set_compile_glue(true);
+    let mut latents = latents;
+    let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let total = (sampler.num_steps() - start_step) as u32;
+    for t in start_step..sampler.num_steps() {
+        if cancel.is_cancelled() {
+            return Err(Error::Msg("generation cancelled".into()));
+        }
+        let sigma = sampler.timestep(t);
+        let pos_res = controlnet.forward(&latents, control_cond, pos_embeds, sigma, lh, lw)?;
+        let pos = transformer.forward_control(
+            &latents,
+            pos_embeds,
+            None,
+            sigma,
+            lh,
+            lw,
+            &[],
+            Some(&pos_res),
+            control_scale,
+        )?;
+        let velocity = match neg_embeds {
+            Some(neg) => {
+                let neg_res = controlnet.forward(&latents, control_cond, neg, sigma, lh, lw)?;
+                let neg = transformer.forward_control(
+                    &latents,
+                    neg,
+                    None,
+                    sigma,
+                    lh,
+                    lw,
+                    &[],
+                    Some(&neg_res),
+                    control_scale,
+                )?;
                 compute_guided_noise(&pos, &neg, guidance)?
             }
             None => pos,

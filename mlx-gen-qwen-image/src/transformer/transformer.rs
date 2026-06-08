@@ -8,7 +8,7 @@
 //! block parity test; the full 60-layer forward is validated end-to-end against the image golden.
 
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{concatenate_axis, split};
+use mlx_rs::ops::{add, concatenate_axis, multiply, split};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
@@ -167,6 +167,39 @@ impl QwenTransformer {
         latent_w: usize,
         cond_grids: &[(usize, usize)],
     ) -> Result<Array> {
+        self.forward_control(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            timestep,
+            latent_h,
+            latent_w,
+            cond_grids,
+            None,
+            0.0,
+        )
+    }
+
+    /// [`forward`](Self::forward) with optional ControlNet residual injection (epic 3401). Identical
+    /// to the T2I/Edit forward, plus: after base block `i` the residual
+    /// `controlnet_residuals[i / interval]` (scaled by `control_scale`) is added to the image stream,
+    /// where `interval = ceil(num_layers / num_residuals)` — the diffusers
+    /// `QwenImageTransformer2DModel` `index_block // interval_control` pattern (60 base blocks, 5
+    /// control residuals → interval 12). `controlnet_residuals = None` is **byte-identical** to the
+    /// plain forward (the T2I/Edit parity path is unchanged).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_control(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        encoder_hidden_states_mask: Option<&Array>,
+        timestep: f32,
+        latent_h: usize,
+        latent_w: usize,
+        cond_grids: &[(usize, usize)],
+        controlnet_residuals: Option<&[Array]>,
+        control_scale: f32,
+    ) -> Result<Array> {
         let b = hidden_states.shape()[0];
         let img_seq = hidden_states.shape()[1];
         let txt_seq = encoder_hidden_states.shape()[1];
@@ -200,7 +233,14 @@ impl QwenTransformer {
             self.rope.forward_multi(&shapes, txt_seq as usize)?;
         let mask = build_joint_mask(encoder_hidden_states_mask, b, img_seq)?;
 
-        for block in &self.blocks {
+        // ControlNet residual injection interval (epic 3401): `ceil(num_layers / num_residuals)`,
+        // matching diffusers `int(np.ceil(len(transformer_blocks) / len(controlnet_block_samples)))`.
+        let interval = controlnet_residuals.map(|r| {
+            let n = self.blocks.len();
+            let k = r.len().max(1);
+            n.div_ceil(k)
+        });
+        for (i, block) in self.blocks.iter().enumerate() {
             let (e, h) = block.forward(
                 &hidden,
                 &encoder,
@@ -213,7 +253,16 @@ impl QwenTransformer {
                 modulate_index.as_ref(),
             )?;
             encoder = e;
-            hidden = h;
+            // After each base block, add the (scaled) control residual for this block's group —
+            // diffusers `hidden_states = hidden_states + controlnet_block_samples[i // interval]`.
+            hidden = match (controlnet_residuals, interval) {
+                (Some(res), Some(interval)) => {
+                    let idx = (i / interval).min(res.len() - 1);
+                    let scale = Array::from_slice(&[control_scale], &[1]);
+                    add(&h, &multiply(&res[idx], &scale)?)?
+                }
+                _ => h,
+            };
         }
 
         // norm_out uses only the real-timestep half of the (doubled) temb (the fork's `temb[:B]`).

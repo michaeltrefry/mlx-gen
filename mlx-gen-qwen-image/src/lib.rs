@@ -17,9 +17,11 @@
 //! Edit, requiring the matching distillation LoRA via `spec.adapters`.
 
 pub mod adapters;
+pub mod control_transformer;
 pub mod image_processor;
 pub mod loader;
 pub mod model;
+pub mod model_control;
 pub mod model_edit;
 pub mod pipeline;
 pub mod sampler;
@@ -29,17 +31,20 @@ pub mod vae;
 pub mod vl_tokenizer;
 
 pub use adapters::apply_qwen_adapters;
+pub use control_transformer::{QwenControlNet, QwenControlNetConfig};
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
 pub use loader::{
-    load_text_encoder, load_tokenizer, load_transformer, load_transformer_edit, load_vae,
-    load_vision_encoder, load_vision_language_encoder,
+    load_controlnet, load_text_encoder, load_tokenizer, load_transformer, load_transformer_edit,
+    load_vae, load_vision_encoder, load_vision_language_encoder,
 };
 pub use model::{descriptor, load, QwenImage, MODEL_ID};
+pub use model_control::QwenImageControl;
 pub use model_edit::QwenImageEdit;
 pub use pipeline::{
     add_noise_by_interpolation, compute_guided_noise, create_noise, decoded_to_image,
-    denoise_edit_with_progress, denoise_with_progress, encode_init_latents, init_time_step,
-    pack_latents, preprocess_init_image, qwen_scheduler, unpack_latents,
+    denoise_control_with_progress, denoise_edit_with_progress, denoise_with_progress,
+    encode_init_latents, init_time_step, pack_latents, preprocess_init_image, qwen_scheduler,
+    unpack_latents,
 };
 pub use sampler::{lightning, FlowMatchSampler, LIGHTNING_SHIFT};
 pub use text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
