@@ -121,3 +121,55 @@ fn ip_image_encoder_runs_on_real_weights() {
         assert!(maxd < 5e-2, "max|Δ| vs torch golden {maxd} too large");
     }
 }
+
+fn read_f32_le(path: &str) -> Vec<f32> {
+    std::fs::read(path)
+        .unwrap_or_else(|_| panic!("missing {path}"))
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Rigorous numeric parity vs torch `CLIPVisionModelWithProjection.image_embeds`, bypassing
+/// preprocessing: both sides consume the **identical** normalized pixel tensor, so this isolates the
+/// ViT-L tower + projection head. Generate the reference with the torch venv:
+///
+/// ```text
+/// ~/mlx-flux-venv/bin/python tools/clip_vit_l_parity_ref.py /tmp/clip_l
+/// CLIP_VIT_L_PIXELS=/tmp/clip_l.pixels CLIP_VIT_L_REF=/tmp/clip_l.embeds \
+///   cargo test -p mlx-gen-flux --release --test ip_image_encoder_real_weights \
+///   ip_image_embeds_torch_parity -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "torch parity: needs tools/clip_vit_l_parity_ref.py output (CLIP_VIT_L_PIXELS + CLIP_VIT_L_REF)"]
+fn ip_image_embeds_torch_parity() {
+    let pixels_path = std::env::var("CLIP_VIT_L_PIXELS").expect("set CLIP_VIT_L_PIXELS");
+    let ref_path = std::env::var("CLIP_VIT_L_REF").expect("set CLIP_VIT_L_REF");
+
+    let pixels = read_f32_le(&pixels_path);
+    assert_eq!(
+        pixels.len(),
+        224 * 224 * 3,
+        "pixels must be NHWC [1,224,224,3]"
+    );
+    let pixels = Array::from_slice(&pixels, &[1, 224, 224, 3]);
+
+    let enc = FluxIpImageEncoder::from_weights(&clip_vit_l_weights()).unwrap();
+    let embeds = enc.image_embeds(&pixels).unwrap();
+    assert_eq!(embeds.shape(), &[1, 768]);
+
+    let refv = read_f32_le(&ref_path);
+    assert_eq!(refv.len(), 768);
+    let refa = Array::from_slice(&refv, &[1, 768]);
+
+    let cos = cosine(&embeds, &refa);
+    let maxd = mlx_rs::ops::max(abs(subtract(&embeds, &refa).unwrap()).unwrap(), None)
+        .unwrap()
+        .item::<f32>();
+    println!("[ip-clip-vit-l] torch image_embeds parity: cosine={cos:.6} max|Δ|={maxd:.3e}");
+    // cosine is the parity verdict for an embedding (≈0.999984 measured). The residual max|Δ| is f32
+    // cross-implementation accumulation (MLX's fused SDPA/LayerNorm vs torch eager) over 24 layers on
+    // a ~19-norm vector — not a structural mismatch (the checkpoint + both sides are f32).
+    assert!(cos >= 0.9999, "cosine vs torch {cos} < 0.9999");
+    assert!(maxd < 5e-2, "max|Δ| vs torch {maxd} too large");
+}
