@@ -14,10 +14,17 @@
 //!  - **scale-1 changes output** (`scale_one_changes_output`): with real residuals at scale 1 the
 //!    output differs from base — the pose actually takes effect.
 //!
-//! The full numeric parity vs the diffusers `QwenImageControlNetPipeline` (per-block residuals +
-//! e2e latents/image on a DWPose skeleton, bf16/Q8/Q4, controlScale sweep) is driven by the golden
-//! from `tools/dump_qwen_control_golden.py` in `e2e_matches_diffusers_golden` (skipped when the
-//! golden is absent).
+//!  - **residual parity vs diffusers** (`residuals_match_diffusers`): the meaningful numeric gate —
+//!    feeds the exact inputs the diffusers `QwenImageControlNetModel` saw (from
+//!    `tools/dump_qwen_control_residuals.py`) to the Rust `QwenControlNet` and compares the 5
+//!    per-block residuals (peak-rel, cross-backend mlx-vs-torch floor). Isolates the control branch
+//!    from all pipeline plumbing; only loads the ~1.6 GB control model. Skipped when the golden is
+//!    absent.
+//!
+//! A coarser full-pipeline image gate vs `QwenImageControlNetPipeline` (`e2e_matches_diffusers_golden`,
+//! `tools/dump_qwen_control_golden.py`) is also provided but is fragile against raw-diffusers
+//! pipeline differences (noise/scheduler/template were matched to the mflux fork, not diffusers) —
+//! prefer the residual gate for correctness.
 //!
 //! Run (the scale-0 gate loads the ~40 GB base transformer):
 //!   cargo test -p mlx-gen-qwen-image --release --test control_real_weights -- --ignored --nocapture
@@ -38,6 +45,10 @@ const TXT_SEQ: i32 = 64;
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/qwen_control_golden.safetensors"
+);
+const RESIDUALS_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/qwen_control_residuals.safetensors"
 );
 
 /// Base `Qwen/Qwen-Image` snapshot dir (env override, else the HF cache).
@@ -139,6 +150,69 @@ fn control_loads_and_emits_residuals() {
             "residual {i} must be finite + non-zero, got {m}"
         );
     }
+}
+
+/// Peak-relative error `max|a-b| / max|b|`.
+fn peak_rel(a: &Array, b: &Array) -> f32 {
+    let n = b.shape().iter().product::<i32>();
+    let a = a.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
+    let b = b.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
+    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
+    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
+    let max_d = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+    if peak == 0.0 {
+        max_d
+    } else {
+        max_d / peak
+    }
+}
+
+/// **Residual-isolation parity vs diffusers** (sc-3574, the meaningful numeric gate): feed the exact
+/// inputs the diffusers `QwenImageControlNetModel` saw (from `dump_qwen_control_residuals.py`) to the
+/// Rust `QwenControlNet` and compare the 5 per-block residuals. Isolates the control branch from all
+/// pipeline plumbing. Cross-backend (mlx mixed-precision vs torch bf16) → peak-rel at the Qwen floor,
+/// not bit-exact. Only loads the ~1.6 GB control model.
+#[test]
+#[ignore = "needs tools/golden/qwen_control_residuals.safetensors from dump_qwen_control_residuals.py"]
+fn residuals_match_diffusers() {
+    if !PathBuf::from(RESIDUALS_GOLDEN).exists() {
+        eprintln!("skipping: {RESIDUALS_GOLDEN} absent (run tools/dump_qwen_control_residuals.py)");
+        return;
+    }
+    let g = mlx_gen::weights::Weights::from_file(RESIDUALS_GOLDEN).expect("residuals golden");
+    let lh: usize = g.metadata("lh").unwrap().parse().unwrap();
+    let lw: usize = g.metadata("lw").unwrap().parse().unwrap();
+    let sigma: f32 = g.metadata("sigma").unwrap().parse().unwrap();
+    let nres: usize = g.metadata("num_residuals").unwrap().parse().unwrap();
+
+    let hidden = g.require("hidden_states").unwrap().clone();
+    let control = g.require("controlnet_cond").unwrap().clone();
+    // Both sides use bf16 embeds (the golden stores the bf16-rounded values as f32).
+    let embeds = g
+        .require("encoder_hidden_states")
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+
+    let cn = loader::load_controlnet(&control_source()).expect("load controlnet");
+    let residuals = cn
+        .forward(&hidden, &control, &embeds, sigma, lh, lw)
+        .expect("control forward");
+    assert_eq!(residuals.len(), nres, "residual count");
+
+    let mut worst = 0f32;
+    for (i, r) in residuals.iter().enumerate() {
+        let golden = g.require(&format!("residual_{i}")).unwrap().clone();
+        let rel = peak_rel(r, &golden);
+        eprintln!("residual {i}: peak-rel {rel:.4}");
+        worst = worst.max(rel);
+    }
+    // Cross-backend floor: mlx f32-latent mixed precision vs torch bf16. The base Qwen e2e sits at a
+    // similar few-% peak-rel; gate generously and surface the actuals above.
+    assert!(
+        worst < 0.06,
+        "worst residual peak-rel {worst:.4} exceeds the 6% cross-backend floor"
+    );
 }
 
 #[test]
