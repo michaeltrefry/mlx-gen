@@ -8,17 +8,21 @@
 //! 2. [`FluxIpAdapter`] — the per-double-block decoupled cross-attention K/V projections
 //!    (`double_blocks.{i}.processor.ip_adapter_double_stream_{k,v}_proj`, `Linear(4096→3072)`, all
 //!    19 FLUX double blocks). At each double block the IP branch attends the block's **own** image
-//!    query (post-RMS-norm, post-RoPE — the diffusers `FluxIPAdapter` semantics, which is the torch
-//!    parity target) to the projected image tokens, and the result scaled by `ip_adapter_scale` is
-//!    added to the image attention output (before the block's `gate_msa`/FF), exactly as in
-//!    diffusers' Flux IP attention processor. There is **no** IP-side query or output projection in
-//!    the checkpoint — the block's query is reused and the V projection output is added directly.
+//!    query (post-RMS-norm, **pre-RoPE** — the diffusers `FluxIPAdapterAttnProcessor` semantics,
+//!    which is the torch parity target: `ip_query = query` is captured *before* `apply_rotary_emb`)
+//!    to the projected image tokens, and the result scaled by `ip_adapter_scale` is added **raw
+//!    (ungated), after the FF residual**, to the block output — diffusers' `hidden_states =
+//!    hidden_states + ip_attn_output` (transformer_flux.py:477). It deliberately bypasses the
+//!    block's `gate_msa` and the FF input; folding it into the pre-gate attention output would both
+//!    suppress it where the adaLN gate is small (weak resemblance) and distort the velocity
+//!    (true_cfg saturation). There is **no** IP-side query or output projection in the checkpoint —
+//!    the block's query is reused and the V projection output is added directly.
 //!
 //! Wiring into the DiT rides the [`crate::transformer::DitImageInjector`] seam via
 //! [`FluxIpInjector`] (`double_block_ip`); the plain txt2img path is untouched.
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, multiply};
+use mlx_rs::ops::multiply;
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -117,9 +121,10 @@ impl FluxIpAdapter {
     }
 
     /// Decoupled cross-attention residual for double block `block_idx`:
-    /// `scale · SDPA(img_q, K·tokens, V·tokens)`, reshaped to `[B, img_seq, 3072]` — the term added
-    /// to the image attention output. `img_q` is the block's post-RMS-norm, post-RoPE per-head image
-    /// query `[B, HEADS, img_seq, HEAD_DIM]`.
+    /// `scale · SDPA(img_q, K·tokens, V·tokens)`, reshaped to `[B, img_seq, 3072]` — the term the
+    /// block adds **raw (ungated), after the FF residual** to its output (diffusers'
+    /// `ip_attn_output`). `img_q` is the block's RMS-normed, **pre-RoPE** per-head image query
+    /// `[B, HEADS, img_seq, HEAD_DIM]` (diffusers' `ip_query`, captured before RoPE).
     fn block_residual(
         &self,
         block_idx: usize,
@@ -195,19 +200,5 @@ impl DitImageInjector for FluxIpInjector<'_> {
             &self.tokens,
             self.scale,
         )?))
-    }
-}
-
-/// Add the IP residual to the image attention output of double block `block_idx`, if any. Helper for
-/// the transformer's joint-attention path: `img_q` is the post-RoPE per-head image query.
-pub(crate) fn add_block_ip(
-    injector: &dyn DitImageInjector,
-    block_idx: usize,
-    img_q: &Array,
-    attn_img: &Array,
-) -> Result<Array> {
-    match injector.double_block_ip(block_idx, img_q)? {
-        Some(r) => Ok(add(attn_img, &r.as_dtype(attn_img.dtype())?)?),
-        None => Ok(attn_img.clone()),
     }
 }

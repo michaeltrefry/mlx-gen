@@ -218,7 +218,17 @@ impl Generator for Flux1 {
             // forward (schnell always; dev without true_cfg).
             return match req.true_cfg {
                 Some(cfg) if self.variant.supports_guidance() => {
-                    let neg = FluxIpInjector::disabled(adapter, &embeds)?;
+                    // Match diffusers' Flux true-CFG IP: the negative branch conditions on a BLACK
+                    // image (zeros), NOT "no IP" — `FluxPipeline` sets `negative_ip_adapter_image =
+                    // np.zeros(...)` when unset. CFG then amplifies the reference-specific signal
+                    // (ref − blank), sharpening resemblance instead of the whole IP term.
+                    let black = Image {
+                        width: 64,
+                        height: 64,
+                        pixels: vec![0u8; 64 * 64 * 3],
+                    };
+                    let black_embeds = encoder.encode(&black)?;
+                    let neg = FluxIpInjector::new(adapter, &black_embeds, scale)?;
                     let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
                     self.generate_with_injector_cfg(
                         req,

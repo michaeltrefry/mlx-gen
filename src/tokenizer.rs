@@ -149,10 +149,13 @@ impl TextTokenizer {
         &self.config
     }
 
-    /// Tokenize one prompt → `(1, L)` int32 `input_ids` + `attention_mask`. An empty prompt
-    /// returns `(1, 0)` empty arrays, matching the fork's all-empty short-circuit.
+    /// Tokenize one prompt → `(1, L)` int32 `input_ids` + `attention_mask`. An empty prompt returns
+    /// `(1, 0)` empty arrays (the fork's all-empty short-circuit) **unless** `pad_to_max_length` is
+    /// set — then it pads to `max_length` like HF `padding="max_length"` (so an empty *negative*
+    /// prompt for true-CFG, e.g. FLUX.1 IP-Adapter, encodes to the special-token + pad sequence
+    /// diffusers produces, not a 0-length tensor that crashes the transformer).
     pub fn tokenize(&self, prompt: &str) -> Result<TokenizerOutput> {
-        if prompt.is_empty() {
+        if prompt.is_empty() && !self.config.pad_to_max_length {
             return Ok(TokenizerOutput {
                 input_ids: empty_row(),
                 attention_mask: empty_row(),
@@ -167,7 +170,7 @@ impl TextTokenizer {
     /// build the full templated text themselves — e.g. the Qwen-Image-Edit VL path, which
     /// interleaves an expanded run of `<|image_pad|>` tokens that depends on the image grid.
     pub fn tokenize_preformatted(&self, text: &str) -> Result<TokenizerOutput> {
-        if text.is_empty() {
+        if text.is_empty() && !self.config.pad_to_max_length {
             return Ok(TokenizerOutput {
                 input_ids: empty_row(),
                 attention_mask: empty_row(),

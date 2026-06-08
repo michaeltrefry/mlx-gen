@@ -134,3 +134,98 @@ fn flux_ip_scale_zero_equals_txt2img() {
     );
     assert!(diffi > 0, "IP scale=0.7 must change the image");
 }
+
+fn flux_dev_snapshot() -> PathBuf {
+    if let Ok(p) = std::env::var("MLX_GEN_FLUX_DEV_SNAPSHOT") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap();
+    let snaps = PathBuf::from(home)
+        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots");
+    std::fs::read_dir(&snaps)
+        .expect("FLUX.1-dev HF snapshot (or set MLX_GEN_FLUX_DEV_SNAPSHOT)")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_dir() && p.join("transformer").is_dir())
+        .expect("a complete FLUX.1-dev snapshot dir")
+}
+
+/// sc-3624 A/B helper: render MLX FLUX + XLabs IP-Adapter conditioned on a reference PNG, saving the
+/// output PNG, so it can be compared to the diffusers `tools/flux_ip_torch_ab.py` render. Env:
+/// `FLUX_IP_REF_PNG` (in), `FLUX_IP_OUT_PNG` (out), `FLUX_IP_PROMPT`, `FLUX_IP_MODEL` (dev|schnell),
+/// `FLUX_IP_SCALE` (0.7), `FLUX_IP_TRUE_CFG` (dev only), `FLUX_IP_SEED` (2), `FLUX_IP_STEPS` (16).
+#[test]
+#[ignore = "sc-3624 A/B: MLX flux+IP render on a reference PNG; set FLUX_IP_REF_PNG + FLUX_IP_OUT_PNG"]
+fn flux_ip_render_to_png() {
+    let ref_png = std::env::var("FLUX_IP_REF_PNG").expect("set FLUX_IP_REF_PNG");
+    let out_png = std::env::var("FLUX_IP_OUT_PNG").expect("set FLUX_IP_OUT_PNG");
+    let prompt = std::env::var("FLUX_IP_PROMPT")
+        .unwrap_or_else(|_| "an oil painting in the bold swirling style of Van Gogh".into());
+    let dev = std::env::var("FLUX_IP_MODEL").as_deref() == Ok("dev");
+    let scale: f32 = std::env::var("FLUX_IP_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.7);
+    let true_cfg: Option<f32> = std::env::var("FLUX_IP_TRUE_CFG")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let seed: u64 = std::env::var("FLUX_IP_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let steps: u32 = std::env::var("FLUX_IP_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+
+    let decoded = image::open(&ref_png)
+        .expect("open FLUX_IP_REF_PNG")
+        .to_rgb8();
+    let reference = Image {
+        width: decoded.width(),
+        height: decoded.height(),
+        pixels: decoded.into_raw(),
+    };
+
+    let snapshot = if dev {
+        flux_dev_snapshot()
+    } else {
+        flux_schnell_snapshot()
+    };
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot))
+        .with_ip_adapter(WeightsSource::Dir(staged_ip_dir()));
+    let model = if dev {
+        mlx_gen_flux::load_dev(&spec)
+    } else {
+        mlx_gen_flux::load_schnell(&spec)
+    }
+    .unwrap();
+
+    let negative_prompt = std::env::var("FLUX_IP_NEG").ok().filter(|s| !s.is_empty());
+    let req = GenerationRequest {
+        prompt: prompt.clone(),
+        negative_prompt,
+        width: 512,
+        height: 512,
+        seed: Some(seed),
+        steps: Some(steps),
+        true_cfg,
+        conditioning: vec![Conditioning::Reference {
+            image: reference,
+            strength: Some(scale),
+        }],
+        ..Default::default()
+    };
+    let out = match model.generate(&req, &mut |_| {}).unwrap() {
+        GenerationOutput::Images(mut v) => v.remove(0),
+        _ => unreachable!(),
+    };
+    image::RgbImage::from_raw(out.width, out.height, out.pixels)
+        .expect("rgb buffer")
+        .save(&out_png)
+        .expect("save FLUX_IP_OUT_PNG");
+    println!(
+        "[mlx-ip] wrote {out_png} (model={}, scale={scale}, true_cfg={true_cfg:?})",
+        if dev { "dev" } else { "schnell" }
+    );
+}
