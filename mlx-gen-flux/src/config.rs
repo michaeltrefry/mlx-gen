@@ -1,7 +1,7 @@
 //! FLUX.1 family configuration, lifted from the frozen Python mflux fork's
 //! `ModelConfig.{schnell,dev}` and `FluxWeightDefinition.get_tokenizers`.
 
-use mlx_gen::{Capabilities, Modality, ModelDescriptor};
+use mlx_gen::{Capabilities, ConditioningKind, Modality, ModelDescriptor};
 
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
 pub const FLUX1_DEV_ID: &str = "flux1_dev";
@@ -71,11 +71,13 @@ impl FluxVariant {
                 supports_negative_prompt: false,
                 supports_guidance: self.supports_guidance(),
                 supports_true_cfg: false,
-                // Base FLUX.1 txt2img only for this story — no conditioning is implemented yet
-                // (`validate` rejects any), so the descriptor advertises none. img2img Reference and
-                // the Redux/Depth/Fill/Control variants are later ports that will turn these on as
-                // they land.
-                conditioning: Vec::new(),
+                // FLUX.1 reference-image conditioning is the XLabs IP-Adapter (epic 3621): a single
+                // `Reference` rides `Conditioning::Reference { image, strength=ipAdapterScale }`,
+                // exactly as SDXL exposes its IP-Adapter. Only wired when a `LoadSpec::ip_adapter`
+                // is supplied at load time; a `Reference` request without it errors loudly (no
+                // false-capability trap — `validate` rejects MultiReference / multiple references).
+                // The Redux/Depth/Fill/Control variants remain later ports.
+                conditioning: vec![ConditioningKind::Reference],
                 supports_lora: true,
                 supports_lokr: true,
                 // The base flow-match sampler plus, for dev, the Hyper-FLUX few-step profile

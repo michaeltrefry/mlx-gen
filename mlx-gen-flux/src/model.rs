@@ -4,19 +4,28 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, DiffusionSampler, Error, FlowMatchSampler, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
-    WeightsSource,
+    default_seed, Conditioning, DiffusionSampler, Error, FlowMatchSampler, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision,
+    Progress, Result, WeightsSource,
 };
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::Dtype;
 
 use crate::config::{FluxVariant, DEFAULT_SAMPLER, HYPER_SAMPLER};
+use crate::image_encoder::FluxIpImageEncoder;
+use crate::ip_adapter::{FluxIpAdapter, FluxIpInjector};
 use crate::loader;
 use crate::pipeline::{build_linear_sigmas, create_noise, unpack_latents};
 use crate::text_encoder::FluxTextEncoders;
 use crate::transformer::FluxTransformer;
+
+/// Default `ip_adapter_scale` when a `Conditioning::Reference` omits its `strength` (epic 3621).
+/// SceneWorks maps `ipAdapterScale` (default 0.7) → `strength`; this is the engine-side fallback.
+const DEFAULT_IP_SCALE: f32 = 0.7;
+/// `true_cfg` clamp range for the IP-Adapter dev path (SceneWorks default 4.0).
+const TRUE_CFG_MIN: f32 = 1.0;
+const TRUE_CFG_MAX: f32 = 10.0;
 
 pub fn descriptor_schnell() -> ModelDescriptor {
     descriptor_for(FluxVariant::Schnell)
@@ -82,6 +91,19 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
     // non-empty spec list that matches nothing — or any unmatched target — errors loudly (sc-2534).
     crate::adapters::apply_flux_adapters(&mut transformer, &spec.adapters)?;
 
+    // Optional XLabs IP-Adapter (epic 3621), loaded from `LoadSpec::ip_adapter`. The plain txt2img
+    // path is unaffected when absent.
+    let ip_adapter = match &spec.ip_adapter {
+        Some(WeightsSource::Dir(p)) => Some(loader::load_flux_ip_adapter(p)?),
+        Some(WeightsSource::File(_)) => {
+            return Err(Error::Msg(format!(
+                "{}: ip_adapter expects a directory (ip_adapter.safetensors + image_encoder/), not a single file",
+                variant.id()
+            )))
+        }
+        None => None,
+    };
+
     Ok(Flux1 {
         descriptor: descriptor_for(variant),
         variant,
@@ -90,6 +112,7 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         text_encoders: Some(text_encoders),
         transformer: Some(transformer),
         vae: Some(vae),
+        ip_adapter,
     })
 }
 
@@ -101,6 +124,10 @@ pub struct Flux1 {
     text_encoders: Option<FluxTextEncoders>,
     transformer: Option<FluxTransformer>,
     vae: Option<Vae>,
+    /// XLabs IP-Adapter (epic 3621): the CLIP-ViT-L/14 image encoder (sc-3622) + the adapter modules
+    /// (sc-3623). `Some` only when a `LoadSpec::ip_adapter` was supplied. A `Conditioning::Reference`
+    /// request errors loudly when this is `None`.
+    ip_adapter: Option<(FluxIpImageEncoder, FluxIpAdapter)>,
 }
 
 impl Flux1 {
@@ -113,6 +140,7 @@ impl Flux1 {
             text_encoders: None,
             transformer: None,
             vae: None,
+            ip_adapter: None,
         }
     }
 
@@ -173,7 +201,52 @@ impl Generator for Flux1 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // Reference-image (XLabs IP-Adapter) path, epic 3621. `validate` (run inside the injector
+        // generate methods) has already confirmed at most one `Reference`; extract it here.
+        if let Some((image, strength)) = single_reference(req)? {
+            let (encoder, adapter) = self.ip_adapter.as_ref().ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: a reference image needs an IP-adapter — load it via LoadSpec::with_ip_adapter",
+                    self.descriptor.id
+                ))
+            })?;
+            let embeds = encoder.encode(image)?;
+            let scale = strength.unwrap_or(DEFAULT_IP_SCALE).clamp(0.0, 1.0);
+            let pos = FluxIpInjector::new(adapter, &embeds, scale)?;
+            // dev + an explicit `true_cfg` → real CFG against `negative_prompt`, image prompt only on
+            // the positive branch (diffusers' Flux IP `true_cfg_scale`). Otherwise the single distilled
+            // forward (schnell always; dev without true_cfg).
+            return match req.true_cfg {
+                Some(cfg) if self.variant.supports_guidance() => {
+                    let neg = FluxIpInjector::disabled(adapter, &embeds)?;
+                    let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
+                    self.generate_with_injector_cfg(
+                        req,
+                        &pos,
+                        &neg,
+                        neg_prompt,
+                        cfg.clamp(TRUE_CFG_MIN, TRUE_CFG_MAX),
+                        0,
+                        on_progress,
+                    )
+                }
+                _ => self.generate_with_injector(req, Some(&pos), on_progress),
+            };
+        }
         self.generate_with_injector(req, None, on_progress)
+    }
+}
+
+/// Extract the single reference image + its optional `strength` (`ip_adapter_scale`) from a request,
+/// or `None` for plain txt2img. Errors on `MultiReference` or more than one reference (FLUX.1's
+/// XLabs IP-Adapter conditions on exactly one image).
+fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
+    match req.conditioning.as_slice() {
+        [] => Ok(None),
+        [Conditioning::Reference { image, strength }] => Ok(Some((image, *strength))),
+        _ => Err(Error::Msg(
+            "flux: reference conditioning supports exactly one Reference image".into(),
+        )),
     }
 }
 
@@ -405,7 +478,22 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             desc.id, caps.max_count
         )));
     }
-    if req.negative_prompt.is_some() && !caps.supports_negative_prompt {
+    // Reference conditioning (XLabs IP-Adapter, epic 3621): exactly one `Reference`. The negative
+    // prompt + true_cfg knobs ride the IP-Adapter dev path (real CFG), so they are permitted
+    // alongside a reference on a guidance-capable (dev) variant even though base txt2img advertises
+    // neither — but never on the plain (no-reference) path, which stays bit-identical.
+    let has_reference = match req.conditioning.as_slice() {
+        [] => false,
+        [Conditioning::Reference { .. }] => true,
+        _ => {
+            return Err(Error::Msg(format!(
+                "{}: only a single Reference image is supported (no MultiReference / multiple references)",
+                desc.id
+            )))
+        }
+    };
+    let ref_cfg_ok = has_reference && caps.supports_guidance;
+    if req.negative_prompt.is_some() && !caps.supports_negative_prompt && !ref_cfg_ok {
         return Err(Error::Msg(format!(
             "{}: negative prompts are not supported",
             desc.id
@@ -417,15 +505,9 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             desc.id
         )));
     }
-    if req.true_cfg.is_some() && !caps.supports_true_cfg {
+    if req.true_cfg.is_some() && !caps.supports_true_cfg && !ref_cfg_ok {
         return Err(Error::Msg(format!(
             "{}: true_cfg is not supported",
-            desc.id
-        )));
-    }
-    if !req.conditioning.is_empty() {
-        return Err(Error::Msg(format!(
-            "{}: conditioning variants are not implemented in the base txt2img port yet",
             desc.id
         )));
     }
@@ -484,6 +566,115 @@ mod tests {
     fn constants_match_expected_ids() {
         assert_eq!(FluxVariant::Schnell.id(), FLUX1_SCHNELL_ID);
         assert_eq!(FluxVariant::Dev.id(), FLUX1_DEV_ID);
+    }
+
+    // ---- epic 3621: XLabs IP-Adapter reference conditioning -----------------------------------
+
+    fn tiny_image() -> Image {
+        Image {
+            width: 8,
+            height: 8,
+            pixels: vec![128u8; 8 * 8 * 3],
+        }
+    }
+
+    fn reference(strength: Option<f32>) -> Conditioning {
+        Conditioning::Reference {
+            image: tiny_image(),
+            strength,
+        }
+    }
+
+    #[test]
+    fn both_variants_advertise_reference_conditioning() {
+        for v in [FluxVariant::Dev, FluxVariant::Schnell] {
+            assert!(
+                descriptor_for(v)
+                    .capabilities
+                    .conditioning
+                    .contains(&mlx_gen::ConditioningKind::Reference),
+                "{} must advertise Reference conditioning",
+                v.id()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_single_reference_with_ip_knobs_on_dev() {
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            guidance: Some(3.5),
+            true_cfg: Some(4.0),
+            negative_prompt: Some("blurry".into()),
+            conditioning: vec![reference(Some(0.7))],
+            ..Default::default()
+        };
+        // true_cfg + negative_prompt are permitted alongside a reference on dev even though base
+        // txt2img advertises neither.
+        model.validate(&req).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_true_cfg_without_reference() {
+        // The IP knobs are scoped to the reference path; the plain dev path stays unchanged.
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            true_cfg: Some(4.0),
+            ..Default::default()
+        };
+        assert!(model
+            .validate(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("true_cfg is not supported"));
+    }
+
+    #[test]
+    fn validate_rejects_true_cfg_on_schnell_even_with_reference() {
+        // schnell is not guidance/CFG-capable, so true_cfg is rejected regardless of a reference.
+        let model = Flux1::new_for_tests(FluxVariant::Schnell);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            true_cfg: Some(4.0),
+            conditioning: vec![reference(None)],
+            ..Default::default()
+        };
+        assert!(model
+            .validate(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("true_cfg is not supported"));
+    }
+
+    #[test]
+    fn validate_rejects_multiple_references() {
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            conditioning: vec![reference(None), reference(None)],
+            ..Default::default()
+        };
+        assert!(model
+            .validate(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("single Reference"));
+    }
+
+    #[test]
+    fn generate_reference_without_ip_adapter_errors() {
+        // No `LoadSpec::ip_adapter` → a reference request errors loudly before touching the (absent)
+        // transformer, so the descriptor never advertises a path that silently no-ops.
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            conditioning: vec![reference(Some(0.7))],
+            ..Default::default()
+        };
+        let err = model.generate(&req, &mut |_| {}).unwrap_err().to_string();
+        assert!(err.contains("needs an IP-adapter"), "got: {err}");
     }
 
     // ---- sc-2908: sampler capability surface + few-step profile -----------------------------

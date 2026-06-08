@@ -9,6 +9,8 @@ use mlx_gen::{Result, WeightsSource};
 use mlx_gen_z_image::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 
 use crate::config::{FluxTokenizerKind, FluxVariant};
+use crate::image_encoder::FluxIpImageEncoder;
+use crate::ip_adapter::FluxIpAdapter;
 use crate::text_encoder::{ClipTextEncoder, T5TextEncoder};
 use crate::transformer::{FluxTransformer, FluxTransformerConfig};
 
@@ -33,6 +35,26 @@ pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
 pub fn load_transformer(root: &Path, variant: FluxVariant) -> Result<FluxTransformer> {
     let w = Weights::from_dir(root.join("transformer"))?;
     FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))
+}
+
+/// Load the XLabs FLUX IP-Adapter (epic 3621) from a directory containing the adapter weights and a
+/// CLIP-ViT-L/14 image tower. The layout mirrors SDXL's `LoadSpec::ip_adapter` contract (the dir
+/// carries both the adapter and its image encoder):
+///
+/// ```text
+/// <dir>/ip_adapter.safetensors            # XLabs-AI/flux-ip-adapter
+/// <dir>/image_encoder/model.safetensors   # openai/clip-vit-large-patch14 (vision tower)
+/// ```
+///
+/// SceneWorks stages the CLIP tower next to the adapter (sc-3625); the engine only resolves the two
+/// files here. Returns the image encoder (sc-3622) and the adapter modules (sc-3623).
+pub fn load_flux_ip_adapter(dir: &Path) -> Result<(FluxIpImageEncoder, FluxIpAdapter)> {
+    let adapter =
+        FluxIpAdapter::from_weights(&Weights::from_file(dir.join("ip_adapter.safetensors"))?)?;
+    let encoder = FluxIpImageEncoder::from_weights(&Weights::from_file(
+        dir.join("image_encoder/model.safetensors"),
+    )?)?;
+    Ok((encoder, adapter))
 }
 
 pub fn load_vae(root: &Path) -> Result<Vae> {
