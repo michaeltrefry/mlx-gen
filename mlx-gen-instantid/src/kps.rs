@@ -113,7 +113,7 @@ static SIN_TABLE: [f32; 451] = [
 /// OpenCV `drawing.cpp` `ellipse2Poly` for our fixed call shape `(arc 0..360, delta 1)`. Returns the
 /// rounded, consecutive-deduped polygon vertices of a rotated ellipse. Faithful to the double-version
 /// (float `SinTable` trig, `float` rotation cos/sin) + the int-version (`cvRound` + dedup).
-fn ellipse2poly(center: (i32, i32), axes: (i32, i32), angle: i32) -> Vec<(i32, i32)> {
+pub(crate) fn ellipse2poly(center: (i32, i32), axes: (i32, i32), angle: i32) -> Vec<(i32, i32)> {
     // Normalize the rotation angle to [0, 360] (the double-version `while` loops), then `sincos`.
     let mut ang = angle;
     while ang < 0 {
@@ -278,7 +278,7 @@ fn line8(img: &mut [u8], w: i32, h: i32, mut pt1: (i32, i32), mut pt2: (i32, i32
 /// XY_SHIFT=16 fixed-point two-edge scanline fill. `v` are integer polygon vertices.
 // Index loops are faithful to OpenCV (the index drives `imin` and `edge[i]`); keep them as written.
 #[allow(clippy::needless_range_loop)]
-fn fill_convex_poly(img: &mut [u8], w: i32, h: i32, v: &[(i32, i32)], color: [u8; 3]) {
+pub(crate) fn fill_convex_poly(img: &mut [u8], w: i32, h: i32, v: &[(i32, i32)], color: [u8; 3]) {
     let npts = v.len() as i32;
     // shift = 0 ⇒ the `delta = 1<<shift>>1` bias is 0, so `(coord + delta) >> shift == coord`.
     let delta1: i64 = XY_ONE >> 1; // line_type < LINE_AA
@@ -417,7 +417,14 @@ fn fill_convex_poly(img: &mut [u8], w: i32, h: i32, v: &[(i32, i32)], color: [u8
 }
 
 /// OpenCV filled `Circle` (Bresenham symmetric span fill).
-fn circle_filled(img: &mut [u8], w: i32, h: i32, center: (i32, i32), radius: i32, color: [u8; 3]) {
+pub(crate) fn circle_filled(
+    img: &mut [u8],
+    w: i32,
+    h: i32,
+    center: (i32, i32),
+    radius: i32,
+    color: [u8; 3],
+) {
     let (cx, cy) = (center.0 as i64, center.1 as i64);
     let (wi, hi) = (w as i64, h as i64);
     let mut err: i64 = 0;

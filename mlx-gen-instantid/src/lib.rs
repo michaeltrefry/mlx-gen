@@ -15,8 +15,13 @@
 
 pub mod kps;
 pub mod model;
+pub mod openpose;
 
 pub use kps::{draw_kps, letterbox, view_angle_kps, ANGLE_SET_ORDER, VIEW_ANGLE_KPS};
 pub use model::{
     InstantId, InstantIdPaths, InstantIdRequest, DEFAULT_CONTROLNET_SCALE, DEFAULT_IP_SCALE,
+};
+pub use openpose::{
+    draw_bodypose, face_box_from_keypoints, normalize_keypoints, square_fit, BodyPoint,
+    NUM_BODY_KEYPOINTS, STICKWIDTH,
 };
