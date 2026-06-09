@@ -90,6 +90,20 @@ pub struct GenerationRequest {
     /// models that don't support it ignore it.
     pub trim_first_frames: Option<u32>,
 
+    // --- SVD image→video micro-conditioning (sc-3523; ignored by other models) ---
+    /// SVD `motion_bucket_id` — the motion-strength bucket baked into the `added_time_ids`
+    /// micro-conditioning (higher = more motion). `None` ⇒ the model default (127). Only the
+    /// `svd_xt` model reads it; other models ignore it.
+    pub motion_bucket_id: Option<f32>,
+    /// SVD `noise_aug_strength` — Gaussian noise added to the VAE-encoded conditioning image (and
+    /// surfaced in `added_time_ids`); higher = less fidelity to the source / more motion. `None` ⇒
+    /// the model default (0.02). Only `svd_xt` reads it.
+    pub noise_aug_strength: Option<f32>,
+    /// Frames decoded per temporal-VAE pass (diffusers `decode_chunk_size`) — a memory/quality knob
+    /// for chunked video VAE decode (smaller = less peak memory, changes temporal-boundary
+    /// behavior). `None` ⇒ the model default. Only `svd_xt` reads it today.
+    pub decode_chunk_size: Option<u32>,
+
     // --- Prompt enhancement (LTX-2.3, sc-2845; ignored by other models) ---
     /// Rewrite `prompt` with an autoregressive Gemma-3 LLM before encoding (the reference
     /// `--enhance-prompt`). Default `false` — the diffusion path is unchanged. On any enhancer
@@ -131,6 +145,9 @@ impl Default for GenerationRequest {
             duration: None,
             video_mode: None,
             trim_first_frames: None,
+            motion_bucket_id: None,
+            noise_aug_strength: None,
+            decode_chunk_size: None,
             enhance_prompt: false,
             use_uncensored_enhancer: false,
             enhance_max_tokens: None,

@@ -248,6 +248,8 @@ impl Generator for Svd {
         let mut params = SvdParams::default();
         if let Some(f) = req.frames {
             params.num_frames = f as i32;
+            // Default the decode chunk to the full clip (diffusers' `decode_chunk_size = num_frames`)
+            // unless the request overrides it below.
             params.decode_chunk_size = f as i32;
         }
         if let Some(s) = req.steps {
@@ -258,6 +260,18 @@ impl Generator for Svd {
         }
         if let Some(g) = req.guidance {
             params.max_guidance_scale = g;
+        }
+        // SVD micro-conditioning knobs (sc-3523): `motion_bucket_id` / `noise_aug_strength` drive the
+        // `added_time_ids` motion conditioning; `decode_chunk_size` is the chunked-VAE memory knob.
+        // Each falls back to the reference default when the request leaves it `None`.
+        if let Some(m) = req.motion_bucket_id {
+            params.motion_bucket_id = m;
+        }
+        if let Some(n) = req.noise_aug_strength {
+            params.noise_aug_strength = n;
+        }
+        if let Some(c) = req.decode_chunk_size {
+            params.decode_chunk_size = c as i32;
         }
         let seed = req.seed.unwrap_or_else(default_seed);
 
