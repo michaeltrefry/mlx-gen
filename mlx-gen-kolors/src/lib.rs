@@ -4,8 +4,10 @@
 //! text encoder (penultimate hidden state = context, last-token last-layer state = pooled). This
 //! crate is built up across epic 3090:
 //!
-//!  - [`chatglm3`] — the ChatGLM3-6B encoder-only forward (sc-3091, this slice).
-//!  - tokenizer (sc-3092), U-Net conditioning wiring on `mlx-gen-sdxl` (sc-3093), the T2I /
-//!    img2img pipelines (sc-3094/3095), quant (sc-3096), ControlNet / IP-Adapter-Plus (sc-3097/98).
+//!  - [`chatglm3`] — the ChatGLM3-6B encoder-only forward (sc-3091).
+//!  - [`tokenizer`] — the ChatGLM3 SentencePiece tokenizer (sc-3092).
+//!  - U-Net conditioning wiring on `mlx-gen-sdxl` (sc-3093), the T2I / img2img pipelines
+//!    (sc-3094/3095), quant (sc-3096), ControlNet / IP-Adapter-Plus (sc-3097/98).
 
 pub mod chatglm3;
+pub mod tokenizer;

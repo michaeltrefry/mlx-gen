@@ -126,6 +126,7 @@ sides run MLX Metal, so parity is near-bit.
 
 | golden | dump script | consumed by | notes |
 |---|---|---|---|
+| `kolors_tokenizer_golden.safetensors` | `build_kolors_tokenizer.py` | `tests/tokenizer_parity.rs` | sc-3092 ChatGLM3 tokenizer. The script ALSO materializes the fast `tokenizer.json` into the snapshot `tokenizer/` dir (LLaMA-style byte_fallback BPE replica). Golden = reference `ChatGLMTokenizer(prompt, padding="max_length", max_length=256, truncation=True)` input_ids/attention_mask/position_ids for a 5-prompt EN/EN-long(truncated)/CN/mixed/empty battery. Rust `KolorsTokenizer` matches byte-identical. |
 | `kolors_chatglm_golden.safetensors` | `dump_kolors_chatglm_golden.py` | `tests/chatglm_parity.rs` | sc-3091 ChatGLM3-6B text encoder. Diffusers `KolorsPipeline` `ChatGLMModel` (`text_encoder/` fp16 shards, ~12.5 GB) run with `output_hidden_states=True` on two fixed inputs — `packed` (pure causal) and `padded` (right-pad → causal+padding mask) — for BOTH f32 and fp16 (`f16_` prefix). Bundles per case/dtype: `input_ids`/`attention_mask` + all 29 hidden states (permuted `[S,B,H]→[B,S,H]`) + `context` (`hidden_states[-2]`) + `pooled` (`hidden_states[-1]` last token). f32 worst hidden ~1.1e-3 (flat over depth = Metal-vs-CPU floor), fp16 worst ~1.7e-3. |
 
 ### Weight-independent
