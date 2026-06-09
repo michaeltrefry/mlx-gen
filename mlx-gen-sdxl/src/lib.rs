@@ -40,7 +40,8 @@ pub use config::{
 };
 pub use inpaint::{preprocess_mask, InpaintBlend};
 pub use ip_adapter::{
-    load_ip_kv_pairs, preprocess_clip_image, IpImageEncoder, Resampler, ResamplerConfig,
+    load_ip_kv_pairs, preprocess_clip_image, preprocess_clip_image_sized, IpImageEncoder,
+    Resampler, ResamplerConfig,
 };
 pub use loader::{
     load_controlnet, load_ip_adapter, load_text_encoder_1, load_text_encoder_1_dtype,

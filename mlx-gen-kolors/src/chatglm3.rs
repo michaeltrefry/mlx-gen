@@ -30,6 +30,8 @@
 //! loaded and applied to expose the conventional `last_hidden_state`, but Kolors does not use it.
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
+use mlx_rs::module::Param;
+use mlx_rs::nn::{Linear, QuantizedLinear};
 use mlx_rs::ops::{
     add, addmm, concatenate_axis, cos as cos_op, dequantize, matmul, multiply, quantized_matmul,
     sin as sin_op, split, subtract,
@@ -37,6 +39,7 @@ use mlx_rs::ops::{
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::silu;
+use mlx_gen::quant::DEFAULT_GROUP_SIZE;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -159,6 +162,31 @@ impl ChatGlmLinear {
             }
         }
     }
+
+    /// Load-time quantization (the mlx-gen-sdxl sc-2641 path, NOT checkpoint-driven): pack a `Dense`
+    /// projection's weight to Q4/Q8 in-memory via the same `QuantizedLinear` path the rest of the repo
+    /// uses (so the affine packing is byte-identical), keeping the Linear `bias` as a separate add. The
+    /// weight is cast to **bf16 before packing** to match the repo's group-scale convention
+    /// (`AdaptableLinear::quantize`). A `Quant` variant is left unchanged (idempotent).
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        if let ChatGlmLinear::Dense { w, bias } = self {
+            let group = group.unwrap_or(DEFAULT_GROUP_SIZE);
+            let linear = Linear {
+                weight: Param::new(w.as_dtype(Dtype::Bfloat16)?),
+                bias: Param::new(None),
+            };
+            let ql = QuantizedLinear::try_from_linear(linear, group, bits)?;
+            *self = ChatGlmLinear::Quant {
+                q: ql.inner.weight.value,
+                scales: ql.scales.value,
+                qbias: ql.biases.value,
+                group,
+                bits,
+                bias: bias.take(),
+            };
+        }
+        Ok(())
+    }
 }
 
 struct GlmBlock {
@@ -215,6 +243,21 @@ impl ChatGlmModel {
             cfg,
             dtype,
         })
+    }
+
+    /// Load-time quantize the encoder to Q4/Q8 (the memory driver — the 28 GLM blocks dominate the 6B
+    /// footprint). Quantizes every block projection (fused `query_key_value` + `dense` + the two MLP
+    /// linears); the token embedding stays dense (the gather stays exact, mirroring the mlx-gen-sdxl
+    /// text-encoder `quantize`, which also leaves its embedding dense). `final_layernorm` /
+    /// `*_layernorm` weights are norms, not quantized. Idempotent.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.qkv.quantize(bits, None)?;
+            layer.dense.quantize(bits, None)?;
+            layer.h_to_4h.quantize(bits, None)?;
+            layer.h4_to_h.quantize(bits, None)?;
+        }
+        Ok(())
     }
 
     /// Rotary `(cos, sin)`, each `[1, seq, 1, rotary_dim/2]`, for the given absolute `positions` (one

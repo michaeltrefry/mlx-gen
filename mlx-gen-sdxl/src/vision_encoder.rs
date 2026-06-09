@@ -73,6 +73,22 @@ impl VisionConfig {
         }
     }
 
+    /// OpenAI CLIP ViT-L/14-**336** (`openai/clip-vit-large-patch14-336`): identical to
+    /// [`vit_l_14`](Self::vit_l_14) but 336px → 24×24 patches → 577 tokens. The image tower the
+    /// **Kolors** IP-Adapter-Plus conditions on (sc-3098, a `CLIPVisionModelWithProjection`,
+    /// `quick_gelu`, LN eps 1e-5).
+    pub fn vit_l_14_336() -> Self {
+        Self {
+            hidden: 1024,
+            num_layers: 24,
+            num_heads: 16,
+            patch: 14,
+            image_size: 336,
+            num_channels: 3,
+            quick_gelu: true,
+        }
+    }
+
     /// Token count = 1 class token + (image_size / patch)² patches (= 257 for ViT-H/14).
     pub fn num_positions(&self) -> i32 {
         let grid = self.image_size / self.patch;

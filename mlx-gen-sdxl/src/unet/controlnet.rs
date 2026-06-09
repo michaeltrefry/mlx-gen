@@ -15,6 +15,7 @@
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d, silu};
 use mlx_gen::weights::Weights;
@@ -113,6 +114,11 @@ pub struct ControlNet {
     down_zero: Vec<Conv2dLayer>,
     /// The 1×1 zero-conv mid projection.
     mid_zero: Conv2dLayer,
+    /// Optional context projection (diffusers `encoder_hid_proj`), present only when the checkpoint
+    /// carries `encoder_hid_proj.weight` — the **Kolors** ControlNet (sc-3097), which projects the
+    /// ChatGLM3 context 4096→`cross_attention_dim` (2048) up front, mirroring its own U-Net. Its own
+    /// learned weights (distinct from the U-Net's). Absent for SDXL ControlNets → `None` (no-op).
+    encoder_hid_proj: Option<AdaptableLinear>,
 }
 
 impl ControlNet {
@@ -171,6 +177,10 @@ impl ControlNet {
             cond_embedding: CondEmbedding::load(w)?,
             down_zero,
             mid_zero,
+            // Kolors `encoder_hid_proj` (4096→2048). Auto-detected: absent for SDXL → `None`.
+            encoder_hid_proj: w.get("encoder_hid_proj.weight").map(|wt| {
+                AdaptableLinear::dense(wt.clone(), w.get("encoder_hid_proj.bias").cloned())
+            }),
         })
     }
 
@@ -193,6 +203,17 @@ impl ControlNet {
     ) -> Result<ControlResiduals> {
         let batch = x.shape()[0];
         let dtype = x.dtype();
+
+        // Kolors: project the ChatGLM3 context (4096) to `cross_attention_dim` (2048) up front, before
+        // any cross-attention (diffusers applies `encoder_hid_proj` once). No-op for SDXL ControlNets.
+        let projected;
+        let encoder_x = match &self.encoder_hid_proj {
+            Some(proj) => {
+                projected = proj.forward(encoder_x)?;
+                &projected
+            }
+            None => encoder_x,
+        };
 
         // Timestep + SDXL `text_time` embedding (identical to the UNet).
         let t = Array::from_slice(&vec![timestep; batch as usize], &[batch]);
@@ -243,6 +264,9 @@ impl ControlNet {
         self.mid_resnet0.quantize(bits)?;
         self.mid_transformer.quantize(bits)?;
         self.mid_resnet1.quantize(bits)?;
+        if let Some(proj) = &mut self.encoder_hid_proj {
+            proj.quantize(bits, None)?;
+        }
         Ok(())
     }
 }

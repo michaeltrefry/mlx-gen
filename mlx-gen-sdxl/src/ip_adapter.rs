@@ -25,10 +25,17 @@ use crate::vision_encoder::ClipVisionEncoder;
 
 /// CLIP ViT image preprocessing for IP-Adapter (`CLIPImageProcessor`): resize the shortest side to
 /// 224 (bicubic), center-crop 224×224, rescale `[0,255]→[0,1]`, normalize by the CLIP mean/std.
-/// Returns NHWC `[1, 224, 224, 3]` f32.
-#[allow(clippy::excessive_precision)] // canonical CLIP mean/std (f32 rounds the last digit)
+/// Returns NHWC `[1, 224, 224, 3]` f32. (ViT-L-336 towers — e.g. Kolors IP-Adapter — use
+/// [`preprocess_clip_image_sized`] with 336.)
 pub fn preprocess_clip_image(image: &Image) -> Result<Array> {
-    const SIZE: usize = 224;
+    preprocess_clip_image_sized(image, 224)
+}
+
+/// [`preprocess_clip_image`] parametrized by the CLIP crop size (224 for ViT-H/ViT-L-224, **336** for
+/// the Kolors IP-Adapter's ViT-L/14-336 tower). Same `CLIPImageProcessor` recipe: shortest-side
+/// bicubic resize to `size`, center-crop `size`×`size`, `[0,255]→[0,1]`, CLIP mean/std normalize.
+#[allow(clippy::excessive_precision)] // canonical CLIP mean/std (f32 rounds the last digit)
+pub fn preprocess_clip_image_sized(image: &Image, size: usize) -> Result<Array> {
     const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
     const STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
     let (iw, ih) = (image.width as usize, image.height as usize);
@@ -38,24 +45,24 @@ pub fn preprocess_clip_image(image: &Image) -> Result<Array> {
             image.pixels.len()
         )));
     }
-    // Resize shortest side to 224 (bicubic), preserving aspect.
-    let scale = SIZE as f64 / iw.min(ih) as f64;
-    let rw = ((iw as f64 * scale).round() as usize).max(SIZE);
-    let rh = ((ih as f64 * scale).round() as usize).max(SIZE);
+    // Resize shortest side to `size` (bicubic), preserving aspect.
+    let scale = size as f64 / iw.min(ih) as f64;
+    let rw = ((iw as f64 * scale).round() as usize).max(size);
+    let rh = ((ih as f64 * scale).round() as usize).max(size);
     let resized = resize_bicubic_u8(&image.pixels, ih, iw, rh, rw); // HWC f32 [0,255]
-                                                                    // Center-crop 224×224 + normalize.
-    let top = (rh - SIZE) / 2;
-    let left = (rw - SIZE) / 2;
-    let mut out = vec![0f32; SIZE * SIZE * 3];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
+                                                                    // Center-crop size×size + normalize.
+    let top = (rh - size) / 2;
+    let left = (rw - size) / 2;
+    let mut out = vec![0f32; size * size * 3];
+    for y in 0..size {
+        for x in 0..size {
             for c in 0..3 {
                 let v = resized[((top + y) * rw + (left + x)) * 3 + c] / 255.0;
-                out[(y * SIZE + x) * 3 + c] = (v - MEAN[c]) / STD[c];
+                out[(y * size + x) * 3 + c] = (v - MEAN[c]) / STD[c];
             }
         }
     }
-    Ok(Array::from_slice(&out, &[1, SIZE as i32, SIZE as i32, 3]))
+    Ok(Array::from_slice(&out, &[1, size as i32, size as i32, 3]))
 }
 
 /// The IP-Adapter image-token source: the CLIP ViT-H encoder + the Resampler. Produces the 16 image
@@ -64,18 +71,35 @@ pub fn preprocess_clip_image(image: &Image) -> Result<Array> {
 pub struct IpImageEncoder {
     encoder: ClipVisionEncoder,
     resampler: Resampler,
+    /// The CLIP crop size the encoder was trained at (224 for ViT-H/ViT-L-224, 336 for the Kolors
+    /// ViT-L/14-336). Drives [`preprocess_clip_image_sized`].
+    image_size: usize,
 }
 
 impl IpImageEncoder {
+    /// ViT-H / ViT-L-224 tower (224px CLIP preprocess).
     pub fn new(encoder: ClipVisionEncoder, resampler: Resampler) -> Self {
-        Self { encoder, resampler }
+        Self::with_image_size(encoder, resampler, 224)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit CLIP crop size (336 for the Kolors ViT-L/14-336).
+    pub fn with_image_size(
+        encoder: ClipVisionEncoder,
+        resampler: Resampler,
+        image_size: usize,
+    ) -> Self {
+        Self {
+            encoder,
+            resampler,
+            image_size,
+        }
     }
 
     /// Reference image → `[1, num_queries, output_dim]` IP tokens (16×2048 for plus-vit-h), at the
-    /// resampler's weight dtype. CLIP preprocess → ViT-H penultimate → Resampler.
+    /// resampler's weight dtype. CLIP preprocess → ViT penultimate → Resampler.
     pub fn tokens(&self, image: &Image) -> Result<Array> {
         let dtype = self.resampler.dtype();
-        let pixels = preprocess_clip_image(image)?.as_dtype(dtype)?;
+        let pixels = preprocess_clip_image_sized(image, self.image_size)?.as_dtype(dtype)?;
         let penultimate = self.encoder.penultimate(&pixels)?;
         self.resampler.forward(&penultimate)
     }
@@ -149,6 +173,25 @@ impl ResamplerConfig {
             dim_head: 64,
             num_queries: 16,
             embed_dim: 1280,
+            output_dim: 2048,
+        }
+    }
+
+    /// Kolors IP-Adapter-Plus Resampler (`image_proj.*` of `Kwai-Kolors/Kolors-IP-Adapter-Plus`'s
+    /// `ip_adapter_plus_general.safetensors`; sc-3098). Same Tencent layout as
+    /// [`plus_sdxl_vit_h`](Self::plus_sdxl_vit_h), but the latent/working width is **2048** (not 1280)
+    /// and the input features are the **ViT-L/14-336** penultimate (1024-d, vs ViT-H 1280). Pinned by
+    /// the on-disk weight shapes: `latents [1,16,2048]`, `proj_in [2048,1024]`, `proj_out [2048,2048]`,
+    /// `to_q [768,2048]` (inner = `heads·dim_head` = 768); `dim_head=64` (universal for IP-Adapter
+    /// Resamplers) ⇒ `heads=12`. depth 4, 16 queries, output 2048 (= the U-Net cross-attention dim).
+    pub fn kolors_plus() -> Self {
+        Self {
+            dim: 2048,
+            depth: 4,
+            heads: 12,
+            dim_head: 64,
+            num_queries: 16,
+            embed_dim: 1024,
             output_dim: 2048,
         }
     }

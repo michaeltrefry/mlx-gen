@@ -13,3 +13,11 @@
 //! provider has one entry point; the T2I denoise loop + scheduler are sc-3094.
 
 pub use mlx_gen_sdxl::{load_unet_kolors_dtype, UNet2DConditionModel};
+
+/// Kolors **ControlNet** (sc-3097): the SDXL `ControlNetModel` primitive reused as-is. The Kolors
+/// ControlNet (`Kwai-Kolors/Kolors-ControlNet-{Pose,Canny,Depth}`) is a standard SDXL ControlNet
+/// whose only deltas are the same two ChatGLM-driven pieces as the Kolors U-Net — its **own**
+/// `encoder_hid_proj` (4096→2048, distinct learned weights) auto-detected from the checkpoint, and
+/// the 5632 add-embedding loaded by shape. `load_controlnet` therefore loads it with no Kolors-
+/// specific config. Conditioned with the ChatGLM3 context (the branch projects it internally).
+pub use mlx_gen_sdxl::{load_controlnet, ControlNet};

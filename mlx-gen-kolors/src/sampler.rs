@@ -22,11 +22,16 @@ use mlx_gen::{DiffusionSampler, Result};
 
 /// Kolors' EulerDiscrete (leading) sampler over the 1100-step `scaled_linear` schedule.
 pub struct KolorsEulerSampler {
-    /// Interpolated sigmas at the leading timesteps, length `num_steps + 1` (trailing `0.0`).
+    /// Interpolated sigmas at the (effective) timesteps, length `num_steps + 1` (trailing `0.0`).
+    /// For img2img this is the schedule **sliced** at the strength-derived start (`begin_index`).
     sigmas: Vec<f32>,
     /// The (float) leading timesteps fed to the U-Net, length `num_steps`.
     timesteps: Vec<f32>,
     init_noise_sigma: f32,
+    /// The σ at the img2img start (`sigmas[begin_index]`) — what diffusers' `add_noise` scales the
+    /// noise by when seeding the init latents. Equals `sigmas[0]` after the img2img slice; for the
+    /// full txt2img schedule it is just the max σ and is unused (txt2img seeds via init noise).
+    start_sigma: f32,
     model_dtype: Dtype,
 }
 
@@ -34,6 +39,40 @@ impl KolorsEulerSampler {
     /// Kolors defaults: `num_train_timesteps=1100`, β₀=0.00085, β₁=0.014, `steps_offset=1`.
     pub fn kolors(num_steps: usize, model_dtype: Dtype) -> Result<Self> {
         Self::new(1100, 0.00085, 0.014, 1, num_steps, model_dtype)
+    }
+
+    /// The img2img variant of [`Self::kolors`]: build the full `num_steps` schedule, then slice it at
+    /// the strength-derived start exactly as diffusers' `KolorsImg2ImgPipeline.get_timesteps` +
+    /// `set_begin_index` do. With `init_timestep = min(int(num_steps·strength), num_steps)` and
+    /// `t_start = num_steps − init_timestep`, the run uses `timesteps[t_start..]` / `sigmas[t_start..]`
+    /// and seeds the init latents with [`Self::add_noise`] at `σ = sigmas[t_start]`. `strength ≤
+    /// 1/num_steps` ⇒ 0 effective steps ⇒ the (un-noised) init is returned unchanged.
+    pub fn kolors_img2img(num_steps: usize, strength: f32, model_dtype: Dtype) -> Result<Self> {
+        let full = Self::kolors(num_steps, model_dtype)?;
+        let init_timestep = ((num_steps as f32 * strength) as usize).min(num_steps);
+        let t_start = num_steps - init_timestep;
+        // sigmas has length num_steps+1 (trailing 0); slicing from t_start keeps that trailing 0.
+        let sigmas = full.sigmas[t_start..].to_vec();
+        let timesteps = full.timesteps[t_start..].to_vec();
+        let start_sigma = sigmas[0];
+        Ok(Self {
+            sigmas,
+            timesteps,
+            init_noise_sigma: full.init_noise_sigma,
+            start_sigma,
+            model_dtype,
+        })
+    }
+
+    /// Seed img2img: noise the clean (VAE-encoded, scaled) init latents at the start σ —
+    /// diffusers' `EulerDiscreteScheduler.add_noise` with `begin_index = t_start`, which is the
+    /// **raw** `x₀ + noise·σ` (the latents stay in un-normalized σ-space; `scale_model_input`
+    /// normalizes before each U-Net call). Draws no RNG — the caller supplies `noise`.
+    pub fn add_noise(&self, x0: &Array, noise: &Array) -> Result<Array> {
+        use mlx_rs::ops::add;
+        let x0 = x0.as_dtype(Dtype::Float32)?;
+        let noise = noise.as_dtype(Dtype::Float32)?;
+        Ok(add(&x0, &multiply(&noise, scalar(self.start_sigma))?)?)
     }
 
     pub fn new(
@@ -79,6 +118,8 @@ impl KolorsEulerSampler {
             timesteps,
             // leading spacing ⇒ init_noise_sigma = (max_sigma² + 1)^0.5.
             init_noise_sigma: (max_sigma * max_sigma + 1.0).sqrt(),
+            // The full txt2img schedule starts at the max σ; the img2img slice overrides this.
+            start_sigma: max_sigma,
             model_dtype,
         })
     }
