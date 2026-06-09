@@ -20,6 +20,10 @@
 pub mod config;
 pub mod hiera;
 pub mod image_encoder;
+pub mod sam_heads;
+pub mod segmenter;
 
 pub use config::{Sam2ImageEncoderConfig, Sam2ModelSize};
 pub use image_encoder::{Sam2ImageEncoder, Sam2ImageEncoderOutput};
+pub use sam_heads::{MaskDecoder, PromptEncoder};
+pub use segmenter::Sam2Segmenter;

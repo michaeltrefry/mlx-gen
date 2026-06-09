@@ -33,6 +33,16 @@ fn cubic(x: f64) -> f64 {
 }
 
 /// Normalized sinc, `sin(πx)/(πx)`.
+/// PIL `Image.BILINEAR` filter: a triangle of support radius 1.0.
+fn triangle(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 1.0 {
+        1.0 - x
+    } else {
+        0.0
+    }
+}
+
 fn sinc(x: f64) -> f64 {
     if x == 0.0 {
         1.0
@@ -185,6 +195,18 @@ pub fn resize_bicubic_u8(
     out_w: usize,
 ) -> Vec<f32> {
     resize_u8(src, in_h, in_w, out_h, out_w, 2.0, &cubic)
+}
+
+/// PIL `Image.BILINEAR` resize of a uint8 RGB HWC image (SAM2's preprocessing filter). Returns
+/// f32 HWC, integer-valued `[0,255]`.
+pub fn resize_bilinear_u8(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<f32> {
+    resize_u8(src, in_h, in_w, out_h, out_w, 1.0, &triangle)
 }
 
 /// PIL `Image.LANCZOS` resize of a uint8 RGB HWC image (the fork's `scale_to_dimensions`). Returns
