@@ -682,6 +682,7 @@ dependencies = [
 name = "mlx-gen-sensenova"
 version = "0.0.0"
 dependencies = [
+ "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",
  "serde_json",

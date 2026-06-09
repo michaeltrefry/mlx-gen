@@ -40,6 +40,7 @@
 pub mod config;
 pub mod fm;
 pub mod loader;
+pub mod model;
 pub mod qwen3;
 pub mod runtime;
 pub mod t2i;
@@ -51,6 +52,7 @@ pub use fm::{
     apply_time_schedule, euler_step, patchify, unpatchify, velocity, FmHead, TimestepEmbedder,
 };
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
+pub use model::{descriptor, load, SenseNova, MODEL_ID};
 pub use qwen3::{KvCache, Path, Qwen3Backbone};
 pub use runtime::{Sampler, ThinkRollout};
 pub use t2i::{
