@@ -335,6 +335,20 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
+    // The production flow-match schedule needs >= 2 steps: at 1 step `qwen_sigmas`' terminal-sigma
+    // rescale divides by zero (`scale == 0`) and produces a `[NaN, 0.0]` schedule that silently
+    // renders garbage (F-113). Lightning's distilled few-step recipe is unaffected, so only guard the
+    // production path; an unset `steps` uses the safe `DEFAULT_STEPS`.
+    let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
+    if !is_lightning {
+        if let Some(steps) = req.steps {
+            if steps < 2 {
+                return Err(Error::Msg(format!(
+                    "qwen_image: steps must be >= 2 for the production sampler (got {steps})"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -386,6 +400,34 @@ mod tests {
             .expect_err("expected an error")
             .to_string();
         assert!(err.contains("unsupported sampler"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_production_steps_below_two() {
+        // F-113: 0/1 production steps make qwen_sigmas' terminal rescale divide by zero → NaN
+        // schedule. Reject them; Lightning few-step and the default (unset) path stay valid.
+        let caps = descriptor().capabilities;
+        let prod = |steps| GenerationRequest {
+            prompt: "a fox".into(),
+            steps,
+            ..Default::default()
+        };
+        for s in [Some(0), Some(1)] {
+            let err = validate_request(&caps, &prod(s))
+                .expect_err("expected an error")
+                .to_string();
+            assert!(err.contains("steps must be >= 2"), "steps {s:?} got: {err}");
+        }
+        assert!(validate_request(&caps, &prod(Some(2))).is_ok());
+        assert!(validate_request(&caps, &prod(None)).is_ok());
+        // Lightning at 1 step is fine (distilled few-step recipe).
+        let lightning = GenerationRequest {
+            prompt: "a fox".into(),
+            steps: Some(1),
+            sampler: Some(LIGHTNING_SAMPLER.into()),
+            ..Default::default()
+        };
+        assert!(validate_request(&caps, &lightning).is_ok());
     }
 
     #[test]
