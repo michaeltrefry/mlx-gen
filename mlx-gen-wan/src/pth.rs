@@ -599,6 +599,22 @@ fn tensor_byte_range(
     Ok((start, end, numel))
 }
 
+/// Enforce the module's documented **STORED-only** support scope (F-017): the `zip` crate
+/// transparently inflates DEFLATE (and other) entries, so a tiny compressed entry could expand to
+/// many GB — a decompression-bomb DoS — and `load_pth_f32` only checks the blob length *after* the
+/// full `read_to_end`. A STORED entry's reader yields exactly its on-disk bytes (no amplification),
+/// so refusing every other method bounds each read by the archive size.
+fn require_stored(method: zip::CompressionMethod, who: &str) -> Result<()> {
+    if method != zip::CompressionMethod::Stored {
+        return Err(Error::Msg(format!(
+            "{who}: zip entry uses {method:?} compression, but only STORED (uncompressed) entries \
+             are supported — a compressed entry could inflate a tiny archive to many GB \
+             (decompression-bomb DoS); re-export the checkpoint without zip compression"
+        )));
+    }
+    Ok(())
+}
+
 /// Load a torch `.pth` checkpoint, returning every tensor as an f32 MLX [`Array`] in PyTorch layout
 /// (`torch.load(...).float()` semantics). Conv-weight transposes + key renames are the caller's job.
 pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
@@ -618,9 +634,14 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
     let prefix = pkl_name.strip_suffix("data.pkl").unwrap().to_string();
 
     let mut pkl_bytes = Vec::new();
-    zip.by_name(&pkl_name)
-        .map_err(|e| Error::Msg(format!("read {pkl_name}: {e}")))?
-        .read_to_end(&mut pkl_bytes)?;
+    {
+        let mut pkl_entry = zip
+            .by_name(&pkl_name)
+            .map_err(|e| Error::Msg(format!("read {pkl_name}: {e}")))?;
+        require_stored(pkl_entry.compression(), &pkl_name)?;
+        pkl_bytes.reserve(pkl_entry.compressed_size() as usize);
+        pkl_entry.read_to_end(&mut pkl_bytes)?;
+    }
 
     let specs = parse_pickle(&pkl_bytes)?;
 
@@ -651,9 +672,14 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
         }
         let blob_name = format!("{prefix}data/{key}");
         let mut blob = Vec::new();
-        zip.by_name(&blob_name)
-            .map_err(|e| Error::Msg(format!("read storage {blob_name} for {name}: {e}")))?
-            .read_to_end(&mut blob)?;
+        {
+            let mut blob_entry = zip
+                .by_name(&blob_name)
+                .map_err(|e| Error::Msg(format!("read storage {blob_name} for {name}: {e}")))?;
+            require_stored(blob_entry.compression(), &blob_name)?;
+            blob.reserve(blob_entry.compressed_size() as usize);
+            blob_entry.read_to_end(&mut blob)?;
+        }
         if end > blob.len() {
             return Err(Error::Msg(format!(
                 "{name}: storage slice [{start}..{end}] exceeds blob len {} (offset {offset}, numel {numel})",
@@ -672,6 +698,20 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_stored_rejects_compressed_entries() {
+        // F-017: only STORED entries are accepted; a DEFLATE entry (the decompression-bomb vector)
+        // is rejected with a clear error before any read.
+        assert!(require_stored(zip::CompressionMethod::Stored, "x").is_ok());
+        // `DEFLATE` is `Unsupported(8)` here (the crate is built `default-features = false`, no
+        // inflater) — still the canonical non-STORED case to reject.
+        let err = require_stored(zip::CompressionMethod::DEFLATE, "data.pkl")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("STORED"), "got: {err}");
+        assert!(err.contains("decompression-bomb"), "got: {err}");
+    }
 
     #[test]
     fn f16_round_trip_known_values() {
