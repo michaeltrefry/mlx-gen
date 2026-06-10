@@ -846,28 +846,6 @@ impl Encoder3d {
         eval(&x)?;
         self.head.forward_cached(&x, cache)
     }
-
-    /// Debug bisection: like [`forward`](Self::forward) but records each stage output.
-    fn forward_capture(
-        &self,
-        x: &Array,
-        cache: &mut FeatCache,
-        out: &mut Vec<(String, Array)>,
-    ) -> Result<Array> {
-        let mut x = cached_conv(&self.conv1, x, cache)?;
-        out.push(("enc_conv1".into(), x.clone()));
-        for (i, stage) in self.downsamples.iter().enumerate() {
-            x = stage.forward(&x, cache)?;
-            out.push((format!("enc_down{i}"), x.clone()));
-        }
-        x = self.middle.0.forward_cached(&x, cache)?;
-        x = self.middle.1.forward(&x)?;
-        x = self.middle.2.forward_cached(&x, cache)?;
-        out.push(("enc_middle".into(), x.clone()));
-        let x = self.head.forward_cached(&x, cache)?;
-        out.push(("enc_head".into(), x.clone()));
-        Ok(x)
-    }
 }
 
 /// Spatial 2×2 patchify: `[B,T,2H,2W,C] → [B,T,H,W,C·4]` (channel pack order C, r, q).
@@ -1084,24 +1062,6 @@ impl Wan22Vae {
         let mu = slice_axis_cl(&out, 4, 0, self.z_dim)?;
         let normed = divide(&subtract(&mu, &self.mean)?, &self.std)?;
         contiguous(&normed)
-    }
-}
-
-impl Wan22Vae {
-    /// Debug bisection of [`encode`](Self::encode) for a **single-chunk** (`T = 1`) input: returns
-    /// `(stage, output)` after each encoder stage + the top conv1, for diffing against the reference.
-    pub fn encode_capture(&self, img_1thwc: &Array) -> Result<Vec<(String, Array)>> {
-        let (top_conv1, encoder) = self
-            .encoder
-            .as_ref()
-            .ok_or_else(|| Error::Msg("vae22: encode requires encoder weights".into()))?;
-        let x = patchify(img_1thwc, 2)?;
-        let mut cache = FeatCache::new(encoder.cache_slots);
-        let mut out = Vec::new();
-        let chunk = slice_t(&x, 0, 1)?;
-        let enc_out = encoder.forward_capture(&chunk, &mut cache, &mut out)?;
-        out.push(("top_conv1".into(), top_conv1.forward(&enc_out, None)?));
-        Ok(out)
     }
 }
 
