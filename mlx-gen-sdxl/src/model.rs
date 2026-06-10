@@ -393,24 +393,44 @@ impl Generator for Sdxl {
             None
         };
 
+        // Seed-independent conditioning + init encodes, hoisted above the per-image count loop
+        // (F-068): the dual-CLIP forwards and the f32 VAE encode draw no RNG, so re-running them per
+        // image was pure waste — the IP tokens above already follow this pattern. `random::seed` stays
+        // per-iteration so each image's init-noise stream still matches the reference.
+        let tokens = self
+            .tokenizer
+            .tokenize_batch(&req.prompt, if cfg_on { Some(negative) } else { None })?;
+        let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens)?;
+        let time_ids = text_time_ids(pooled.shape()[0]);
+        let latent_shape = [1, (req.height / 8) as i32, (req.width / 8) as i32, 4];
+        // img2img/inpaint init latents (the f32 VAE encode) and the inpaint mask are seed-independent
+        // too. `init_latents` is Some exactly for the ancestral img2img/inpaint paths — a Reference
+        // that is neither an accel run nor an IP image prompt; `mask_latent` adds the inpaint mask.
+        let init_latents = match reference {
+            Some((image, _)) if !is_accel && !ip_mode => Some(encode_init_latents(
+                &self.vae, image, req.width, req.height,
+            )?),
+            _ => None,
+        };
+        let mask_latent = match mask_img {
+            Some(mask) if init_latents.is_some() => {
+                Some(preprocess_mask(mask, req.width, req.height)?)
+            }
+            _ => None,
+        };
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             // One image per iteration (the vendored `_run_one`, n_images=1), each with its own seed.
             let seed = base_seed.wrapping_add(i as u64);
-            // Seed the global RNG up front. Conditioning + VAE-encode draw no RNG, so the first draw
-            // is the init noise (the prior / img2img add_noise) — matching the reference stream.
+            // Seed the global RNG up front; the hoisted conditioning/VAE encodes drew no RNG, so the
+            // first draw here is the init noise (the prior / img2img add_noise) — matching the
+            // reference stream.
             mlx_rs::random::seed(seed)?;
-
-            let tokens = self
-                .tokenizer
-                .tokenize_batch(&req.prompt, if cfg_on { Some(negative) } else { None })?;
-            let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens)?;
-            let time_ids = text_time_ids(pooled.shape()[0]);
 
             // Build the run's sampler + its seeded init latents. The denoise loop is driven entirely
             // by the sampler's own schedule (`sampler.num_steps()`), so the trait owns the per-step
             // timestep, the input scaling, and the step math.
-            let latent_shape = [1, (req.height / 8) as i32, (req.width / 8) as i32, 4];
             let (latents, sampler, blend): (
                 mlx_rs::Array,
                 Box<dyn DiffusionSampler + '_>,
@@ -421,17 +441,18 @@ impl Generator for Sdxl {
                 let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
                 let lat = s.scale_initial_noise(&noise)?;
                 (lat, s, None)
-            } else if let (Some((image, strength)), Some(mask)) = (reference, mask_img) {
+            } else if let (Some(x_0), Some(mask_latent)) = (&init_latents, &mask_latent) {
                 // Masked inpaint (sc-3057): same ancestral img2img start, but keep the FIXED prior
                 // noise so the per-step blend can pin the black (keep) region to the init noised to
                 // each step's σ. Default strength 0.85 (the worker's inpaint default).
-                let strength = strength.unwrap_or(INPAINT_DEFAULT_STRENGTH).clamp(0.0, 1.0);
-                let x_0 = encode_init_latents(&self.vae, image, req.width, req.height)?;
+                let strength = reference
+                    .and_then(|(_, s)| s)
+                    .unwrap_or(INPAINT_DEFAULT_STRENGTH)
+                    .clamp(0.0, 1.0);
                 let start_step = max_time * strength;
                 let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
-                let x_t = self.sampler.add_noise_with(&x_0, &noise, start_step)?;
+                let x_t = self.sampler.add_noise_with(x_0, &noise, start_step)?;
                 let eff = (steps as f32 * strength) as usize;
-                let mask_latent = preprocess_mask(mask, req.width, req.height)?;
                 // The kept region is noised to each step's "next" time `t_prev` (schedule[i].1).
                 let t_prev: Vec<f32> = self
                     .sampler
@@ -439,21 +460,29 @@ impl Generator for Sdxl {
                     .into_iter()
                     .map(|(_, tp)| tp)
                     .collect();
-                let blend = InpaintBlend::new(&self.sampler, mask_latent, x_0, noise, t_prev);
+                let blend = InpaintBlend::new(
+                    &self.sampler,
+                    mask_latent.clone(),
+                    x_0.clone(),
+                    noise,
+                    t_prev,
+                );
                 (
                     x_t,
                     Box::new(AncestralEuler::new(&self.sampler, eff, start_step)?),
                     Some(blend),
                 )
-            } else if let Some((image, strength)) = reference.filter(|_| !ip_mode) {
-                // img2img (ancestral; the vendored `generate_latents_from_image`): VAE-encode the
-                // init, start at `max_time·strength`, run `int(steps·strength)` steps — NO min-1
-                // floor (strength ≤ 1/steps ⇒ 0 steps ⇒ init returned unchanged, dodging the σ=0
-                // ancestral `σ_up` 0/0 → NaN).
-                let strength = strength.unwrap_or(DEFAULT_STRENGTH).clamp(0.0, 1.0);
-                let x_0 = encode_init_latents(&self.vae, image, req.width, req.height)?;
+            } else if let Some(x_0) = &init_latents {
+                // img2img (ancestral; the vendored `generate_latents_from_image`): start at
+                // `max_time·strength`, run `int(steps·strength)` steps — NO min-1 floor (strength ≤
+                // 1/steps ⇒ 0 steps ⇒ init returned unchanged, dodging the σ=0 ancestral `σ_up` 0/0
+                // → NaN).
+                let strength = reference
+                    .and_then(|(_, s)| s)
+                    .unwrap_or(DEFAULT_STRENGTH)
+                    .clamp(0.0, 1.0);
                 let start_step = max_time * strength;
-                let x_t = self.sampler.add_noise(&x_0, start_step)?;
+                let x_t = self.sampler.add_noise(x_0, start_step)?;
                 let eff = (steps as f32 * strength) as usize;
                 (
                     x_t,
