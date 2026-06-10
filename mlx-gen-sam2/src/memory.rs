@@ -19,6 +19,9 @@
 //!     at the [`MemoryAttention`] boundary; the layers transpose to batch-first internally.
 //!   * `nn.LayerNorm` uses eps `1e-5`; `LayerNorm2d` uses `1e-6`.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::nn::relu;
 use mlx_rs::ops::{
@@ -297,6 +300,57 @@ fn repeat_rows(t: &Array, repeat: i32) -> Result<Array> {
     Ok(t.reshape(&[n * repeat, c])?)
 }
 
+/// `(cos, sin)` RoPE tables, keyed by grid shape in the caches below.
+type RopeTables = (Array, Array);
+
+thread_local! {
+    /// Axial RoPE tables keyed by `(head_dim, end_x, end_y)`. Every caller in the per-frame video
+    /// loop hits a fixed 64×64 grid with a constant `head_dim`, so the ~1M host trig evaluations +
+    /// ~4 MB upload that `axial_rope_tables` performs run **once** instead of 8× per frame (F-167).
+    /// MLX `Array`s are ref-counted handles, so returning a cache hit is a cheap clone. Thread-local
+    /// so the cache needs no `Send`/`Sync` guarantees on `Array`.
+    static ROPE_TABLE_CACHE: RefCell<HashMap<(i32, i32, i32), RopeTables>> =
+        RefCell::new(HashMap::new());
+    /// The cross-attention `repeat_rows` variant keyed by `(head_dim, end_x, end_y, repeat)` — the
+    /// tiled tables are also constant across the video, so cache them too rather than re-tiling per
+    /// layer per frame.
+    static ROPE_REPEAT_CACHE: RefCell<HashMap<(i32, i32, i32, i32), RopeTables>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Memoized [`axial_rope_tables`] (F-167): the tables are a pure function of the key, so the first
+/// call for a given grid builds them and every later call returns a cheap handle clone.
+fn axial_rope_tables_cached(head_dim: i32, end_x: i32, end_y: i32) -> (Array, Array) {
+    let key = (head_dim, end_x, end_y);
+    if let Some(hit) = ROPE_TABLE_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let tables = axial_rope_tables(head_dim, end_x, end_y);
+    ROPE_TABLE_CACHE.with(|c| c.borrow_mut().insert(key, tables.clone()));
+    tables
+}
+
+/// The `repeat`-tiled axial RoPE tables for cross-attention, memoized (F-167). `repeat == 1` is the
+/// un-tiled base.
+fn axial_rope_tables_repeated(
+    head_dim: i32,
+    end_x: i32,
+    end_y: i32,
+    repeat: i32,
+) -> Result<(Array, Array)> {
+    if repeat == 1 {
+        return Ok(axial_rope_tables_cached(head_dim, end_x, end_y));
+    }
+    let key = (head_dim, end_x, end_y, repeat);
+    if let Some(hit) = ROPE_REPEAT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(hit);
+    }
+    let (cos, sin) = axial_rope_tables_cached(head_dim, end_x, end_y);
+    let tiled = (repeat_rows(&cos, repeat)?, repeat_rows(&sin, repeat)?);
+    ROPE_REPEAT_CACHE.with(|c| c.borrow_mut().insert(key, tiled.clone()));
+    Ok(tiled)
+}
+
 /// Apply interleaved axial RoPE to `x` `[b, heads, tokens, head_dim]`; `cos`/`sin` are
 /// `[tokens, head_dim/2]` (broadcast over batch/heads). Matches `apply_rope` (even/odd interleave).
 fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
@@ -376,7 +430,7 @@ impl RoPEAttention {
         } else {
             (q_len, 1)
         };
-        let (cos, sin) = axial_rope_tables(head_dim, end_x, end_y);
+        let (cos, sin) = axial_rope_tables_cached(head_dim, end_x, end_y);
         let repeat = if self.rope_k_repeat && q_len != 0 {
             k_len / q_len
         } else {
@@ -386,11 +440,7 @@ impl RoPEAttention {
         let q = apply_rope(&q, &cos, &sin)?;
         let rope_len = k_len - num_k_exclude_rope;
         let k = if rope_len > 0 {
-            let (ck, sk) = if repeat != 1 {
-                (repeat_rows(&cos, repeat)?, repeat_rows(&sin, repeat)?)
-            } else {
-                (cos, sin)
-            };
+            let (ck, sk) = axial_rope_tables_repeated(head_dim, end_x, end_y, repeat)?;
             let k_rope = apply_rope(&take_token_range(&k, 0, rope_len)?, &ck, &sk)?;
             if num_k_exclude_rope > 0 {
                 concatenate_axis(&[&k_rope, &take_token_range(&k, rope_len, k_len)?], 2)?
@@ -549,6 +599,25 @@ mod tests {
         let sumsq = add(ops::square(&cos).unwrap(), ops::square(&sin).unwrap()).unwrap();
         let one = Array::from_slice(&vec![1f32; 72], &[9, 8]);
         assert!(maxabs(&subtract(&sumsq, &one).unwrap()) < 1e-5);
+    }
+
+    /// The memoized RoPE-table accessors (F-167) must return tables bit-identical to the direct
+    /// `axial_rope_tables` / `repeat_rows` computations they cache — both on a cold miss and a warm hit.
+    #[test]
+    fn cached_rope_tables_match_direct_compute() {
+        let (cos_d, sin_d) = axial_rope_tables(16, 4, 4);
+        for _ in 0..2 {
+            // First iteration is a cache miss, second a hit — both must equal the direct compute.
+            let (cos_c, sin_c) = axial_rope_tables_cached(16, 4, 4);
+            assert!(maxabs(&subtract(&cos_c, &cos_d).unwrap()) == 0.0);
+            assert!(maxabs(&subtract(&sin_c, &sin_d).unwrap()) == 0.0);
+        }
+        // The repeated variant matches `repeat_rows` of the base, and `repeat == 1` is the base.
+        let (cos_r, sin_r) = axial_rope_tables_repeated(16, 4, 4, 3).unwrap();
+        assert!(maxabs(&subtract(&cos_r, repeat_rows(&cos_d, 3).unwrap()).unwrap()) == 0.0);
+        assert!(maxabs(&subtract(&sin_r, repeat_rows(&sin_d, 3).unwrap()).unwrap()) == 0.0);
+        let (cos_1, _) = axial_rope_tables_repeated(16, 4, 4, 1).unwrap();
+        assert!(maxabs(&subtract(&cos_1, &cos_d).unwrap()) == 0.0);
     }
 
     /// `repeat_rows` tiles each row consecutively: row `r` lands at output rows `r*repeat .. (r+1)*repeat`.

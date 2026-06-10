@@ -11,6 +11,7 @@
 //! wrapped to transpose to MLX's NHWC and back. Token tensors `[b, n, c]` are layout-agnostic.
 
 use std::f32::consts::PI;
+use std::sync::OnceLock;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::nn::relu;
@@ -173,6 +174,8 @@ pub struct PromptEncoder {
     embed_dim: i32,
     image_embedding: i32,  // square grid side (64)
     input_image_size: i32, // 1024
+    /// Cached dense grid PE — a constant of `image_embedding` recomputed per frame otherwise (F-167).
+    dense_pe_cache: OnceLock<Array>,
 }
 
 /// The five mask-prompt downscaling layers (`PromptEncoder._embed_masks`).
@@ -209,13 +212,23 @@ impl PromptEncoder {
             embed_dim: 256,
             image_embedding: 64,
             input_image_size: 1024,
+            dense_pe_cache: OnceLock::new(),
         })
     }
 
-    /// Dense grid position encoding `[1, embed_dim, grid, grid]` (the decoder's `image_pe`).
+    /// Dense grid position encoding `[1, embed_dim, grid, grid]` (the decoder's `image_pe`). Constant
+    /// for a loaded model, so it is built once and cached — the image segmenter and every frame of the
+    /// video loop reuse the same tensor instead of recomputing it (F-167).
     pub fn dense_pe(&self) -> Result<Array> {
-        self.pe_layer
-            .dense_pe(self.image_embedding, self.image_embedding)
+        if let Some(pe) = self.dense_pe_cache.get() {
+            return Ok(pe.clone());
+        }
+        let pe = self
+            .pe_layer
+            .dense_pe(self.image_embedding, self.image_embedding)?;
+        // A race-loser's `set` returns Err; both computed the identical constant, so ignore it.
+        let _ = self.dense_pe_cache.set(pe.clone());
+        Ok(pe)
     }
 
     /// Embed `points` `[b, n, 2]` (pixel space) with int `labels` `[b, n]`, padding one
