@@ -314,6 +314,11 @@ pub(crate) fn render_batch(
     on_progress: &mut dyn FnMut(Progress),
     mut denoise: impl FnMut(Array, &mut dyn FnMut(Progress)) -> Result<Array>,
 ) -> Result<Vec<Image>> {
+    // sc-2963 (rollout of sc-2957): run the DiT's fusable elementwise glue through `mx.compile` —
+    // bit-exact and a per-step win. sc-4036/F-036: enable it ONCE for the whole render via an RAII
+    // guard (was redundantly re-set every image) that restores the prior process-global on return,
+    // so code after `generate` (e.g. the eager reference-parity gates) doesn't inherit it left on.
+    let _compile_glue = crate::CompileGlueGuard::enable();
     let mut images = Vec::with_capacity(req.count as usize);
     for i in 0..req.count {
         // Distinct seed per image in a batch (the fork's `seed + i`). PARITY-BF16 (sc-2609): the noise
@@ -336,9 +341,6 @@ pub(crate) fn render_batch(
             }
             None => noise,
         };
-        // sc-2963 (rollout of sc-2957): run the DiT's fusable elementwise glue through `mx.compile` —
-        // bit-exact and a per-step win. Enabled at the production boundary; process-global, idempotent.
-        crate::set_compile_glue(true);
         let latents = denoise(latents, on_progress)?;
 
         on_progress(Progress::Decoding);

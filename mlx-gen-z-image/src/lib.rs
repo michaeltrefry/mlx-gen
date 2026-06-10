@@ -79,3 +79,59 @@ pub fn set_compile_glue(on: bool) {
 pub(crate) fn compile_glue() -> bool {
     COMPILE_GLUE.load(Ordering::Relaxed)
 }
+
+/// RAII guard (sc-4036 / F-036) that enables compiled glue for its lifetime and restores the prior
+/// `COMPILE_GLUE` value on drop. The production render holds one across the whole count loop so the
+/// toggle is set once (not redundantly per image) and — unlike a bare [`set_compile_glue`]`(true)`
+/// that leaked the process-global on — code running after `generate` returns (e.g. the
+/// reference-parity gates the doc above promises run eager) sees the toggle restored, even on an
+/// early `?` return.
+#[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
+pub(crate) struct CompileGlueGuard {
+    prev: bool,
+}
+
+impl CompileGlueGuard {
+    /// Turn compiled glue on, remembering the prior value to restore on drop.
+    pub(crate) fn enable() -> Self {
+        Self {
+            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for CompileGlueGuard {
+    fn drop(&mut self) {
+        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod compile_glue_guard_tests {
+    use super::{compile_glue, set_compile_glue, CompileGlueGuard};
+
+    // Single-threaded test runner (`.cargo/config.toml` RUST_TEST_THREADS=1) makes the
+    // process-global `COMPILE_GLUE` safe to assert on, matching the existing `set_compile_glue`
+    // A/B tests in feed_forward / control_transformer.
+    #[test]
+    fn guard_enables_then_restores_prior_value() {
+        // Prior off → on within scope → restored off on drop (the doc's "eager by default" intent).
+        set_compile_glue(false);
+        {
+            let _g = CompileGlueGuard::enable();
+            assert!(compile_glue(), "guard enables compiled glue for its scope");
+        }
+        assert!(!compile_glue(), "guard restores the prior (off) on drop");
+
+        // Restores the *prior* value, not a hardcoded false: prior on stays on after drop.
+        set_compile_glue(true);
+        {
+            let _g = CompileGlueGuard::enable();
+            assert!(compile_glue());
+        }
+        assert!(compile_glue(), "guard restores the prior (on) on drop");
+
+        // Leave the global eager, as the reference-parity gates expect.
+        set_compile_glue(false);
+    }
+}
