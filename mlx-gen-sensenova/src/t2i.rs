@@ -1203,6 +1203,17 @@ impl T2iModel {
         let l = token_h * token_w;
         let (cache_cond, cond_t) = cond;
 
+        // `cfg_scale`/`img_cfg_scale` > 1 demand the corresponding caches; this is a `pub` method, so
+        // an external caller can ask for guidance without supplying them. Fail fast with a typed error
+        // (mirroring `it2i_generate`'s `needs_*` flags) instead of unwrap-panicking mid-loop (F-126).
+        let (needs_img, needs_uncond) = it2i_cache_requirements(opts.cfg_scale, opts.img_cfg_scale);
+        if needs_img && img.is_none() {
+            return Err(img_cache_err());
+        }
+        if needs_uncond && uncond.is_none() {
+            return Err(uncond_cache_err());
+        }
+
         let noise_scale = self.noise_scale_for(grid_h, grid_w);
         let mut image = multiply(
             &base_noise.as_dtype(Dtype::Float32)?,
@@ -1246,14 +1257,14 @@ impl T2iModel {
             let mut v_pred = if !use_cfg || (cfg == 1.0 && img_cfg == 1.0) {
                 out_cond.clone()
             } else if img_cfg == 1.0 {
-                let (c, tl) = img.as_mut().unwrap();
+                let (c, tl) = img.as_mut().ok_or_else(img_cache_err)?;
                 let oi = self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?;
                 add(
                     &oi,
                     &multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?,
                 )?
             } else if cfg == img_cfg {
-                let (c, tl) = uncond.as_mut().unwrap();
+                let (c, tl) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
                 let ou = self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?;
                 add(
                     &ou,
@@ -1261,11 +1272,11 @@ impl T2iModel {
                 )?
             } else {
                 let oi = {
-                    let (c, tl) = img.as_mut().unwrap();
+                    let (c, tl) = img.as_mut().ok_or_else(img_cache_err)?;
                     self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?
                 };
                 let ou = {
-                    let (c, tl) = uncond.as_mut().unwrap();
+                    let (c, tl) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
                     self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?
                 };
                 let a = multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?;
@@ -1287,6 +1298,30 @@ impl T2iModel {
         }
         Ok(traj)
     }
+}
+
+/// `(needs_img, needs_uncond)`: which extra caches `it2i_denoise` requires for the given guidance
+/// scales. Mirrors the `needs_*` flags `it2i_generate` uses to decide which caches to build, so the
+/// denoise guard and the cache construction agree (F-126).
+fn it2i_cache_requirements(cfg_scale: f32, img_cfg_scale: f32) -> (bool, bool) {
+    let needs_cfg = !(cfg_scale == 1.0 && img_cfg_scale == 1.0);
+    let needs_img = needs_cfg && (img_cfg_scale == 1.0 || cfg_scale != img_cfg_scale);
+    let needs_uncond = needs_cfg && img_cfg_scale != 1.0;
+    (needs_img, needs_uncond)
+}
+
+fn img_cache_err() -> Error {
+    Error::Msg(
+        "it2i_denoise: image-CFG guidance needs an image-conditioned cache (`img`), but none was \
+         supplied"
+            .into(),
+    )
+}
+
+fn uncond_cache_err() -> Error {
+    Error::Msg(
+        "it2i_denoise: guidance needs an uncond cache (`uncond`), but none was supplied".into(),
+    )
 }
 
 /// Blend condition/uncondition velocities under the chosen [`CfgNorm`].
@@ -1452,6 +1487,18 @@ mod tests {
     fn slice(a: &Array) -> Vec<f32> {
         let n = a.shape().iter().product::<i32>();
         a.reshape(&[n]).unwrap().as_slice::<f32>().to_vec()
+    }
+
+    #[test]
+    fn it2i_cache_requirements_match_guidance_scales() {
+        // F-126: the denoise guard's cache requirements must match it2i_generate's needs_* flags.
+        assert_eq!(it2i_cache_requirements(1.0, 1.0), (false, false)); // no guidance
+        assert_eq!(it2i_cache_requirements(4.0, 1.0), (true, false)); // image-CFG only
+        assert_eq!(it2i_cache_requirements(4.0, 4.0), (false, true)); // uncond only
+        assert_eq!(it2i_cache_requirements(4.0, 2.0), (true, true)); // dual guidance
+                                                                     // The error builders name the missing cache so a caller knows what to pass.
+        assert!(img_cache_err().to_string().contains("img"));
+        assert!(uncond_cache_err().to_string().contains("uncond"));
     }
 
     #[test]
