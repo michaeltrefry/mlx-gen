@@ -85,6 +85,10 @@ struct LtxLoraTarget {
 /// image dataset to (normalized latent, prompt-embed) pairs, then runs the functional-autograd
 /// rectified-flow loop with the sc-3043 runtime glue, and writes a LoRA that round-trips through
 /// [`crate::apply_ltx_adapters`].
+///
+/// **Single-use** (F-055): `train` frees the Gemma text encoder + tokenizer (~24 GB) after the
+/// embed cache, so the instance cannot run a second job — `validate` (hence `train`) rejects a reuse
+/// up front. Construct a fresh trainer (via [`load_trainer`]) per job.
 pub struct LtxTrainer {
     descriptor: TrainerDescriptor,
     /// Freed after the one-time prompt-embed cache (the 24 GB Gemma backbone), before the loop.
@@ -163,35 +167,54 @@ inventory::submit! {
     TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer }
 }
 
+/// Capability-free request validation, factored out of [`Trainer::validate`] so it can be
+/// unit-tested without a loaded trainer. Rejects an empty dataset, zero rank, LoKr (LoRA-only
+/// trainer), and unsupported optimizers. The single-use / text-encoder-present check stays in
+/// [`Trainer::validate`], which has the trainer state to inspect (F-055).
+fn validate_request(req: &TrainingRequest) -> Result<()> {
+    if req.items.is_empty() {
+        return Err("ltx_2_3 trainer: dataset is empty".into());
+    }
+    if req.config.rank == 0 {
+        return Err("ltx_2_3 trainer: rank must be > 0".into());
+    }
+    if req.config.network_type == NetworkType::Lokr {
+        return Err(
+            "ltx_2_3 trainer: LoKr training is not supported — the reference LTX MLX \
+                    trainer is LoRA-only. (LTX *inference* supports LoKr via sc-2393, but no \
+                    LoKr trainer exists yet; that would be a separate extension.)"
+                .into(),
+        );
+    }
+    if !TrainOptimizer::is_supported(&req.config.optimizer) {
+        return Err(format!(
+            "ltx_2_3 trainer: optimizer '{}' is not available on MLX training (supported: \
+             adamw, adam, rose, prodigy)",
+            req.config.optimizer
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl Trainer for LtxTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> Result<()> {
-        if req.items.is_empty() {
-            return Err("ltx_2_3 trainer: dataset is empty".into());
-        }
-        if req.config.rank == 0 {
-            return Err("ltx_2_3 trainer: rank must be > 0".into());
-        }
-        if req.config.network_type == NetworkType::Lokr {
+        // Single-use enforcement (F-055): `train` frees the Gemma text encoder + tokenizer (~24 GB)
+        // after the embed cache, so a second `train` on the same instance can't re-encode. Fail here,
+        // up front (validate runs before any progress is emitted), instead of with a late, confusing
+        // "text encoder missing" mid-run. Construct a fresh trainer (via `load_trainer`) per job.
+        if self.text_encoder.is_none() || self.tokenizer.is_none() {
             return Err(
-                "ltx_2_3 trainer: LoKr training is not supported — the reference LTX MLX \
-                        trainer is LoRA-only. (LTX *inference* supports LoKr via sc-2393, but no \
-                        LoKr trainer exists yet; that would be a separate extension.)"
+                "ltx_2_3 trainer: single-use — the Gemma text encoder was freed after the \
+                        first train() to reclaim ~24 GB; construct a fresh trainer for each job"
                     .into(),
             );
         }
-        if !TrainOptimizer::is_supported(&req.config.optimizer) {
-            return Err(format!(
-                "ltx_2_3 trainer: optimizer '{}' is not available on MLX training (supported: \
-                 adamw, adam, rose, prodigy)",
-                req.config.optimizer
-            )
-            .into());
-        }
-        Ok(())
+        validate_request(req)
     }
 
     fn train(
@@ -564,4 +587,45 @@ fn decode_image(path: &Path) -> Result<Image> {
         height,
         pixels: rgb.into_raw(),
     })
+}
+
+#[cfg(test)]
+mod validate_request_tests {
+    use super::validate_request;
+    use mlx_gen::{NetworkType, TrainingConfig, TrainingItem, TrainingRequest};
+    use std::path::PathBuf;
+
+    fn request(items: usize) -> TrainingRequest {
+        TrainingRequest {
+            items: (0..items)
+                .map(|i| TrainingItem {
+                    image_path: PathBuf::from(format!("img{i}.png")),
+                    caption: "a cat".into(),
+                })
+                .collect(),
+            config: TrainingConfig::default(),
+            output_dir: PathBuf::from("/tmp/ltx-trainer-test"),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        }
+    }
+
+    #[test]
+    fn accepts_valid_and_rejects_bad_requests() {
+        assert!(validate_request(&request(1)).is_ok());
+        assert!(validate_request(&request(0)).is_err()); // empty dataset
+
+        let mut r = request(1);
+        r.config.rank = 0;
+        assert!(validate_request(&r).is_err()); // zero rank
+
+        let mut r = request(1);
+        r.config.network_type = NetworkType::Lokr;
+        assert!(validate_request(&r).is_err()); // LoKr is LoRA-only here
+
+        let mut r = request(1);
+        r.config.optimizer = "sgd".into();
+        assert!(validate_request(&r).is_err()); // unsupported optimizer
+    }
 }
