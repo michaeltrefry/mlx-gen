@@ -662,6 +662,14 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             req.count, caps.max_count
         )));
     }
+    // An explicit `steps: Some(0)` would run a 0-step denoise and VAE-decode pure scaled noise, so
+    // reject it (the crate's reject-loudly philosophy; F-073). A *derived* 0 from img2img
+    // `int(steps·strength)` is a legitimate no-op (returns the init) and is NOT this case.
+    if req.steps == Some(0) {
+        return Err(Error::Msg(
+            "sdxl: steps must be >= 1 (an explicit 0 renders undenoised noise)".into(),
+        ));
+    }
     if req.width < caps.min_size
         || req.height < caps.min_size
         || req.width > caps.max_size
@@ -744,6 +752,31 @@ mod tests {
         let req = GenerationRequest::default(); // default prompt is empty
         let err = validate_request(&caps, &req).unwrap_err().to_string();
         assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_explicit_zero_steps() {
+        let caps = descriptor().capabilities;
+        // F-073: an explicit `steps: Some(0)` would VAE-decode pure scaled noise → reject loudly.
+        let zero = GenerationRequest {
+            prompt: "a fox".into(),
+            steps: Some(0),
+            ..Default::default()
+        };
+        let err = validate_request(&caps, &zero).unwrap_err().to_string();
+        assert!(err.contains("steps"), "got: {err}");
+        // `steps: None` (use the production default) and an explicit positive count are accepted.
+        let unset = GenerationRequest {
+            prompt: "a fox".into(),
+            ..Default::default()
+        };
+        assert!(validate_request(&caps, &unset).is_ok());
+        let one = GenerationRequest {
+            prompt: "a fox".into(),
+            steps: Some(1),
+            ..Default::default()
+        };
+        assert!(validate_request(&caps, &one).is_ok());
     }
 
     #[test]
