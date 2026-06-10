@@ -2,8 +2,6 @@
 //! dual-stream joint blocks, single-stream blocks, FLUX RoPE, time/text/guidance embedding, and
 //! output AdaLayerNorm.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{gelu_tanh, silu};
@@ -12,7 +10,7 @@ use mlx_gen::Result;
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::nn::gelu;
-use mlx_rs::ops::{add, concatenate_axis, divide, multiply, power, split, subtract, tanh};
+use mlx_rs::ops::{add, concatenate_axis, divide, multiply, power, split, tanh};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
@@ -27,51 +25,22 @@ const LN_EPS: f32 = 1e-6;
 // bias in every attention block that compounds across the 19 joint + 38 single blocks.
 const RMS_EPS: f32 = 1e-5;
 
-/// sc-2963 (rollout of the Wan sc-2957 template): when on, the FLUX.1 MMDiT's fusable elementwise
-/// *glue* — adaLN affine (`norm·(1+scale)+shift`), gated residual (`x+gate·y`), the tanh-GELU FFN
-/// activation, and the complex RoPE rotation — runs through `mx.compile` so MLX fuses each chain into
-/// a single Metal kernel (vs one kernel per primitive op when eager). The big GEMMs / SDPA / `mx.fast`
-/// norms stay eager, and the image-FFN exact `gelu` is **already** internally `mx.compile`'d by mlx-rs
-/// (`compiled_gelu`). **Bit-exact** to the eager form (`compile_parity.rs` gates `max|Δ|=0`).
-/// **Enabled by the production denoise loop** ([`crate::model`]); **off by default**.
-static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+// sc-2963 compiled-glue toggle + the `modulate`/`gated`/`rope_rotate` helpers are hoisted into core
+// (F-101) so FLUX.1/FLUX.2 share one implementation. Re-export the toggle as this crate's public API;
+// the per-family dtype policy (FLUX.1 casts the modulate `1` to scale's dtype, sc-2787) is the
+// `one_matches_scale = true` argument below. The tanh-GELU FFN glue (`gelu_ffn`) stays crate-specific.
+use mlx_gen::nn::compile_glue;
+pub use mlx_gen::nn::set_compile_glue;
 
-/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
-pub fn set_compile_glue(on: bool) {
-    COMPILE_GLUE.store(on, Ordering::Relaxed);
-}
-
-pub(crate) fn compile_glue() -> bool {
-    COMPILE_GLUE.load(Ordering::Relaxed)
-}
-
-/// adaLN affine `normed·(1+scale)+shift` (`scale`/`shift` pre-broadcast to `[B,1,D]`). One fused
-/// kernel when the sc-2963 glue toggle is on. The `1` is cast to `scale`'s dtype before the add — the
-/// fork's weak python `1` adopts the (bf16) modulation dtype so `1+scale` rounds in bf16 (coarse near
-/// 1.0, spacing ~2⁻⁷); a strong f32 `1` would promote the sum to f32 and break bf16 parity (sc-2787).
+/// adaLN affine `normed·(1+scale)+shift` — FLUX.1 casts the `1` to `scale`'s dtype (bf16-coarse,
+/// sc-2787). Forwards to the shared [`mlx_gen::nn::modulate`].
 fn modulate(normed: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    let f = |(n, s, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        let one = scalar(1.0).as_dtype(s.dtype())?;
-        add(&multiply(n, &add(s, &one)?)?, sh)
-    };
-    if compile_glue() {
-        Ok(compile(f, true)((normed, scale, shift))?)
-    } else {
-        Ok(f((normed, scale, shift))?)
-    }
+    mlx_gen::nn::modulate(normed, scale, shift, true)
 }
 
-/// Gated residual `x + gate·y` (`gate` pre-broadcast to `[B,1,D]`) — one fused kernel when the
-/// sc-2963 glue toggle is on; bit-identical to the eager `add(x, gate·y)`.
+/// Gated residual `x + gate·y`. Forwards to the shared [`mlx_gen::nn::gated`].
 fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
-    let f = |(x, g, y): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(x, &multiply(g, y)?)
-    };
-    if compile_glue() {
-        Ok(compile(f, true)((x, gate, y))?)
-    } else {
-        Ok(f((x, gate, y))?)
-    }
+    mlx_gen::nn::gated(x, gate, y)
 }
 
 /// The tanh-GELU FFN activation. Body mirrors [`mlx_gen::nn::gelu_tanh`] exactly (dtype-preserving,
@@ -93,24 +62,10 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
     Ok(compile(f, true)(x)?)
 }
 
-/// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`, in f32. Fused
-/// into one kernel when the sc-2963 glue toggle is on (vs 6 eager ops, applied to q and k / block).
+/// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`, in f32.
+/// Forwards to the shared [`mlx_gen::nn::rope_rotate`].
 fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
-        let (r, i, c, s) = (&inp[0], &inp[1], &inp[2], &inp[3]);
-        let out0 = subtract(&multiply(r, c)?, &multiply(i, s)?)?;
-        let out1 = add(&multiply(i, c)?, &multiply(r, s)?)?;
-        Ok(vec![out0, out1])
-    };
-    let args = [real.clone(), imag.clone(), cos.clone(), sin.clone()];
-    let mut out = if compile_glue() {
-        compile(f, true)(&args)?
-    } else {
-        f(&args)?
-    };
-    let out1 = out.pop().unwrap();
-    let out0 = out.pop().unwrap();
-    Ok((out0, out1))
+    mlx_gen::nn::rope_rotate(real, imag, cos, sin)
 }
 
 pub struct FluxTransformerConfig {
