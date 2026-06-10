@@ -285,32 +285,4 @@ impl Autoencoder {
         let mean = moments.take_axis(&idx, 3)?;
         Ok(multiply(&mean, scalar(self.scaling_factor))?)
     }
-
-    /// Full `encode_mean` plus the log-variance (the vendored `encode` second return), for callers
-    /// that sample. `logvar = raw_logvar + 2·ln(scaling_factor)`.
-    pub fn encode_moments(&self, x: &Array) -> Result<(Array, Array)> {
-        let moments = self.quant_proj.forward(&self.encoder.forward(x)?)?;
-        let c = moments.shape()[3];
-        let half = c / 2;
-        let mean_idx = Array::from_slice(&(0..half).collect::<Vec<i32>>(), &[half]);
-        let lv_idx = Array::from_slice(&(half..c).collect::<Vec<i32>>(), &[half]);
-        let mean = multiply(
-            &moments.take_axis(&mean_idx, 3)?,
-            scalar(self.scaling_factor),
-        )?;
-        let logvar = add(
-            &moments.take_axis(&lv_idx, 3)?,
-            scalar(2.0 * self.scaling_factor.ln()),
-        )?;
-        Ok((mean, logvar))
-    }
-
-    /// Quantize the VAE's Linear projections (the quant/post-quant + mid-attention projections) to
-    /// Q4/Q8. Convs stay dense. (SDXL's reference VAE runs fp32; this is exposed for the Q-path
-    /// scope decision in sc-2641.)
-    pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.quant_proj.quantize(bits, None)?;
-        self.post_quant_proj.quantize(bits, None)?;
-        Ok(())
-    }
 }

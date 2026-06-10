@@ -96,7 +96,7 @@ impl EulerSampler {
     }
 
     /// Linearly interpolate the sigma table at the (float) time `t` (the vendored `_interp`), host
-    /// f32. Used for `init_noise_scale` + tests; the denoise math uses [`Self::sigma_arr`] so the
+    /// f32. Used in tests; the denoise math uses [`Self::sigma_arr`] so the
     /// interp runs through MLX (bit-exact to the reference at non-integer `t` — sc-2400 S6).
     pub fn sigma(&self, t: f32) -> f32 {
         let last = self.sigmas.len() - 1;
@@ -158,12 +158,6 @@ impl EulerSampler {
             }
         }
         steps.windows(2).map(|w| (w[0], w[1])).collect()
-    }
-
-    /// The latent-noise scale for `sample_prior`: `σ_last · (σ_last² + 1)^-0.5` (host f32; for tests).
-    pub fn init_noise_scale(&self) -> f32 {
-        let s = *self.sigmas.last().unwrap();
-        s * (s * s + 1.0).powf(-0.5)
     }
 
     /// Sample the prior latents `noise · σ_last · (σ_last² + 1).rsqrt()` (f32, global RNG). `shape`

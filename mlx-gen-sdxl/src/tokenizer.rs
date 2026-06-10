@@ -192,14 +192,6 @@ impl ClipBpeTokenizer {
         }
         Ok(Array::from_slice(&flat, &[batch, n as i32]))
     }
-
-    pub fn bos_id(&self) -> i32 {
-        self.bos_id
-    }
-
-    pub fn eos_id(&self) -> i32 {
-        self.eos_id
-    }
 }
 
 /// Replace every run of (unicode) whitespace with a single ASCII space — the vendored
