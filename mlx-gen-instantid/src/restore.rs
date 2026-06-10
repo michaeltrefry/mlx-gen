@@ -36,57 +36,69 @@ pub fn feather_mask(crop_w: usize, crop_h: usize) -> Vec<f32> {
             }
         }
     }
-    let radius = (crop_w / 12).max(4) as f64;
-    gaussian_blur(&mask, crop_w, crop_h, radius)
+    let radius = (crop_w / 12).max(4);
+    feather_blur(&mask, crop_w, crop_h, radius)
 }
 
-/// Separable Gaussian blur of a single-channel image (clamp-to-edge), `sigma` = the blur radius. The
-/// kernel half-width is `ceil(3·sigma)`. Used to feather the elliptical mask.
-fn gaussian_blur(img: &[f32], w: usize, h: usize, sigma: f64) -> Vec<f32> {
-    if sigma <= 0.0 {
+/// Feather a single-channel mask (clamp-to-edge) with a **3-pass separable box-blur cascade**. Three
+/// iterated box blurs approximate a Gaussian (central-limit) of effective σ ≈ `radius`, but each pass
+/// costs a constant ~4 ops per pixel via a sliding running sum — vs the `O(radius)` taps of the old
+/// direct Gaussian convolution, whose half-width `ceil(3σ)` made the feather scale `O(crop³)` (≈1s on
+/// a 1024² crop, F-091). The composite gate is directional (a smooth feather, not bit-parity vs PIL),
+/// which a box cascade satisfies.
+fn feather_blur(img: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+    if radius == 0 || w == 0 || h == 0 {
         return img.to_vec();
     }
-    let radius = (3.0 * sigma).ceil() as isize;
-    // 1-D Gaussian kernel, normalized.
-    let mut kernel = vec![0f64; (2 * radius + 1) as usize];
-    let two_s2 = 2.0 * sigma * sigma;
-    let mut sum = 0.0;
-    for (i, k) in kernel.iter_mut().enumerate() {
-        let d = i as isize - radius;
-        *k = (-(d * d) as f64 / two_s2).exp();
-        sum += *k;
+    let mut a = img.to_vec();
+    let mut b = vec![0f32; w * h];
+    for _ in 0..3 {
+        box_blur_h(&a, &mut b, w, h, radius);
+        box_blur_v(&b, &mut a, w, h, radius);
     }
-    for k in &mut kernel {
-        *k /= sum;
-    }
+    a
+}
 
-    let clamp = |v: isize, hi: usize| -> usize { v.max(0).min(hi as isize - 1) as usize };
-
-    // Horizontal pass.
-    let mut tmp = vec![0f32; w * h];
+/// Horizontal box blur (window `2·r+1`, clamp-to-edge) via a sliding running sum: `src → dst`.
+// The loop index drives the sliding-window bounds (`add`/`rem`), so it can't be an iterator.
+#[allow(clippy::needless_range_loop)]
+fn box_blur_h(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+    let norm = 1.0 / (2 * r + 1) as f64;
+    let last = w as isize - 1;
     for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0f64;
-            for (i, &k) in kernel.iter().enumerate() {
-                let sx = clamp(x as isize + i as isize - radius, w);
-                acc += k * img[y * w + sx] as f64;
-            }
-            tmp[y * w + x] = acc as f32;
+        let row = &src[y * w..y * w + w];
+        let out = &mut dst[y * w..y * w + w];
+        // Initial window [-r, r] for x = 0 (clamped to the edge).
+        let mut sum: f64 = (-(r as isize)..=r as isize)
+            .map(|j| row[j.clamp(0, last) as usize] as f64)
+            .sum();
+        out[0] = (sum * norm) as f32;
+        for x in 1..w {
+            // Slide: drop the pixel leaving on the left, add the one entering on the right.
+            let add = (x as isize + r as isize).min(last) as usize;
+            let rem = (x as isize - 1 - r as isize).max(0) as usize;
+            sum += row[add] as f64 - row[rem] as f64;
+            out[x] = (sum * norm) as f32;
         }
     }
-    // Vertical pass.
-    let mut out = vec![0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0f64;
-            for (i, &k) in kernel.iter().enumerate() {
-                let sy = clamp(y as isize + i as isize - radius, h);
-                acc += k * tmp[sy * w + x] as f64;
-            }
-            out[y * w + x] = acc as f32;
+}
+
+/// Vertical box blur (window `2·r+1`, clamp-to-edge) via a sliding running sum: `src → dst`.
+fn box_blur_v(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+    let norm = 1.0 / (2 * r + 1) as f64;
+    let last = h as isize - 1;
+    for x in 0..w {
+        let mut sum: f64 = (-(r as isize)..=r as isize)
+            .map(|j| src[j.clamp(0, last) as usize * w + x] as f64)
+            .sum();
+        dst[x] = (sum * norm) as f32;
+        for y in 1..h {
+            let add = (y as isize + r as isize).min(last) as usize;
+            let rem = (y as isize - 1 - r as isize).max(0) as usize;
+            sum += src[add * w + x] as f64 - src[rem * w + x] as f64;
+            dst[y * w + x] = (sum * norm) as f32;
         }
     }
-    out
 }
 
 /// Alpha-composite a `crop_w × crop_h` RGB8 patch `small` onto `base` at top-left `(ax, ay)`, using
@@ -151,6 +163,38 @@ mod tests {
         );
         // No hard edge: every value is a valid, finite alpha in [0, 1].
         assert!(m.iter().all(|&v| (0.0..=1.0).contains(&v)));
+    }
+
+    /// F-091: the sliding-running-sum box blur must equal a direct clamp-to-edge windowed average,
+    /// and a constant image must blur to itself (catches a normalization / window-bounds bug).
+    #[test]
+    fn box_blur_matches_direct_average() {
+        let (w, h, r) = (5usize, 4usize, 1usize);
+        let img: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
+        let mut got = vec![0f32; w * h];
+        box_blur_h(&img, &mut got, w, h, r);
+
+        let last = w as isize - 1;
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0f64;
+                for j in -(r as isize)..=r as isize {
+                    let sx = (x as isize + j).clamp(0, last) as usize;
+                    acc += img[y * w + sx] as f64;
+                }
+                let want = (acc / (2 * r + 1) as f64) as f32;
+                assert!(
+                    (got[y * w + x] - want).abs() < 1e-5,
+                    "box_blur_h[{x},{y}] {} vs {want}",
+                    got[y * w + x]
+                );
+            }
+        }
+
+        // A constant feathered image stays constant (3-pass cascade, any radius).
+        let flat = vec![0.7f32; w * h];
+        let blurred = feather_blur(&flat, w, h, 2);
+        assert!(blurred.iter().all(|&v| (v - 0.7).abs() < 1e-5));
     }
 
     /// sc-3380: alpha paste-back is a straight per-pixel blend — α=1 replaces, α=0 keeps.
