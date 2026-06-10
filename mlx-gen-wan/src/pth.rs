@@ -77,6 +77,46 @@ enum Val {
     },
 }
 
+/// Upper bound on opcodes executed by [`parse_pickle`]. A `data.pkl` from even a large checkpoint
+/// is a flat `{name: tensor}` dict — millions of opcodes is already far past any legitimate file,
+/// so this caps a stream that loops or never reaches `STOP`.
+const MAX_PICKLE_OPCODES: u64 = 64 * 1024 * 1024;
+
+/// Cumulative budget on [`Val`] nodes *materialized by clones* (memoize / fetch). The memo clones
+/// values in and out by deep copy, and `TUPLE*` nest them, so a crafted pickle can `BINGET` a value,
+/// pair it with `TUPLE2`, and `BINPUT` the result — doubling the in-memory structure every ~6 bytes
+/// (a "billion-laughs" amplification) and demanding `2^O(n)` memory before any tensor validation runs.
+/// Charging each clone against this budget — *before* the clone is made — bounds both the resident
+/// memory and the total work to `O(budget)`. A real state dict materializes well under a million such
+/// nodes, so 8M is ~8× headroom while still tripping the amplification within a couple dozen doublings.
+const MAX_PICKLE_NODES: u64 = 8 * 1024 * 1024;
+
+/// Count the [`Val`] nodes in a value (itself plus every nested element), used to charge clones
+/// against [`MAX_PICKLE_NODES`].
+fn count_nodes(v: &Val) -> u64 {
+    match v {
+        Val::Tuple(items) => 1 + items.iter().map(count_nodes).sum::<u64>(),
+        Val::Dict(items) => {
+            1 + items
+                .iter()
+                .map(|(k, val)| count_nodes(k) + count_nodes(val))
+                .sum::<u64>()
+        }
+        _ => 1,
+    }
+}
+
+/// Add `n` to the running clone budget, erroring once it crosses [`MAX_PICKLE_NODES`].
+fn charge_nodes(total: &mut u64, n: u64) -> Result<()> {
+    *total = total.saturating_add(n);
+    if *total > MAX_PICKLE_NODES {
+        return Err(Error::Msg(format!(
+            "pickle: node budget exceeded ({MAX_PICKLE_NODES}); refusing to parse (possible memory-amplification attack)"
+        )));
+    }
+    Ok(())
+}
+
 /// A cursor over the pickle byte stream.
 struct Reader<'a> {
     buf: &'a [u8],
@@ -132,6 +172,9 @@ fn parse_pickle(data: &[u8]) -> Result<Vec<(String, Val)>> {
     let mut r = Reader { buf: data, pos: 0 };
     let mut stack: Vec<Val> = Vec::new();
     let mut memo: HashMap<u32, Val> = HashMap::new();
+    let mut opcodes: u64 = 0;
+    // Total Val nodes cloned through the memo so far (billion-laughs guard, F-015).
+    let mut cloned_nodes: u64 = 0;
 
     let pop = |st: &mut Vec<Val>| {
         st.pop()
@@ -152,6 +195,12 @@ fn parse_pickle(data: &[u8]) -> Result<Vec<(String, Val)>> {
     };
 
     loop {
+        opcodes += 1;
+        if opcodes > MAX_PICKLE_OPCODES {
+            return Err(Error::Msg(format!(
+                "pickle: opcode budget exceeded ({MAX_PICKLE_OPCODES}); refusing to parse"
+            )));
+        }
         let op = r.u8()?;
         match op {
             0x80 => {
@@ -218,39 +267,35 @@ fn parse_pickle(data: &[u8]) -> Result<Vec<(String, Val)>> {
             }
             b'q' => {
                 let i = r.u8()? as u32;
-                memo.insert(
-                    i,
-                    stack
-                        .last()
-                        .cloned()
-                        .ok_or_else(|| Error::Msg("pickle: BINPUT empty".into()))?,
-                );
+                let top = stack
+                    .last()
+                    .ok_or_else(|| Error::Msg("pickle: BINPUT empty".into()))?;
+                charge_nodes(&mut cloned_nodes, count_nodes(top))?;
+                memo.insert(i, top.clone());
             }
             b'r' => {
                 let i = r.u32le()?;
-                memo.insert(
-                    i,
-                    stack
-                        .last()
-                        .cloned()
-                        .ok_or_else(|| Error::Msg("pickle: LONG_BINPUT empty".into()))?,
-                );
+                let top = stack
+                    .last()
+                    .ok_or_else(|| Error::Msg("pickle: LONG_BINPUT empty".into()))?;
+                charge_nodes(&mut cloned_nodes, count_nodes(top))?;
+                memo.insert(i, top.clone());
             }
             b'h' => {
                 let i = r.u8()? as u32;
-                stack.push(
-                    memo.get(&i)
-                        .cloned()
-                        .ok_or_else(|| Error::Msg("pickle: BINGET miss".into()))?,
-                );
+                let v = memo
+                    .get(&i)
+                    .ok_or_else(|| Error::Msg("pickle: BINGET miss".into()))?;
+                charge_nodes(&mut cloned_nodes, count_nodes(v))?;
+                stack.push(v.clone());
             }
             b'j' => {
                 let i = r.u32le()?;
-                stack.push(
-                    memo.get(&i)
-                        .cloned()
-                        .ok_or_else(|| Error::Msg("pickle: LONG_BINGET miss".into()))?,
-                );
+                let v = memo
+                    .get(&i)
+                    .ok_or_else(|| Error::Msg("pickle: LONG_BINGET miss".into()))?;
+                charge_nodes(&mut cloned_nodes, count_nodes(v))?;
+                stack.push(v.clone());
             }
             0x85 => {
                 let a = pop(&mut stack)?;
@@ -758,6 +803,46 @@ mod tests {
             }
             _ => panic!("expected a tensor spec"),
         }
+    }
+
+    #[test]
+    fn count_nodes_counts_nested_structure() {
+        assert_eq!(count_nodes(&Val::Int(7)), 1);
+        // Tuple(Tuple(Int, Int), Int) → 1 (outer) + [1 (inner) + 1 + 1] + 1 = 5
+        let nested = Val::Tuple(vec![
+            Val::Tuple(vec![Val::Int(1), Val::Int(2)]),
+            Val::Int(3),
+        ]);
+        assert_eq!(count_nodes(&nested), 5);
+    }
+
+    /// F-015: a crafted pickle that `BINGET`s a memoized value twice, pairs the copies with `TUPLE2`,
+    /// and `BINPUT`s the result back doubles the in-memory structure every iteration. Without a budget
+    /// this demands `2^n` memory; the node-clone budget must make it error (well before OOM) instead.
+    #[test]
+    fn parse_rejects_billion_laughs_amplification() {
+        let mut p: Vec<u8> = Vec::new();
+        p.extend_from_slice(&[0x80, 2]); // PROTO 2
+        p.push(b')'); // EMPTY_TUPLE — the seed value
+        p.push(b'q');
+        p.push(0); // BINPUT 0  → memo[0] = ()
+                   // 40 doublings is far past the 8M-node budget; the parse must bail mid-way.
+        for _ in 0..40 {
+            p.push(b'h');
+            p.push(0); // BINGET 0
+            p.push(b'h');
+            p.push(0); // BINGET 0
+            p.push(0x86); // TUPLE2 → (memo0, memo0)
+            p.push(b'q');
+            p.push(0); // BINPUT 0  → memo[0] doubles
+        }
+        p.push(b'.'); // STOP
+
+        let err = parse_pickle(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("node budget exceeded"),
+            "expected a node-budget error, got: {err}"
+        );
     }
 
     #[test]
