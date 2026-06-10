@@ -123,6 +123,11 @@ const AUDIO_LATENT_CHANNELS: i32 = 8;
 const AUDIO_MEL_BINS: i32 = 16;
 /// VAE temporal compression (8×): `latent_frames = 1 + (frames − 1) / 8`.
 const TEMPORAL_SCALE: u32 = 8;
+/// Upper bound on requested `num_frames` (DoS guard, F-058): `generate` sizes the per-stage noise +
+/// audio buffers directly from the request, so an unbounded `frames` (e.g. a hostile `8_000_001`,
+/// which still satisfies `frames % 8 == 1`) would drive multi-hundred-GB allocations before any
+/// error. `1025` (= 1 + 8·128, ~40 s at 25 fps) is far above any realistic request.
+const MAX_FRAMES: u32 = 1025;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
 const SPATIAL_SCALE: u32 = 32;
 /// I2V conditioning strength when neither the `Reference` nor `req.strength` supplies one (reference
@@ -834,6 +839,11 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
                 "ltx_2_3: num_frames must be 1 + 8·k (got {frames})"
             )));
         }
+        if frames > MAX_FRAMES {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: num_frames {frames} exceeds the maximum {MAX_FRAMES}"
+            )));
+        }
     }
     Ok(())
 }
@@ -970,6 +980,32 @@ mod tests {
             &caps,
             &GenerationRequest {
                 frames: Some(32),
+                ..base.clone()
+            }
+        )
+        .is_err());
+        // F-058: an unbounded frame count that still satisfies `% 8 == 1` is rejected by the max.
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                frames: Some(8_000_001), // 8_000_001 % 8 == 1, but far beyond MAX_FRAMES
+                ..base.clone()
+            }
+        )
+        .is_err());
+        // The maximum itself is allowed; the next valid form above it is not.
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                frames: Some(MAX_FRAMES),
+                ..base.clone()
+            }
+        )
+        .is_ok());
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                frames: Some(MAX_FRAMES + 8),
                 ..base.clone()
             }
         )
