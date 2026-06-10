@@ -645,6 +645,19 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
 
     let specs = parse_pickle(&pkl_bytes)?;
 
+    // How many tensors still reference each storage `key`. Multiple tensors can be views into one
+    // shared storage blob (the case the offset-fix `460d3e7` exists for); without memoization they
+    // would each re-open, re-read, and re-decode the whole multi-MB blob (F-018). Cache the blob bytes
+    // by key and drop each one once its last referencing tensor has been decoded, so peak memory still
+    // holds only the blobs currently in flight.
+    let mut remaining: HashMap<String, usize> = HashMap::new();
+    for (_, spec) in &specs {
+        if let Val::Tensor { key, .. } = spec {
+            *remaining.entry(key.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut blob_cache: HashMap<String, Vec<u8>> = HashMap::new();
+
     let mut out = HashMap::with_capacity(specs.len());
     for (name, spec) in specs {
         let Val::Tensor {
@@ -670,16 +683,19 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
                 "{name}: non-contiguous storage stride {stride:?} for size {size:?} unsupported"
             )));
         }
-        let blob_name = format!("{prefix}data/{key}");
-        let mut blob = Vec::new();
-        {
+        // Read the storage blob once and cache it by key; later views of the same storage reuse it.
+        if !blob_cache.contains_key(&key) {
+            let blob_name = format!("{prefix}data/{key}");
+            let mut blob = Vec::new();
             let mut blob_entry = zip
                 .by_name(&blob_name)
                 .map_err(|e| Error::Msg(format!("read storage {blob_name} for {name}: {e}")))?;
             require_stored(blob_entry.compression(), &blob_name)?;
             blob.reserve(blob_entry.compressed_size() as usize);
             blob_entry.read_to_end(&mut blob)?;
+            blob_cache.insert(key.clone(), blob);
         }
+        let blob = &blob_cache[&key];
         if end > blob.len() {
             return Err(Error::Msg(format!(
                 "{name}: storage slice [{start}..{end}] exceeds blob len {} (offset {offset}, numel {numel})",
@@ -691,6 +707,14 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
         // truncate or sign-flip.
         let shape: Vec<i32> = size.iter().map(|&d| d as i32).collect();
         out.insert(name, Array::from_slice(&floats, &shape));
+
+        // Drop the cached blob once its last referencing tensor has been decoded (F-018).
+        if let Some(refs) = remaining.get_mut(&key) {
+            *refs -= 1;
+            if *refs == 0 {
+                blob_cache.remove(&key);
+            }
+        }
     }
     Ok(out)
 }
