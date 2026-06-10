@@ -449,32 +449,51 @@ impl ChatGlmModel {
         )?)
     }
 
-    /// Additive `(1, 1, S, S)` mask in the compute dtype, mirroring the reference `get_masks`:
+    /// Additive `(B, 1, S, S)` mask in the compute dtype, mirroring the reference `get_masks`:
     /// a **real** query row `i` (`mask[i]=1`) attends key `j` iff causal (`j ≤ i`) and the key is not
     /// padding (`mask[j]=1`); a **padding** query row (`mask[i]=0`) attends everything (the reference's
     /// `-= padding_mask - 1` adjustment) — so its hidden state is deterministic and matches, even though
     /// Kolors ignores it. Disallowed → a large finite negative (avoids the all-`-inf` softmax NaN).
+    ///
+    /// Built per batch row from the `[B, S]` `attention_mask`, so a `B > 1` call applies each row's own
+    /// padding rather than batch-0's to everyone (F-127). `[B, 1, S, S]` broadcasts over heads and is
+    /// bit-identical to the old `[1, 1, S, S]` when `B = 1`.
     fn causal_padding_mask(&self, attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
-        debug_assert_eq!(b, 1, "encoder mask builder assumes batch 1");
-        let m = attention_mask.reshape(&[-1])?;
-        let m = m.as_dtype(Dtype::Int32)?;
+        let m = attention_mask.reshape(&[-1])?.as_dtype(Dtype::Int32)?;
         let m = m.as_slice::<i32>();
-        let neg = -1e30f32;
-        let (sl,) = (s as usize,);
-        let mut data = vec![0f32; sl * sl];
-        for i in 0..sl {
-            let pad_query = m[i] == 0;
-            for j in 0..sl {
-                let allowed = pad_query || (j <= i && m[j] != 0);
-                if !allowed {
-                    data[i * sl + j] = neg;
-                }
-            }
+        let (bl, sl) = (b as usize, s as usize);
+        if m.len() != bl * sl {
+            return Err(Error::Msg(format!(
+                "chatglm3 attention mask has {} entries, expected {bl}×{sl}",
+                m.len()
+            )));
         }
-        Array::from_slice(&data, &[1, 1, s, s])
+        let data = causal_padding_data(m, bl, sl);
+        Array::from_slice(&data, &[b, 1, s, s])
             .as_dtype(self.dtype)
             .map_err(Error::from)
     }
+}
+
+/// Flat `[B·S·S]` additive-mask data: for each batch row `bi`, query `i` is masked off key `j`
+/// (value `-1e30`) unless that row's own padding allows it. Pulled out of `causal_padding_mask` so
+/// the per-row batch logic (F-127) is unit-testable without a loaded encoder. Assumes `m.len()==b*s`.
+fn causal_padding_data(m: &[i32], b: usize, s: usize) -> Vec<f32> {
+    let neg = -1e30f32;
+    let mut data = vec![0f32; b * s * s];
+    for bi in 0..b {
+        let row = &m[bi * s..(bi + 1) * s];
+        for i in 0..s {
+            let pad_query = row[i] == 0;
+            for j in 0..s {
+                let allowed = pad_query || (j <= i && row[j] != 0);
+                if !allowed {
+                    data[(bi * s + i) * s + j] = neg;
+                }
+            }
+        }
+    }
+    data
 }
 
 /// Take `count` consecutive heads starting at `start` along the head axis (axis 2) of a
@@ -504,5 +523,38 @@ fn load_embedding(
             )
         }
         _ => Ok(w.require(&format!("{key}.weight"))?.as_dtype(dtype)?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn causal_padding_data_uses_per_row_padding() {
+        // F-127: a B=2 mask must apply each row's own padding, not batch-0's to everyone.
+        // Row 0: all real ([1,1,1]). Row 1: key 0 padded ([0,1,1]) — a causally-visible position so
+        // the two rows genuinely differ (the old flatten-first-S bug would have made them identical).
+        let s = 3;
+        let m = [1, 1, 1, /* row 1 */ 0, 1, 1];
+        let data = causal_padding_data(&m, 2, s);
+        let neg = -1e30f32;
+        let at = |bi: usize, i: usize, j: usize| data[(bi * s + i) * s + j];
+
+        // Row 0 is a plain causal mask.
+        assert_eq!(at(0, 0, 1), neg); // future key masked
+        assert_eq!(at(0, 1, 0), 0.0); // past real key attended
+
+        // Row 1, query 1 (real): key 0 is padding ⇒ masked, even though it's causal.
+        assert_eq!(at(1, 1, 0), neg);
+        assert_eq!(at(1, 1, 1), 0.0);
+        // The same cell differs between the rows — the core of the bug.
+        assert_ne!(at(0, 1, 0), at(1, 1, 0));
+
+        // Row 1, query 0 is itself padding ⇒ attends everything (reference `-= padding_mask - 1`).
+        assert_eq!(at(1, 0, 0), 0.0);
+        assert_eq!(at(1, 0, 2), 0.0);
+        // ...whereas row 0's real query 0 is strictly causal.
+        assert_ne!(at(0, 0, 2), at(1, 0, 2));
     }
 }
