@@ -24,7 +24,7 @@
 //! mirrors the reference's own bf16 compute (the production-speed path). [`Precision::dense_f32`]
 //! additionally dequantizes the weights to dense f32 — the S3a block-math gate.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
@@ -790,6 +790,37 @@ impl AdaLayerNormSingle {
 }
 
 /// The LTX-2.3 video DiT: preprocessor + 48 blocks + output projection. Predicts velocity.
+/// Memoizes a SPLIT-RoPE `(cos, sin)` table pair keyed on the `positions` content (F-048). The tables
+/// depend only on `positions` (+ the model's fixed dims), which are **constant across every denoise
+/// step of a stage**, so the expensive single-threaded f64 host trig in [`precompute_split_freqs_cis`]
+/// runs once per stage instead of once per step. Bit-identical: the recomputed tables are byte-equal,
+/// so a cache hit returns exactly what a recompute would. Inference is one job per thread (like the
+/// LoRA-pass [`Cell`]), so a [`RefCell`] is sufficient.
+#[derive(Default)]
+struct RopeMemo {
+    cached: RefCell<Option<(Vec<f32>, Array, Array)>>,
+}
+
+impl RopeMemo {
+    /// Return the cached `(cos, sin)` if `positions` is unchanged since the last call, else run
+    /// `compute`, cache, and return it. The key is the positions content (small relative to the trig).
+    fn get_or_compute(
+        &self,
+        positions: &Array,
+        compute: impl FnOnce() -> Result<(Array, Array)>,
+    ) -> Result<(Array, Array)> {
+        let key: Vec<f32> = positions.as_slice::<f32>().to_vec();
+        if let Some((k, cos, sin)) = self.cached.borrow().as_ref() {
+            if *k == key {
+                return Ok((cos.clone(), sin.clone()));
+            }
+        }
+        let (cos, sin) = compute()?;
+        *self.cached.borrow_mut() = Some((key, cos.clone(), sin.clone()));
+        Ok((cos, sin))
+    }
+}
+
 pub struct LtxDiT {
     patchify_proj: Linear,
     adaln: AdaLayerNormSingle,
@@ -799,6 +830,8 @@ pub struct LtxDiT {
     proj_out: Linear,
     cfg: LtxConfig,
     prec: Precision,
+    /// Per-stage SPLIT-RoPE table cache (F-048): the tables are constant across denoise steps.
+    rope_memo: RopeMemo,
 }
 
 impl LtxDiT {
@@ -819,6 +852,7 @@ impl LtxDiT {
             proj_out: Linear::load(w, "proj_out", prec)?,
             cfg: cfg.clone(),
             prec,
+            rope_memo: RopeMemo::default(),
         })
     }
 
@@ -901,14 +935,17 @@ impl LtxDiT {
         // caption_projection = Identity (2.3): context enters cross-attn as-is.
         let context = context.as_dtype(dt)?;
 
-        // SPLIT RoPE from the position grid (f32 tables; the block casts per input dtype).
-        let (cos, sin) = precompute_split_freqs_cis(
-            positions,
-            inner,
-            self.cfg.positional_embedding_theta,
-            &self.cfg.positional_embedding_max_pos,
-            self.cfg.num_attention_heads,
-        )?;
+        // SPLIT RoPE from the position grid (f32 tables; the block casts per input dtype). Cached on
+        // `positions` — constant across the stage's denoise steps, so computed once not per step (F-048).
+        let (cos, sin) = self.rope_memo.get_or_compute(positions, || {
+            precompute_split_freqs_cis(
+                positions,
+                inner,
+                self.cfg.positional_embedding_theta,
+                &self.cfg.positional_embedding_max_pos,
+                self.cfg.num_attention_heads,
+            )
+        })?;
 
         Ok(Preprocessed {
             x,
@@ -1050,6 +1087,9 @@ struct Stream {
     av_ca_ts_mult: i32,
     eps: f32,
     prec: Precision,
+    /// Per-stage caches for this stream's self-attention + cross-modal SPLIT-RoPE tables (F-048).
+    self_rope_memo: RopeMemo,
+    cross_rope_memo: RopeMemo,
 }
 
 /// The per-modality preprocessed args threaded into the block stack + output head.
@@ -1145,22 +1185,22 @@ impl Stream {
         // caption_projection = Identity (2.3): context enters cross-attn as-is.
         let context = context.as_dtype(dt)?;
 
-        // Self-attention SPLIT RoPE (modality inner dim, modality max_pos).
-        let (cos, sin) = precompute_split_freqs_cis(
-            positions,
-            inner,
-            self.theta,
-            &self.self_max_pos,
-            self.heads,
-        )?;
+        // Self-attention SPLIT RoPE (modality inner dim, modality max_pos). Both tables are constant
+        // across the stage's denoise steps, so cache them on `positions` (computed once, not per
+        // step — F-048; the cross table's `time_axis(positions)` is derived from the same key).
+        let (cos, sin) = self.self_rope_memo.get_or_compute(positions, || {
+            precompute_split_freqs_cis(positions, inner, self.theta, &self.self_max_pos, self.heads)
+        })?;
         // Cross-modal SPLIT RoPE: the time axis only, at the cross inner dim (2048) / cross max_pos.
-        let (cross_cos, cross_sin) = precompute_split_freqs_cis(
-            &time_axis(positions)?,
-            self.cross_inner,
-            self.theta,
-            &[self.cross_max_pos],
-            self.heads,
-        )?;
+        let (cross_cos, cross_sin) = self.cross_rope_memo.get_or_compute(positions, || {
+            precompute_split_freqs_cis(
+                &time_axis(positions)?,
+                self.cross_inner,
+                self.theta,
+                &[self.cross_max_pos],
+                self.heads,
+            )
+        })?;
 
         Ok(StreamPrep {
             x,
@@ -1467,6 +1507,8 @@ impl AvDiT {
             av_ca_ts_mult: cfg.av_ca_timestep_scale_multiplier,
             eps: cfg.norm_eps as f32,
             prec,
+            self_rope_memo: RopeMemo::default(),
+            cross_rope_memo: RopeMemo::default(),
         };
         let audio = Stream {
             patchify: Linear::load(w, "audio_patchify_proj", prec)?,
@@ -1491,6 +1533,8 @@ impl AvDiT {
             av_ca_ts_mult: cfg.av_ca_timestep_scale_multiplier,
             eps: cfg.norm_eps as f32,
             prec,
+            self_rope_memo: RopeMemo::default(),
+            cross_rope_memo: RopeMemo::default(),
         };
         let blocks = (0..cfg.num_layers)
             .map(|i| AvBlock::load(w, &format!("transformer_blocks.{i}"), cfg, prec))
@@ -1596,6 +1640,51 @@ impl AvDiT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rope_memo_caches_on_positions_and_recomputes_on_change() {
+        // F-048: the per-stage RoPE tables are recomputed only when `positions` changes. A constant
+        // positions (every denoise step) hits the cache; a new positions (next stage) recomputes.
+        let memo = RopeMemo::default();
+        let calls = std::cell::Cell::new(0);
+        let compute = |tag: f32| {
+            // Distinct table content per "stage" so we can tell a hit from a recompute.
+            (
+                Array::from_slice(&[tag, tag + 1.0], &[2]),
+                Array::from_slice(&[tag + 2.0, tag + 3.0], &[2]),
+            )
+        };
+
+        let pos_a = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0], &[1, 1, 2, 2]);
+        let pos_a2 = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0], &[1, 1, 2, 2]); // same content
+        let pos_b = Array::from_slice(&[9.0f32, 1.0, 2.0, 3.0], &[1, 1, 2, 2]); // different
+
+        let (c0, _) = memo
+            .get_or_compute(&pos_a, || {
+                calls.set(calls.get() + 1);
+                Ok(compute(10.0))
+            })
+            .unwrap();
+        // Same positions content → cache hit, compute not re-run, identical table returned.
+        let (c1, _) = memo
+            .get_or_compute(&pos_a2, || {
+                calls.set(calls.get() + 1);
+                Ok(compute(99.0)) // would differ if (wrongly) recomputed
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1, "same positions must hit the cache");
+        assert_eq!(c0.as_slice::<f32>(), c1.as_slice::<f32>());
+
+        // Different positions → recompute.
+        let (c2, _) = memo
+            .get_or_compute(&pos_b, || {
+                calls.set(calls.get() + 1);
+                Ok(compute(20.0))
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 2, "changed positions must recompute");
+        assert_eq!(c2.as_slice::<f32>(), &[20.0, 21.0]);
+    }
 
     #[test]
     fn modulate_closed_form() {
