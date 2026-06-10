@@ -32,7 +32,6 @@ fn cubic(x: f64) -> f64 {
     }
 }
 
-/// Normalized sinc, `sin(πx)/(πx)`.
 /// PIL `Image.BILINEAR` filter: a triangle of support radius 1.0.
 fn triangle(x: f64) -> f64 {
     let x = x.abs();
@@ -43,6 +42,7 @@ fn triangle(x: f64) -> f64 {
     }
 }
 
+/// Normalized sinc, `sin(πx)/(πx)`.
 fn sinc(x: f64) -> f64 {
     if x == 0.0 {
         1.0
