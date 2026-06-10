@@ -283,7 +283,10 @@ impl Scrfd {
             let kps = readback(&out.kps)?;
             let sf = s as f32;
             for (r, &score) in scores.iter().enumerate() {
-                if score < score_thresh {
+                // Drop non-finite AND below-threshold scores: a NaN off a corrupted checkpoint or
+                // numeric blow-up passes `score < thresh` (NaN comparisons are false) and would later
+                // panic the NMS sort, crashing every consumer (F-078).
+                if !score.is_finite() || score < score_thresh {
                     continue;
                 }
                 // anchor centre: row r → (cell, anchor); cell = r / num_anchors; (h,w) = (cell/W, cell%W)
@@ -344,7 +347,10 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 
 /// Greedy NMS by descending score (insightface uses IoU threshold 0.4).
 fn nms(mut dets: Vec<Detection>, thresh: f32) -> Vec<Detection> {
-    dets.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    // `total_cmp` (not `partial_cmp().unwrap()`) so a NaN score can never panic the sort — scores
+    // come straight off a model readback (F-078). Decode already drops non-finite scores; this is the
+    // belt-and-suspenders guard for the production runtime path.
+    dets.sort_by(|a, b| b.score.total_cmp(&a.score));
     let mut keep: Vec<Detection> = Vec::new();
     for d in dets {
         if keep.iter().all(|k| iou(&k.bbox, &d.bbox) <= thresh) {
@@ -352,4 +358,40 @@ fn nms(mut dets: Vec<Detection>, thresh: f32) -> Vec<Detection> {
         }
     }
     keep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn det(score: f32, x: f32) -> Detection {
+        // Disjoint 10×10 boxes (stride 100) so NMS keeps them all — isolates the score sort.
+        Detection {
+            bbox: [x, 0.0, x + 10.0, 10.0],
+            kps: [[0.0; 2]; 5],
+            score,
+        }
+    }
+
+    /// F-078: a NaN score must not panic the NMS sort (`total_cmp`, not `partial_cmp().unwrap()`),
+    /// and the finite scores must still come out in descending order.
+    #[test]
+    fn nms_sorts_descending_and_survives_nan() {
+        let dets = vec![
+            det(0.5, 0.0),
+            det(f32::NAN, 100.0),
+            det(0.9, 200.0),
+            det(0.7, 300.0),
+        ];
+        let kept = nms(dets, 0.4); // disjoint boxes ⇒ all retained, just reordered
+        assert_eq!(kept.len(), 4);
+        // The three finite scores are descending; the NaN sorts deterministically (total order) and
+        // never panics — that's the regression being guarded.
+        let finite: Vec<f32> = kept
+            .iter()
+            .map(|d| d.score)
+            .filter(|s| s.is_finite())
+            .collect();
+        assert_eq!(finite, vec![0.9, 0.7, 0.5]);
+    }
 }
