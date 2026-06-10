@@ -184,7 +184,7 @@ impl InstantId {
             openpose: None,
             resampler,
             vae,
-            sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE),
+            sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
             face: None,
         })
     }

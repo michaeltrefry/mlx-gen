@@ -94,7 +94,7 @@ fn img2img_components_bit_exact() {
     let image = init_image(&g, w, h);
 
     let vae = load_vae(&snap).unwrap(); // VAE always f32
-    let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT);
+    let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT).unwrap();
 
     // x_0 = VAE-encode mean of the preprocessed init.
     let x0 = encode_init_latents(&vae, &image, w, h).unwrap();

@@ -43,16 +43,18 @@ pub struct EulerSampler {
 impl EulerSampler {
     /// Build the sampler from a [`DiffusionConfig`] at f32. `ancestral` selects the
     /// `SimpleEulerAncestralSampler` step (SDXL) vs the plain Euler step.
-    pub fn new(cfg: &DiffusionConfig, ancestral: bool) -> Self {
+    pub fn new(cfg: &DiffusionConfig, ancestral: bool) -> Result<Self> {
         Self::new_with_dtype(cfg, ancestral, Dtype::Float32)
     }
 
     /// Build the sampler at a given compute `dtype` (the vendored `self.dtype` — `float16` for the
     /// production path). The sigma table is always built in f32; `dtype` governs the per-step math.
-    pub fn new_with_dtype(cfg: &DiffusionConfig, ancestral: bool, dtype: Dtype) -> Self {
-        let mut s = Self::try_new(cfg, ancestral).expect("sigma table construction");
+    /// Returns `Err` if the MLX sigma-table construction fails, so the registry `load` path can
+    /// surface it instead of panicking.
+    pub fn new_with_dtype(cfg: &DiffusionConfig, ancestral: bool, dtype: Dtype) -> Result<Self> {
+        let mut s = Self::try_new(cfg, ancestral)?;
         s.dtype = dtype;
-        s
+        Ok(s)
     }
 
     /// The sigma table is built with **MLX ops** (`cumprod`/`sqrt`/`square`), not host f32, so it is
@@ -329,8 +331,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn constructors_return_ok_for_valid_config() {
+        // F-066: `new`/`new_with_dtype` are fallible (no internal `.expect`) so the registry `load`
+        // path surfaces an MLX sigma-table failure as `Err` instead of panicking. The happy path
+        // must still build a well-formed sampler at the requested dtype.
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        assert_eq!(s.dtype, Dtype::Float32);
+        let s16 =
+            EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), false, Dtype::Float16)
+                .unwrap();
+        assert_eq!(s16.dtype, Dtype::Float16);
+        assert!(!s16.ancestral);
+    }
+
+    #[test]
     fn sigma_table_endpoints_and_interp() {
-        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true);
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
         assert_eq!(s.sigmas.len(), 1001);
         assert_eq!(s.sigmas[0], 0.0);
         assert_eq!(s.max_time(), 1000.0);
@@ -345,14 +361,14 @@ mod tests {
     fn zero_steps_yield_no_pairs() {
         // img2img at strength ≤ 1/steps rounds to 0 steps; the schedule must produce no `(t, t_prev)`
         // pairs so the denoise loop is a no-op (and never invokes the σ=0 ancestral step → NaN).
-        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true);
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
         assert!(s.timesteps(0, 0.0).is_empty());
         assert!(s.timesteps(0, 1000.0).is_empty());
     }
 
     #[test]
     fn timesteps_span_start_to_zero() {
-        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true);
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
         let ts = s.timesteps(4, 1000.0);
         assert_eq!(ts.len(), 4);
         assert_eq!(ts[0].0, 1000.0);

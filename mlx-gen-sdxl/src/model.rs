@@ -264,7 +264,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         controls,
         ip_adapter,
         vae,
-        sampler: EulerSampler::new_with_dtype(&cfg, true, dtype),
+        sampler: EulerSampler::new_with_dtype(&cfg, true, dtype)?,
         alpha_schedule,
     }))
 }

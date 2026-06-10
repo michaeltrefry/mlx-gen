@@ -131,7 +131,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
         te2: crate::loader::load_text_encoder_2(root)?,
         vae: crate::loader::load_vae(root)?,
         unet: crate::loader::load_unet(root)?,
-        sampler: EulerSampler::new(&DiffusionConfig::sdxl_base(), true),
+        sampler: EulerSampler::new(&DiffusionConfig::sdxl_base(), true)?,
     }))
 }
 

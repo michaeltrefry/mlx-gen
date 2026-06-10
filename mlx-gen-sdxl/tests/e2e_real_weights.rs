@@ -95,7 +95,7 @@ fn accumulate_from_own_prior() {
     let (conditioning, pooled) = encode_conditioning(&te1, &te2, &tokens).unwrap();
     let time_ids = text_time_ids(pooled.shape()[0]);
     let unet = load_unet_dtype(&snap, DT).unwrap();
-    let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT);
+    let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT).unwrap();
 
     // generate's exact RNG order: seed, draw the prior (USE it), then per-step noise.
     mlx_rs::random::seed(seed).unwrap();
@@ -191,7 +191,7 @@ fn denoise_per_step_matches_golden() {
     let (conditioning, pooled) = encode_conditioning(&te1, &te2, &tokens).unwrap();
     let time_ids = text_time_ids(pooled.shape()[0]);
     let unet = load_unet_dtype(&snap, DT).unwrap();
-    let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT);
+    let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT).unwrap();
     let ts = sampler.timesteps(steps, sampler.max_time());
 
     // Reproduce the RNG order: seed, draw + discard the prior, then per-step noise.
