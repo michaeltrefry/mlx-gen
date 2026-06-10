@@ -28,7 +28,6 @@
 use std::path::Path;
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::array::host_i32;
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::checkpoint_filename;
@@ -53,7 +52,7 @@ use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
 use crate::model::MODEL_ID;
-use crate::pipeline::{encode_init_latents, slice_valid};
+use crate::pipeline::encode_init_latents;
 use crate::text_encoder::TextEncoder;
 use crate::transformer::ZImageTransformer;
 use crate::vae::Vae;
@@ -303,27 +302,6 @@ inventory::submit! {
     TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer }
 }
 
-impl ZImageTurboTrainer {
-    /// Prompt → `cap_feats` (f32): the inference `encode_prompt` path (tokenize with the Qwen chat
-    /// template, run the text encoder, slice off the padded tail).
-    fn encode_prompt(&self, prompt: &str) -> Result<Array> {
-        let t = self.tokenizer.tokenize(prompt)?;
-        if t.input_ids.shape()[1] == 0 {
-            return Err(mlx_gen::Error::Msg(
-                "z_image_turbo trainer: empty caption".into(),
-            ));
-        }
-        let num_valid: i32 = host_i32(&t.attention_mask)?.iter().sum();
-        if num_valid == 0 {
-            return Err(mlx_gen::Error::Msg(
-                "z_image_turbo trainer: empty caption".into(),
-            ));
-        }
-        let enc = self.text_encoder.forward(&t.input_ids, &t.attention_mask)?;
-        slice_valid(&enc, num_valid)
-    }
-}
-
 impl Trainer for ZImageTurboTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
@@ -371,7 +349,12 @@ impl Trainer for ZImageTurboTrainer {
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
             let x0 = encode_init_latents(&self.vae, &img, edge, edge)?; // clean latent [16,1,h,w]
-            let cap = self.encode_prompt(&item.caption)?;
+            let cap = crate::pipeline::encode_prompt(
+                &self.tokenizer,
+                &self.text_encoder,
+                &item.caption,
+                "z_image_turbo trainer",
+            )?;
             eval([&x0, &cap])?;
             cache.push((x0, cap));
         }

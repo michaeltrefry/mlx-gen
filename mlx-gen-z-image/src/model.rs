@@ -8,20 +8,16 @@
 //! seeded noise → flow-match Euler denoise over the DiT → VAE decode → RGB8. The chain is
 //! parity-proven against the frozen Python fork on real bf16 weights (sc-2352).
 
-use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Result, WeightsSource,
+    default_seed, Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
 use crate::loader;
-use crate::pipeline::{
-    add_noise_by_interpolation, create_noise, decoded_to_image, denoise_with_progress,
-    encode_init_latents, init_time_step, slice_valid, unpack_latents,
-};
+use crate::pipeline::{self, denoise_with_progress, encode_init_latents, init_time_step};
 use crate::text_encoder::TextEncoder;
 use crate::transformer::ZImageTransformer;
 use crate::vae::Vae;
@@ -149,51 +145,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl ZImageTurbo {
-    /// Prompt → `cap_feats` (f32): tokenize with the Qwen chat template, run the text encoder,
-    /// and slice off the padded tail to the valid caption tokens.
-    fn encode_prompt(&self, prompt: &str) -> Result<mlx_rs::Array> {
-        let t = self.tokenizer.tokenize(prompt)?;
-        // An empty prompt tokenizes to a `[1, 0]` array. Guard on shape before any host readback:
-        // `as_slice`/`host_i32` on a size-0 array would otherwise make the intended error below
-        // unreachable (Qwen T2I guards the same way). `validate_request` already rejects this, so
-        // this is defense-in-depth at the encode boundary.
-        if t.input_ids.shape()[1] == 0 {
-            return Err(Error::Msg("z_image_turbo: empty prompt".into()));
-        }
-        let num_valid: i32 = host_i32(&t.attention_mask)?.iter().sum();
-        if num_valid == 0 {
-            return Err(Error::Msg("z_image_turbo: empty prompt".into()));
-        }
-        let enc = self.text_encoder.forward(&t.input_ids, &t.attention_mask)?;
-        slice_valid(&enc, num_valid)
-    }
-
-    /// Extract the single img2img init image + its strength from the request's conditioning. The
-    /// per-reference strength wins over `req.strength`. Z-Image img2img conditions on exactly one
-    /// init image, so more than one `Reference` is an error (multi-image is `MultiReference`, which
-    /// this model doesn't advertise).
-    fn resolve_reference<'a>(
-        &self,
-        req: &'a GenerationRequest,
-    ) -> Result<Option<(&'a Image, Option<f32>)>> {
-        let mut reference = None;
-        for c in &req.conditioning {
-            if let Conditioning::Reference { image, strength } = c {
-                if reference.is_some() {
-                    return Err(Error::Msg(
-                        "z_image_turbo: multiple reference images are not supported (single \
-                         img2img init only)"
-                            .into(),
-                    ));
-                }
-                reference = Some((image, strength.or(req.strength)));
-            }
-        }
-        Ok(reference)
-    }
-}
-
 impl Generator for ZImageTurbo {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -214,7 +165,7 @@ impl Generator for ZImageTurbo {
         let base_seed = req.seed.unwrap_or_else(default_seed);
 
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
-        let reference = self.resolve_reference(req)?;
+        let reference = pipeline::resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
             Some((_, strength)) => init_time_step(steps, strength),
             None => 0,
@@ -224,7 +175,8 @@ impl Generator for ZImageTurbo {
         // Prompt → cap_feats (f32). txt2img runs the DiT in bf16 (the parity-proven path); img2img
         // matches the fork's f32 init latents, so keep cap f32 too (so the unified stream is one
         // dtype). The DiT promotes per-op against the bf16 weights either way.
-        let cap = self.encode_prompt(&req.prompt)?;
+        let cap =
+            pipeline::encode_prompt(&self.tokenizer, &self.text_encoder, &req.prompt, MODEL_ID)?;
         let cap = if is_img2img {
             cap
         } else {
@@ -249,46 +201,28 @@ impl Generator for ZImageTurbo {
             None
         };
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            // Distinct seed per image in a batch (the fork's `seed + i` convention).
-            let seed = base_seed.wrapping_add(i as u64);
-            // Seeded noise as bf16 (the fork's `create_noise` casts to model precision).
-            // PARITY-BF16 (sc-2609): bf16 to match the fork's seed→image mapping; flipping to f32 is
-            // a *different* (higher-precision) noise realization, not just sharper — so it changes the
-            // output, not only its crispness. Revisit alongside the other f32 flips.
-            let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
-            let latents = if let Some(clean) = &clean {
-                // Blend the pre-encoded clean latents with the noise at `sigma = sigmas[init_time_step]`
-                // (the fork's `create_for_txt2img_or_img2img`).
-                let sigma = scheduler.sigmas[start_step];
-                add_noise_by_interpolation(clean, &noise, sigma)?
-            } else {
-                noise
-            };
-            // sc-2963 (rollout of sc-2957): run the DiT's fusable elementwise glue (SwiGLU, gated
-            // residuals, RoPE rotation) through `mx.compile` — bit-exact and a per-step win. Enabled
-            // here at the production boundary (not inside `denoise_with_progress`, which the
-            // stage-wise parity tests reuse and must keep running eager). Process-global, idempotent.
-            crate::set_compile_glue(true);
-            let latents = denoise_with_progress(
-                &self.transformer,
-                &scheduler,
-                latents,
-                &cap,
-                start_step,
-                &req.cancel,
-                on_progress,
-            )?;
-
-            on_progress(Progress::Decoding);
-            // [16,1,H,W] -> [1,16,H,W] -> [1,16,1,H,W] for VAE decode.
-            let unpacked = unpack_latents(&latents)?;
-            let sh = unpacked.shape();
-            let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]])?;
-            let decoded = self.vae.decode(&latent5)?.as_dtype(Dtype::Float32)?;
-            images.push(decoded_to_image(&decoded)?);
-        }
+        // Per-image batch render shared with the control variant (F-035); the base branch's only
+        // difference is the plain `denoise_with_progress` step.
+        let images = pipeline::render_batch(
+            &self.vae,
+            &scheduler,
+            clean.as_ref(),
+            start_step,
+            base_seed,
+            req,
+            on_progress,
+            |latents, op| {
+                denoise_with_progress(
+                    &self.transformer,
+                    &scheduler,
+                    latents,
+                    &cap,
+                    start_step,
+                    &req.cancel,
+                    op,
+                )
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -434,7 +368,7 @@ mod tests {
         let caps = descriptor().capabilities;
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            conditioning: vec![Conditioning::Depth {
+            conditioning: vec![mlx_gen::Conditioning::Depth {
                 image: mlx_gen::Image::default(),
             }],
             ..Default::default()

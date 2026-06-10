@@ -4,12 +4,17 @@
 //! ([`crate::transformer`]), scheduler ([`mlx_gen::FlowMatchEuler`]) and VAE ([`crate::vae`])
 //! lands once `load()` assembles the model from weights (+ the text encoder).
 
+use mlx_gen::array::host_i32;
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Image, Progress, Result};
+use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::{
+    CancelFlag, Conditioning, Error, FlowMatchEuler, GenerationRequest, Image, Progress, Result,
+};
 use mlx_rs::ops::{add, concatenate_axis, multiply};
-use mlx_rs::{random, Array};
+use mlx_rs::{random, Array, Dtype};
 
 use crate::control_transformer::ZImageControlTransformer;
+use crate::text_encoder::TextEncoder;
 use crate::vae::Vae;
 use crate::ZImageTransformer;
 
@@ -246,4 +251,163 @@ pub fn add_noise_by_interpolation(clean: &Array, noise: &Array, sigma: f32) -> R
     let one_minus = Array::from_slice(&[1.0 - sigma], &[1]);
     let s = Array::from_slice(&[sigma], &[1]);
     Ok(add(&multiply(clean, one_minus)?, &multiply(noise, s)?)?)
+}
+
+/// Prompt → `cap_feats` (f32): tokenize with the Qwen chat template, run the text encoder, slice off
+/// the padded tail to the valid caption tokens. Shared by the base + control generators and the
+/// trainer (F-035); `id` only labels the empty-prompt error. An empty prompt tokenizes to `[1, 0]`,
+/// so guard on shape before any host readback (`host_i32` on a size-0 array would panic) —
+/// `validate_request` already rejects it, this is defense-in-depth at the encode boundary.
+pub(crate) fn encode_prompt(
+    tokenizer: &TextTokenizer,
+    text_encoder: &TextEncoder,
+    prompt: &str,
+    id: &str,
+) -> Result<Array> {
+    let t = tokenizer.tokenize(prompt)?;
+    if t.input_ids.shape()[1] == 0 {
+        return Err(Error::Msg(format!("{id}: empty prompt")));
+    }
+    let num_valid: i32 = host_i32(&t.attention_mask)?.iter().sum();
+    if num_valid == 0 {
+        return Err(Error::Msg(format!("{id}: empty prompt")));
+    }
+    let enc = text_encoder.forward(&t.input_ids, &t.attention_mask)?;
+    slice_valid(&enc, num_valid)
+}
+
+/// Resolve the single img2img init image + its strength from the request's conditioning (F-035). The
+/// per-reference strength wins over `req.strength`. Z-Image conditions on exactly one init image, so
+/// more than one `Reference` is an error (multi-image is `MultiReference`, unadvertised here).
+pub(crate) fn resolve_reference<'a>(
+    req: &'a GenerationRequest,
+    id: &str,
+) -> Result<Option<(&'a Image, Option<f32>)>> {
+    let mut reference = None;
+    for c in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = c {
+            if reference.is_some() {
+                return Err(Error::Msg(format!(
+                    "{id}: multiple reference images are not supported (single img2img init only)"
+                )));
+            }
+            reference = Some((image, strength.or(req.strength)));
+        }
+    }
+    Ok(reference)
+}
+
+/// The shared per-image batch render the two Z-Image generators only differed in the denoise call for
+/// (F-035): for each of `req.count` images, build the seeded bf16 noise (blended with the pre-encoded
+/// `clean` latents for img2img), run `denoise`, then VAE-decode to an RGB8 [`Image`]. The base vs
+/// control branch is the `denoise` closure; the seed convention, the `sigma`-blend, the process-global
+/// compile-glue enable, and the decode tail are identical and live here. Bit-identical to the prior
+/// inline loops.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_batch(
+    vae: &Vae,
+    scheduler: &FlowMatchEuler,
+    clean: Option<&Array>,
+    start_step: usize,
+    base_seed: u64,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    mut denoise: impl FnMut(Array, &mut dyn FnMut(Progress)) -> Result<Array>,
+) -> Result<Vec<Image>> {
+    let mut images = Vec::with_capacity(req.count as usize);
+    for i in 0..req.count {
+        // Distinct seed per image in a batch (the fork's `seed + i`). PARITY-BF16 (sc-2609): the noise
+        // is bf16 to match the fork's seed→image mapping (f32 is a *different*, higher-precision
+        // realization, not just sharper).
+        let seed = base_seed.wrapping_add(i as u64);
+        let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
+        let latents = match clean {
+            // img2img: blend the pre-encoded clean latents with the noise at `sigma = sigmas[start]`.
+            Some(clean) => add_noise_by_interpolation(clean, &noise, scheduler.sigmas[start_step])?,
+            None => noise,
+        };
+        // sc-2963 (rollout of sc-2957): run the DiT's fusable elementwise glue through `mx.compile` —
+        // bit-exact and a per-step win. Enabled at the production boundary; process-global, idempotent.
+        crate::set_compile_glue(true);
+        let latents = denoise(latents, on_progress)?;
+
+        on_progress(Progress::Decoding);
+        // [16,1,H,W] -> [1,16,H,W] -> [1,16,1,H,W] for VAE decode.
+        let unpacked = unpack_latents(&latents)?;
+        let sh = unpacked.shape();
+        let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]])?;
+        let decoded = vae.decode(&latent5)?.as_dtype(Dtype::Float32)?;
+        images.push(decoded_to_image(&decoded)?);
+    }
+    Ok(images)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(w: u32, h: u32) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        }
+    }
+
+    #[test]
+    fn resolve_reference_handles_count_and_strength() {
+        // F-035: the single shared img2img resolution (was duplicated in both generators). No
+        // Reference → None.
+        let none = GenerationRequest {
+            prompt: "a fox".into(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_reference(&none, "z_image_turbo").unwrap(), None);
+
+        // A per-reference strength wins over req.strength.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            strength: Some(0.6),
+            conditioning: vec![Conditioning::Reference {
+                image: img(64, 64),
+                strength: Some(0.3),
+            }],
+            ..Default::default()
+        };
+        let (_, s) = resolve_reference(&req, "z_image_turbo").unwrap().unwrap();
+        assert_eq!(s, Some(0.3));
+
+        // Missing per-reference strength falls back to req.strength.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            strength: Some(0.6),
+            conditioning: vec![Conditioning::Reference {
+                image: img(64, 64),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let (_, s) = resolve_reference(&req, "z_image_turbo").unwrap().unwrap();
+        assert_eq!(s, Some(0.6));
+
+        // More than one Reference is an error (single img2img init only).
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(64, 64),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: img(64, 64),
+                    strength: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let err = resolve_reference(&req, "z_image_turbo")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("multiple reference images"), "{err}");
+    }
 }

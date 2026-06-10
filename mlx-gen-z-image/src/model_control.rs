@@ -14,7 +14,6 @@
 //! the base transformer at `control_context_scale = 0`, and the full control render matches the
 //! fork's control golden — see `tests/z_control_transformer.rs` and `tests/control_real_weights.rs`.
 
-use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler,
@@ -27,8 +26,8 @@ use crate::control_transformer::ZImageControlTransformer;
 use crate::loader;
 use crate::model::{validate_request, DEFAULT_STEPS, SCHEDULE_SHIFT};
 use crate::pipeline::{
-    add_noise_by_interpolation, create_noise, decoded_to_image, denoise_control_with_progress,
-    encode_control_context, encode_init_latents, init_time_step, slice_valid, unpack_latents,
+    self, denoise_control_with_progress, encode_control_context, encode_init_latents,
+    init_time_step,
 };
 use crate::text_encoder::TextEncoder;
 use crate::vae::Vae;
@@ -133,24 +132,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 impl ZImageTurboControl {
-    /// Prompt → `cap_feats` (f32): tokenize with the Qwen chat template, run the text encoder, slice
-    /// off the padded tail. (Identical to the base model's `encode_prompt`.)
-    fn encode_prompt(&self, prompt: &str) -> Result<mlx_rs::Array> {
-        let t = self.tokenizer.tokenize(prompt)?;
-        // Guard on shape before any host readback (an empty prompt tokenizes to `[1, 0]`) — the
-        // base model's panic-safe encode boundary (F-001/2/7). `validate_request` already rejects
-        // an empty prompt; this is defense-in-depth.
-        if t.input_ids.shape()[1] == 0 {
-            return Err(Error::Msg("z_image_turbo_control: empty prompt".into()));
-        }
-        let num_valid: i32 = host_i32(&t.attention_mask)?.iter().sum();
-        if num_valid == 0 {
-            return Err(Error::Msg("z_image_turbo_control: empty prompt".into()));
-        }
-        let enc = self.text_encoder.forward(&t.input_ids, &t.attention_mask)?;
-        slice_valid(&enc, num_valid)
-    }
-
     /// Extract the (required) control image + its `control_context_scale` from the request. The
     /// Fun-Controlnet-Union is a *union* ControlNet (pose/canny/depth share one VAE-encoded control
     /// path), so any [`mlx_gen::ControlKind`] is accepted — the pose skeleton is the validated use.
@@ -172,29 +153,6 @@ impl ZImageTurboControl {
                     .into(),
             )
         })
-    }
-
-    /// Extract the optional img2img init image + strength (the fork's `generate_image(image_path,
-    /// image_strength)` — control can run on top of an init image). Per-reference strength wins over
-    /// `req.strength`; more than one `Reference` is an error.
-    fn resolve_reference<'a>(
-        &self,
-        req: &'a GenerationRequest,
-    ) -> Result<Option<(&'a Image, Option<f32>)>> {
-        let mut reference = None;
-        for c in &req.conditioning {
-            if let Conditioning::Reference { image, strength } = c {
-                if reference.is_some() {
-                    return Err(Error::Msg(
-                        "z_image_turbo_control: multiple reference images are not supported (single \
-                         img2img init only)"
-                            .into(),
-                    ));
-                }
-                reference = Some((image, strength.or(req.strength)));
-            }
-        }
-        Ok(reference)
     }
 }
 
@@ -232,7 +190,7 @@ impl Generator for ZImageTurboControl {
 
         // Required pose/union control + optional img2img init.
         let (control_image, control_scale) = self.resolve_control(req)?;
-        let reference = self.resolve_reference(req)?;
+        let reference = pipeline::resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
             Some((_, strength)) => init_time_step(steps, strength),
             None => 0,
@@ -245,7 +203,8 @@ impl Generator for ZImageTurboControl {
         // when its hints are added, and `latents += dt·velocity` makes the latents f32 after step 0 —
         // so most of the loop runs f32. We match that exactly: bf16 cap (txt2img) + f32 control_context
         // below. (img2img keeps f32 cap, mirroring the base img2img; the DiT promotes per-op either way.)
-        let cap = self.encode_prompt(&req.prompt)?;
+        let cap =
+            pipeline::encode_prompt(&self.tokenizer, &self.text_encoder, &req.prompt, MODEL_ID)?;
         let cap = if is_img2img {
             cap
         } else {
@@ -273,43 +232,31 @@ impl Generator for ZImageTurboControl {
             None
         };
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = base_seed.wrapping_add(i as u64);
-            // Seeded noise as bf16 (the fork's `create_noise` casts to model precision).
-            // PARITY-BF16 (sc-2609): bf16 matches the fork's seed→image mapping; f32 is a different
-            // (higher-precision) realization, not just sharper. Revisit with the other f32 flips.
-            let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
-            let latents = if let Some(clean) = &clean {
-                let sigma = scheduler.sigmas[start_step];
-                add_noise_by_interpolation(clean, &noise, sigma)?
-            } else {
-                noise
-            };
-            // sc-2963 (rollout of sc-2957): compiled elementwise glue in the control denoise loop too
-            // — SwiGLU, gated residuals, RoPE rotation, and the control-branch hint injection
-            // (`x+hint·scale`). Bit-exact, and the mixed-precision dtype flow (bf16 base, f32
-            // control_context, sc-2720) is preserved. Enabled at the production boundary; idempotent.
-            crate::set_compile_glue(true);
-            let latents = denoise_control_with_progress(
-                &self.transformer,
-                &scheduler,
-                latents,
-                &cap,
-                &control_context,
-                control_scale,
-                start_step,
-                &req.cancel,
-                on_progress,
-            )?;
-
-            on_progress(Progress::Decoding);
-            let unpacked = unpack_latents(&latents)?;
-            let sh = unpacked.shape();
-            let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]])?;
-            let decoded = self.vae.decode(&latent5)?.as_dtype(Dtype::Float32)?;
-            images.push(decoded_to_image(&decoded)?);
-        }
+        // Per-image batch render shared with the base variant (F-035); the control branch's only
+        // difference is the `denoise_control_with_progress` step threading the f32 control context +
+        // scale (the mixed-precision dtype flow, sc-2720, is preserved inside the closure).
+        let images = pipeline::render_batch(
+            &self.vae,
+            &scheduler,
+            clean.as_ref(),
+            start_step,
+            base_seed,
+            req,
+            on_progress,
+            |latents, op| {
+                denoise_control_with_progress(
+                    &self.transformer,
+                    &scheduler,
+                    latents,
+                    &cap,
+                    &control_context,
+                    control_scale,
+                    start_step,
+                    &req.cancel,
+                    op,
+                )
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }
