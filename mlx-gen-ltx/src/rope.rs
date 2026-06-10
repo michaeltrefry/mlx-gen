@@ -19,7 +19,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// The GPT-NeoX "rotate-halves" rotation `(first·cos − second·sin, second·cos + first·sin)` on the
 /// already-split f32 halves. Fused into one kernel when the sc-2963 glue toggle is on (vs 6 eager ops,
@@ -61,12 +61,26 @@ pub fn precompute_split_freqs_cis(
     num_attention_heads: i32,
 ) -> Result<(Array, Array)> {
     let shape = positions.shape();
-    debug_assert_eq!(shape.len(), 4, "positions must be (B, n_pos_dims, T, 2)");
+    if shape.len() != 4 {
+        return Err(Error::Msg(format!(
+            "precompute_split_freqs_cis: positions must be rank-4 (B, n_pos_dims, T, 2), got {shape:?}"
+        )));
+    }
     let batch = shape[0] as usize;
     let n_pos_dims = shape[1] as usize;
     let seq = shape[2] as usize; // T
-    debug_assert_eq!(shape[3], 2);
-    debug_assert_eq!(n_pos_dims, max_pos.len());
+    if shape[3] != 2 {
+        return Err(Error::Msg(format!(
+            "precompute_split_freqs_cis: positions last axis must be 2 (start, end), got {}",
+            shape[3]
+        )));
+    }
+    if n_pos_dims != max_pos.len() {
+        return Err(Error::Msg(format!(
+            "precompute_split_freqs_cis: n_pos_dims ({n_pos_dims}) must equal max_pos.len() ({})",
+            max_pos.len()
+        )));
+    }
 
     let pos = positions.as_slice::<f32>();
     // C-order index into (B, 3, T, 2): ((b*3 + d)*T + t)*2 + e.
@@ -103,8 +117,10 @@ pub fn precompute_split_freqs_cis(
     for b in 0..batch {
         for t in 0..seq {
             // scaled position per axis (use middle of [start,end], fractional, then *2-1).
-            let mut scaled = [0f64; 3];
-            for (d, s) in scaled.iter_mut().enumerate().take(n_pos_dims) {
+            // Sized to `n_pos_dims` (the grid's axis count), not a fixed 3 — `scaled[d]` is later
+            // indexed by `d = k % n_pos_dims`, which would overflow a `[_; 3]` for >3-axis grids.
+            let mut scaled = vec![0f64; n_pos_dims];
+            for (d, s) in scaled.iter_mut().enumerate() {
                 let start = pos[idx(b, d, t, 0)] as f64;
                 let end = pos[idx(b, d, t, 1)] as f64;
                 let mid = (start + end) / 2.0;
@@ -196,6 +212,29 @@ mod tests {
         // p=2 is the first real frequency (i=0, d=0): scaled[0]*indices[0]; index[0]=pi/2.
         // The middle/fractional makes this small but generally != the pad sentinel.
         assert!(c[2] <= 1.0 && c[2] >= -1.0);
+    }
+
+    #[test]
+    fn handles_more_than_three_pos_dims() {
+        // F-054: a 4-axis grid used to panic on the fixed `[0f64; 3]` (`scaled[d]`, `d` up to 3).
+        let pos = Array::from_slice(&[0f32; 8], &[1, 4, 1, 2]); // (B=1, n_pos_dims=4, T=1, 2)
+        let r = precompute_split_freqs_cis(&pos, 4096, 10000.0, &[20, 20, 20, 20], 32);
+        assert!(r.is_ok(), "4-axis grid must not panic/error: {:?}", r.err());
+        assert_eq!(r.unwrap().0.shape(), &[1, 32, 1, 64]);
+    }
+
+    #[test]
+    fn rejects_malformed_positions() {
+        // F-054: shape mismatches are now typed errors, not release-vanishing `debug_assert`s.
+        // last axis must be 2 (start, end):
+        let bad_last = Array::from_slice(&[0f32; 9], &[1, 3, 1, 3]);
+        assert!(precompute_split_freqs_cis(&bad_last, 4096, 1e4, &[1, 1, 1], 32).is_err());
+        // n_pos_dims must equal max_pos.len():
+        let mismatch = Array::from_slice(&[0f32; 6], &[1, 3, 1, 2]);
+        assert!(precompute_split_freqs_cis(&mismatch, 4096, 1e4, &[1, 1], 32).is_err());
+        // positions must be rank-4:
+        let rank3 = Array::from_slice(&[0f32; 6], &[1, 3, 2]);
+        assert!(precompute_split_freqs_cis(&rank3, 4096, 1e4, &[1, 1, 1], 32).is_err());
     }
 
     #[test]
