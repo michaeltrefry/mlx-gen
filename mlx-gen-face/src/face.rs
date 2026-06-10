@@ -94,12 +94,24 @@ pub fn resize_bilinear_cv2(
     let (xofs, xa) = coeffs(in_w, out_w);
     let (yofs, ya) = coeffs(in_h, out_h);
 
-    // Horizontal pass over every source row → int (value·2048).
-    let mut hbuf = vec![0i64; in_h * out_w * C];
-    for sy in 0..in_h {
+    // The vertical pass only reads the source rows named in `yofs` (≤ 2·out_h distinct), so the
+    // horizontal pass resamples just those rows — not all `in_h` — and `hbuf` is sized to match
+    // (cv2's 2-row ring buffer; F-088). For a 4000-px-tall image downscaled to ≤640 this avoids a
+    // ~61 MB i64 buffer and ~3× the work. `row_of` maps a source row to its compact `hbuf` index.
+    let mut needed: Vec<usize> = yofs.iter().flat_map(|&(s0, s1)| [s0, s1]).collect();
+    needed.sort_unstable();
+    needed.dedup();
+    let mut row_of = vec![usize::MAX; in_h];
+    for (hi, &sy) in needed.iter().enumerate() {
+        row_of[sy] = hi;
+    }
+
+    // Horizontal pass over the needed source rows → int (value·2048).
+    let mut hbuf = vec![0i64; needed.len() * out_w * C];
+    for (hi, &sy) in needed.iter().enumerate() {
         for (dx, (&(sx, sx1), &(w0, w1))) in xofs.iter().zip(&xa).enumerate() {
             for ch in 0..C {
-                hbuf[(sy * out_w + dx) * C + ch] = src[(sy * in_w + sx) * C + ch] as i64 * w0
+                hbuf[(hi * out_w + dx) * C + ch] = src[(sy * in_w + sx) * C + ch] as i64 * w0
                     + src[(sy * in_w + sx1) * C + ch] as i64 * w1;
             }
         }
@@ -108,10 +120,11 @@ pub fn resize_bilinear_cv2(
     // Vertical pass → uint8, (acc + 2^21) >> 22.
     let mut out = vec![0u8; out_h * out_w * C];
     for (dy, (&(sy0, sy1), &(v0, v1))) in yofs.iter().zip(&ya).enumerate() {
+        let (r0, r1) = (row_of[sy0], row_of[sy1]);
         for dx in 0..out_w {
             for ch in 0..C {
                 let acc =
-                    hbuf[(sy0 * out_w + dx) * C + ch] * v0 + hbuf[(sy1 * out_w + dx) * C + ch] * v1;
+                    hbuf[(r0 * out_w + dx) * C + ch] * v0 + hbuf[(r1 * out_w + dx) * C + ch] * v1;
                 out[(dy * out_w + dx) * C + ch] = (((acc + (1 << 21)) >> 22).clamp(0, 255)) as u8;
             }
         }
@@ -269,5 +282,26 @@ mod tests {
         let src = vec![128u8; 4 * 4 * 3];
         let out = resize_bilinear_cv2(&src, 4, 4, 8, 8);
         assert_eq!(out.len(), 8 * 8 * 3);
+    }
+
+    /// F-088: resizing to the same size is a bit-exact passthrough (coeffs reduce to weight 2048/0),
+    /// so the row-subsetting must not perturb any pixel.
+    #[test]
+    fn resize_same_size_is_identity() {
+        let src: Vec<u8> = (0..5 * 3 * 3).map(|i| (i * 37 % 256) as u8).collect();
+        let out = resize_bilinear_cv2(&src, 5, 3, 5, 3);
+        assert_eq!(out, src);
+    }
+
+    /// F-088: a tall constant image downscaled exercises the row-subsetting path (in_h ≫ out_h) and
+    /// must still produce the constant everywhere — a regression in the needed-rows remap would corrupt
+    /// it (e.g. an unmapped `usize::MAX` row index would panic / read garbage).
+    #[test]
+    fn resize_constant_preserved_on_tall_downscale() {
+        let (in_h, w) = (200usize, 4usize);
+        let src = vec![123u8; in_h * w * 3];
+        let out = resize_bilinear_cv2(&src, in_h, w, 8, w);
+        assert_eq!(out.len(), 8 * w * 3);
+        assert!(out.iter().all(|&v| v == 123), "constant must be preserved");
     }
 }
