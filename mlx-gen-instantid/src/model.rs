@@ -417,8 +417,9 @@ impl InstantId {
             c
         };
         Ok(ControlContext {
+            // Precompute the step-invariant conditioning embedding once per run (F-069).
+            cond_embed: controlnet.embed_cond(&control_image)?,
             controlnet,
-            control_image,
             scale,
         })
     }

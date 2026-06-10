@@ -206,9 +206,20 @@ impl ControlNet {
         })
     }
 
+    /// Precompute the conditioning embedding for the fixed control image — the
+    /// `cond_embedding` conv stack over the full-resolution control image, which is **step-invariant**
+    /// (it depends only on `control`, not on the latents or timestep). Run once per run and stored in
+    /// `ControlContext` so the ~30-step denoise loop doesn't re-evaluate it every step (F-069); the
+    /// cached tensor is bit-identical to recomputing it inside `forward`. `control` is NHWC
+    /// `[B, H, W, 3]` in `[0,1]`; the result is `[B, H/8, W/8, 320]`.
+    pub fn embed_cond(&self, control: &Array) -> Result<Array> {
+        self.cond_embedding.forward(control)
+    }
+
     /// Compute the control residuals for one denoise step.
     /// - `x`: NHWC latents `[B, H, W, 4]` (the same CFG-batched input the UNet sees).
-    /// - `control`: NHWC control image `[B, H, W, 3]` in `[0,1]`.
+    /// - `cond_embed`: the precomputed conditioning embedding ([`embed_cond`](Self::embed_cond)) for
+    ///   the fixed control image — step-invariant, so it is computed once per run, not per step.
     /// - `encoder_x`: cross-attention conditioning `[B, S, D]` — **text** for tile-CN, the face
     ///   tokens for InstantID. Generic; the branch does not assume text.
     /// - `scale`: `conditioning_scale` applied to every residual.
@@ -216,7 +227,7 @@ impl ControlNet {
     pub fn forward(
         &self,
         x: &Array,
-        control: &Array,
+        cond_embed: &Array,
         timestep: f32,
         encoder_x: &Array,
         text_emb: &Array,
@@ -248,9 +259,9 @@ impl ControlNet {
         let emb = self.add_embedding.forward(&emb)?;
         temb = add(&temb, &emb)?;
 
-        // conv_in + conditioning embedding.
+        // conv_in + conditioning embedding (precomputed once per run — step-invariant, F-069).
         let mut x = self.conv_in.forward(x)?;
-        x = add(&x, &self.cond_embedding.forward(control)?)?;
+        x = add(&x, cond_embed)?;
 
         // Down — collect skip residuals (starting with the stem+cond output).
         let mut residuals: Vec<Array> = vec![x.clone()];

@@ -65,7 +65,10 @@ pub struct Denoiser<'a> {
 /// the `conditioning_scale`. Each step runs the branch on the model input and injects its residuals.
 pub struct ControlContext<'a> {
     pub controlnet: &'a ControlNet,
-    pub control_image: Array,
+    /// The precomputed conditioning embedding for the fixed control image
+    /// ([`ControlNet::embed_cond`]) — step-invariant, so it is computed once at construction rather
+    /// than re-run every denoise step (F-069).
+    pub cond_embed: Array,
     pub scale: f32,
 }
 
@@ -354,7 +357,7 @@ fn denoise_core(
             for cc in controls {
                 let res = cc.controlnet.forward(
                     &x_unet,
-                    &cc.control_image,
+                    &cc.cond_embed,
                     timestep,
                     cn_enc,
                     pooled,
