@@ -219,7 +219,7 @@ impl Connector {
         // 32 heads, head_dim 128) — a sibling of the bf16-GEMM bug, NOT fixed by sc-2714 (which
         // patched matmul.cpp only). The reference's wheel MLX has a correct bf16 SDPA, so an f32
         // SDPA matches it to bf16 rounding. (No-op when the connector already runs f32.) See
-        // tests/op_bf16_probe.rs.
+        // tests/bf16_sdpa_bug.rs.
         let out = scaled_dot_product_attention(
             &q.as_dtype(Dtype::Float32)?,
             &k.as_dtype(Dtype::Float32)?,
