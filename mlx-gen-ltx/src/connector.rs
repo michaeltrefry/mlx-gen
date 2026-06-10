@@ -94,7 +94,8 @@ impl Connector {
     ) -> Result<Self> {
         let n = num_layers as usize;
         let dim = num_heads * head_dim;
-        let f32w = |key: &str| -> Result<Array> {
+        // Load a weight cast to the caller-supplied `dtype` (bf16 on the production path, not f32).
+        let w_at_dtype = |key: &str| -> Result<Array> {
             w.get(key)
                 .ok_or_else(|| Error::MissingTensor(key.into()))?
                 .as_dtype(dtype)
@@ -104,25 +105,25 @@ impl Connector {
         for i in 0..n {
             let b = format!("{prefix}transformer_1d_blocks.{i}.");
             blocks.push(ConnectorBlock {
-                to_q_w: f32w(&format!("{b}attn1.to_q.weight"))?,
-                to_q_b: f32w(&format!("{b}attn1.to_q.bias"))?,
-                to_k_w: f32w(&format!("{b}attn1.to_k.weight"))?,
-                to_k_b: f32w(&format!("{b}attn1.to_k.bias"))?,
-                to_v_w: f32w(&format!("{b}attn1.to_v.weight"))?,
-                to_v_b: f32w(&format!("{b}attn1.to_v.bias"))?,
-                to_out_w: f32w(&format!("{b}attn1.to_out.0.weight"))?,
-                to_out_b: f32w(&format!("{b}attn1.to_out.0.bias"))?,
-                q_norm_w: f32w(&format!("{b}attn1.q_norm.weight"))?,
-                k_norm_w: f32w(&format!("{b}attn1.k_norm.weight"))?,
-                gate_w: f32w(&format!("{b}attn1.to_gate_logits.weight"))?,
-                gate_b: f32w(&format!("{b}attn1.to_gate_logits.bias"))?,
-                ff_in_w: f32w(&format!("{b}ff.net.0.proj.weight"))?,
-                ff_in_b: f32w(&format!("{b}ff.net.0.proj.bias"))?,
-                ff_out_w: f32w(&format!("{b}ff.net.2.weight"))?,
-                ff_out_b: f32w(&format!("{b}ff.net.2.bias"))?,
+                to_q_w: w_at_dtype(&format!("{b}attn1.to_q.weight"))?,
+                to_q_b: w_at_dtype(&format!("{b}attn1.to_q.bias"))?,
+                to_k_w: w_at_dtype(&format!("{b}attn1.to_k.weight"))?,
+                to_k_b: w_at_dtype(&format!("{b}attn1.to_k.bias"))?,
+                to_v_w: w_at_dtype(&format!("{b}attn1.to_v.weight"))?,
+                to_v_b: w_at_dtype(&format!("{b}attn1.to_v.bias"))?,
+                to_out_w: w_at_dtype(&format!("{b}attn1.to_out.0.weight"))?,
+                to_out_b: w_at_dtype(&format!("{b}attn1.to_out.0.bias"))?,
+                q_norm_w: w_at_dtype(&format!("{b}attn1.q_norm.weight"))?,
+                k_norm_w: w_at_dtype(&format!("{b}attn1.k_norm.weight"))?,
+                gate_w: w_at_dtype(&format!("{b}attn1.to_gate_logits.weight"))?,
+                gate_b: w_at_dtype(&format!("{b}attn1.to_gate_logits.bias"))?,
+                ff_in_w: w_at_dtype(&format!("{b}ff.net.0.proj.weight"))?,
+                ff_in_b: w_at_dtype(&format!("{b}ff.net.0.proj.bias"))?,
+                ff_out_w: w_at_dtype(&format!("{b}ff.net.2.weight"))?,
+                ff_out_b: w_at_dtype(&format!("{b}ff.net.2.bias"))?,
             });
         }
-        let registers = f32w(&format!("{prefix}learnable_registers"))?;
+        let registers = w_at_dtype(&format!("{prefix}learnable_registers"))?;
         Ok(Self {
             blocks,
             registers,
