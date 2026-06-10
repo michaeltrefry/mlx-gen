@@ -16,7 +16,7 @@
 //! (~0.98, deep-conv only). The parity bar is therefore the canonical-math one (sc-3131).
 
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_rs::Array;
 
 use crate::bisenet::BiSeNet;
@@ -58,6 +58,13 @@ pub fn resize_bilinear_cv2(
     out_w: usize,
 ) -> Vec<u8> {
     const C: usize = 3;
+    // `src` is indexed by `in_h`/`in_w`; reject a mismatched `(buf, h, w)` triple at the entry rather
+    // than panic out-of-bounds in the horizontal pass (F-081).
+    assert!(
+        src.len() >= in_h * in_w * C,
+        "resize_bilinear_cv2: src buffer of {} bytes too small for {in_h}×{in_w}×3",
+        src.len()
+    );
     const BITS: i64 = 11;
     const SCALE: f64 = (1i64 << BITS) as f64; // 2048
 
@@ -119,6 +126,14 @@ pub fn resize_bilinear_cv2(
 /// (aspect-preserving) → top-left pad to 640² → `(rgb − 127.5) / 128`. Returns the NHWC
 /// `[1,640,640,3]` f32 blob and `det_scale` (= `new_h / h`).
 pub fn detector_blob(img: &[u8], h: usize, w: usize) -> (Array, f32) {
+    // `img` is resized/indexed by `h`/`w`; reject a mismatched `(buf, h, w)` triple at the entry
+    // (F-081). `FaceAnalysis::analyze` already returns a typed error for this; the assert guards
+    // direct callers of this pub primitive.
+    assert!(
+        img.len() >= h * w * 3,
+        "detector_blob: img buffer of {} bytes too small for {h}×{w}×3",
+        img.len()
+    );
     let det = DET_SIZE as usize;
     let im_ratio = h as f64 / w as f64;
     let (new_w, new_h) = if im_ratio > 1.0 {
@@ -181,6 +196,15 @@ impl FaceAnalysis {
     /// Detect → align → embed every face in an RGB `u8` image, sorted **largest-first** (insightface
     /// `app.get()` order — PuLID uses `[0]`, the max face). `h`/`w` are the image dimensions.
     pub fn analyze(&self, img: &[u8], h: usize, w: usize) -> Result<Vec<Face>> {
+        // The worker hands us a decoded buffer plus `(h, w)`; a mismatch would index out of bounds in
+        // the detector/align primitives. Reject it with a typed error rather than crash generation
+        // (F-081) — this is the public worker entry, so it owns the diagnosable check.
+        if img.len() < h * w * 3 {
+            return Err(Error::Msg(format!(
+                "face analyze: img buffer of {} bytes too small for {h}×{w}×3",
+                img.len()
+            )));
+        }
         let (blob, det_scale) = detector_blob(img, h, w);
         let dets = self
             .scrfd
@@ -227,4 +251,26 @@ impl FaceAnalysis {
 fn u8_to_rgb01(crop: &[u8], h: i32, w: i32) -> Array {
     let data: Vec<f32> = crop.iter().map(|&v| v as f32 / 255.0).collect();
     Array::from_slice(&data, &[1, h, w, 3])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-081: `resize_bilinear_cv2` indexes `src` by `in_h`/`in_w`; a buffer too small for the claimed
+    /// dims is caught at the entry, not as an opaque out-of-bounds in the horizontal pass.
+    #[test]
+    #[should_panic(expected = "too small for 4×4×3")]
+    fn resize_rejects_undersized_buffer() {
+        let src = vec![0u8; 4 * 4 * 3 - 1]; // one byte short of 4×4×3
+        let _ = resize_bilinear_cv2(&src, 4, 4, 8, 8);
+    }
+
+    /// A correctly-sized buffer resizes to the requested `out_h × out_w × 3`.
+    #[test]
+    fn resize_accepts_matched_buffer() {
+        let src = vec![128u8; 4 * 4 * 3];
+        let out = resize_bilinear_cv2(&src, 4, 4, 8, 8);
+        assert_eq!(out.len(), 8 * 8 * 3);
+    }
 }

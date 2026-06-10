@@ -209,6 +209,14 @@ pub fn warp_affine(
     out_w: usize,
     border: [u8; 3],
 ) -> Vec<u8> {
+    // `src` is indexed as `(y·in_w + x)·3 + ch` with bounds from `in_h`/`in_w` only; a `(buf,h,w)`
+    // mismatch would otherwise index out of bounds deep in the sample loop. Check the contract at the
+    // entry so the failure is labeled here (F-081). Callers that decode their own buffers uphold it.
+    assert!(
+        src.len() >= in_h * in_w * 3,
+        "warp_affine: src buffer of {} bytes too small for {in_h}×{in_w}×3",
+        src.len()
+    );
     let im = forward.invert().0; // src_x = im0·x+im1·y+im2 ; src_y = im3·x+im4·y+im5
     let adelta: Vec<i64> = (0..out_w as i64)
         .map(|x| cv_round(im[0] * x as f64 * AB_SCALE))
@@ -324,5 +332,15 @@ mod tests {
         let id = Affine2x3([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
         let out = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0]);
         assert_eq!(out, src, "identity warp must be lossless");
+    }
+
+    /// F-081: a `(buf, h, w)` mismatch (buffer too small for the claimed dims) is caught at the entry
+    /// with a labeled message, not an opaque out-of-bounds index deep in the sample loop.
+    #[test]
+    #[should_panic(expected = "too small for 8×8×3")]
+    fn warp_affine_rejects_undersized_buffer() {
+        let src = vec![0u8; 8 * 8 * 3 - 1]; // one byte short of 8×8×3
+        let id = Affine2x3([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let _ = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0]);
     }
 }
