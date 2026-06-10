@@ -344,6 +344,22 @@ pub struct WanVaceTransformer {
     compute_dtype: Dtype,
 }
 
+/// Per-generate constants hoisted out of the VACE denoise loop (F-023). The RoPE cos/sin table (keyed
+/// on the latent grid) and the patch-embedded 96-ch control latent are identical at every step, so
+/// `denoise_vace` builds this once and reuses it for every step *and* both CFG branches — eliminating
+/// the per-step RoPE rebuild + control re-patchify the old per-call `forward_vace` did. Mirrors the
+/// base Wan [`crate::pipeline::StepCache`] (which also caches the projected text contexts; those are
+/// hoisted here as separate `text_embed` results since they differ per CFG branch).
+struct VaceStepCache {
+    cos_t: Array,
+    sin_t: Array,
+    /// `vace_patch_embedding(control)` zero-padded to the main token length `l` — `[1, l, dim]`.
+    control_emb: Array,
+    /// Main-latent token count and grid (constant across steps for a fixed latent shape).
+    l: i32,
+    grid: (usize, usize, usize),
+}
+
 impl WanVaceTransformer {
     /// Load from a diffusers-layout VACE transformer weight map. `compute_dtype` selects the matmul
     /// precision (f32 for the structural golden; bf16 for the production checkpoint).
@@ -467,29 +483,26 @@ impl WanVaceTransformer {
         context: &Array,
         scales: &[f32],
     ) -> Result<Array> {
-        if scales.len() != self.cfg.vace_layers.len() {
-            return Err(mlx_gen::Error::Msg(format!(
-                "wan-vace: control_hidden_states_scale len {} != vace_layers len {}",
-                scales.len(),
-                self.cfg.vace_layers.len()
-            )));
-        }
+        // Single-shot path: build the per-generate cache + project the context once, then run the
+        // step body. `denoise_vace` instead builds these once and reuses them across every step/branch
+        // (F-023); this wrapper keeps the public API (and the parity gates) bit-identical.
+        let cache = self.build_vace_cache(latent, control)?;
+        let context_emb = self.text_embed(context)?;
+        self.forward_vace_cached(latent, t, &cache, &context_emb, scales)
+    }
+
+    /// Build the step-invariant [`VaceStepCache`] for a fixed latent shape + control latent. The grid
+    /// is taken from `sample_latent` (every denoise step shares it). Done once per generate (F-023).
+    fn build_vace_cache(&self, sample_latent: &Array, control: &Array) -> Result<VaceStepCache> {
         let dt = self.compute_dtype;
         let dim = self.cfg.base.dim as i32;
         let patch = self.cfg.base.patch_size;
 
         // RoPE over the main latent grid (cast to compute_dtype, mirroring the base Wan regime).
-        let grid = self.patch_grid(latent);
+        let grid = self.patch_grid(sample_latent);
         let (cos_t, sin_t) = self.rope.precompute_cos_sin(grid)?;
         let (cos_t, sin_t) = (cast(&cos_t, dt)?, cast(&sin_t, dt)?);
-
-        // Patch-embed the noisy latent → [1, L, dim] (f32 residual).
-        let (tokens, _) = patchify(latent, patch)?;
         let l = (grid.0 * grid.1 * grid.2) as i32;
-        let x_tokens = self
-            .patch_embedding
-            .forward(&tokens)?
-            .reshape(&[1, l, dim])?;
 
         // Patch-embed the control latent via vace_patch_embedding, then zero-pad tokens to L.
         let (ctokens, cgrid) = patchify(control, patch)?;
@@ -505,17 +518,56 @@ impl WanVaceTransformer {
             control_emb
         };
 
-        // Condition embeddings.
+        Ok(VaceStepCache {
+            cos_t,
+            sin_t,
+            control_emb,
+            l,
+            grid,
+        })
+    }
+
+    /// The step-varying body of [`forward_vace`]: patch-embed the noisy `latent`, time-embed `t`, run
+    /// the VACE hint stack + main blocks against the cached RoPE / control embed / projected
+    /// `context_emb`, and unpatchify. Identical math to the old single-shot `forward_vace` — only the
+    /// step-invariant work (RoPE, control patchify, `text_embed`) is hoisted into `cache`/`context_emb`.
+    fn forward_vace_cached(
+        &self,
+        latent: &Array,
+        t: f32,
+        cache: &VaceStepCache,
+        context_emb: &Array,
+        scales: &[f32],
+    ) -> Result<Array> {
+        if scales.len() != self.cfg.vace_layers.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "wan-vace: control_hidden_states_scale len {} != vace_layers len {}",
+                scales.len(),
+                self.cfg.vace_layers.len()
+            )));
+        }
+        let dt = self.compute_dtype;
+        let dim = self.cfg.base.dim as i32;
+        let patch = self.cfg.base.patch_size;
+        let (l, grid) = (cache.l, cache.grid);
+
+        // Patch-embed the noisy latent → [1, L, dim] (f32 residual).
+        let (tokens, _) = patchify(latent, patch)?;
+        let x_tokens = self
+            .patch_embedding
+            .forward(&tokens)?
+            .reshape(&[1, l, dim])?;
+
+        // Condition embeddings (time is step-varying; the text context is cached).
         let (e, e0) = self.time_embed(t)?;
-        let context_emb = self.text_embed(context)?;
 
         // VACE hint prep: thread the control stream through every vace block; collect hints.
-        let rope = (&cos_t, &sin_t);
-        let mut control_hs = control_emb;
+        let rope = (&cache.cos_t, &cache.sin_t);
+        let mut control_hs = cache.control_emb.clone();
         let mut hints: Vec<(Array, f32)> = Vec::with_capacity(self.vace_blocks.len());
         for (j, vb) in self.vace_blocks.iter().enumerate() {
             let (hint, new_control) =
-                vb.forward(&control_hs, &x_tokens, &e0, &context_emb, rope, dt)?;
+                vb.forward(&control_hs, &x_tokens, &e0, context_emb, rope, dt)?;
             hints.push((hint, scales[j]));
             control_hs = new_control;
         }
@@ -524,7 +576,7 @@ impl WanVaceTransformer {
         // Main blocks with hint injection at each layer in vace_layers.
         let mut x = x_tokens;
         for (i, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, &e0, &context_emb, rope, dt)?;
+            x = block.forward(&x, &e0, context_emb, rope, dt)?;
             if self.cfg.vace_layers.contains(&i) {
                 let (hint, scale) = hints
                     .pop()
@@ -785,12 +837,26 @@ pub fn denoise_vace(
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
+    // Hoist the step-invariant work out of the loop (F-023): the RoPE table + patch-embedded control
+    // latent (shared by every step AND both CFG branches) and the projected text contexts (constant
+    // per branch). The old loop rebuilt all of these inside each of the 2 forwards per step.
+    let cache = transformer.build_vace_cache(init_noise, control)?;
+    let ctx_cond_emb = transformer.text_embed(ctx_cond)?;
+    let ctx_uncond_emb = ctx_uncond.map(|u| transformer.text_embed(u)).transpose()?;
+    mlx_rs::transforms::eval([
+        &cache.cos_t,
+        &cache.sin_t,
+        &cache.control_emb,
+        &ctx_cond_emb,
+    ])?;
+
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
-        let cond = transformer.forward_vace(&latents, control, t, ctx_cond, scales)?;
-        let pred = match ctx_uncond {
-            Some(uncond_ctx) => {
-                let uncond = transformer.forward_vace(&latents, control, t, uncond_ctx, scales)?;
+        let cond = transformer.forward_vace_cached(&latents, t, &cache, &ctx_cond_emb, scales)?;
+        let pred = match &ctx_uncond_emb {
+            Some(uncond_emb) => {
+                let uncond =
+                    transformer.forward_vace_cached(&latents, t, &cache, uncond_emb, scales)?;
                 add(
                     &uncond,
                     &multiply(&subtract(&cond, &uncond)?, scalar(guidance))?,
