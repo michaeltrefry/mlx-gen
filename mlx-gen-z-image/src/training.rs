@@ -302,10 +302,40 @@ inventory::submit! {
     TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer }
 }
 
+/// Recognized `timestep_type` values — the noise-schedule samplers [`sample_sigma`] branches on
+/// (`linear`/`uniform`/`weighted`) plus the `sigmoid` default it falls back to. Any other string
+/// would silently sample sigmoid (F-041).
+const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
+/// Recognized `timestep_bias` values — the high/low-noise tilts [`sample_sigma`] branches on plus
+/// the neutral default (`balanced`/`none`/`neutral`) it falls back to.
+const TIMESTEP_BIASES: [&str; 9] = [
+    "balanced",
+    "none",
+    "neutral",
+    "high",
+    "high_noise",
+    "favor_high_noise",
+    "low",
+    "low_noise",
+    "favor_low_noise",
+];
+/// Recognized `loss_type` values — `mae`/`l1` select MAE, `mse`/`l2` the MSE default; any other
+/// string would silently train MSE (F-041).
+const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
+
+/// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
+/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
+fn normalize_cfg(s: &str) -> String {
+    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
+}
+
 /// Capability-free training-request validation, factored out of [`Trainer::validate`] so it can be
 /// unit-tested without a loaded trainer (mirrors the inference-side `validate_request`). Rejects an
 /// empty dataset, zero rank, **zero steps** (F-040 — a 0-step run would otherwise fall straight
-/// through to the save and write a no-op `B = 0` identity adapter), and unsupported optimizers.
+/// through to the save and write a no-op `B = 0` identity adapter), an unsupported optimizer, and —
+/// rather than letting a typo silently fall back to a default sampler/loss (F-041) — an unrecognized
+/// `timestep_type` / `timestep_bias` / `loss_type`. The non-empty target-module resolution (also
+/// F-041) is checked in [`Trainer::validate`], which has the loaded DiT to match suffixes against.
 fn validate_request(req: &TrainingRequest) -> Result<()> {
     if req.items.is_empty() {
         return Err("z_image_turbo trainer: dataset is empty".into());
@@ -324,6 +354,30 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
         )
         .into());
     }
+    if !TIMESTEP_TYPES.contains(&normalize_cfg(&req.config.timestep_type).as_str()) {
+        return Err(format!(
+            "z_image_turbo trainer: timestep_type '{}' is not recognized (supported: {})",
+            req.config.timestep_type,
+            TIMESTEP_TYPES.join(", ")
+        )
+        .into());
+    }
+    if !TIMESTEP_BIASES.contains(&normalize_cfg(&req.config.timestep_bias).as_str()) {
+        return Err(format!(
+            "z_image_turbo trainer: timestep_bias '{}' is not recognized (supported: {})",
+            req.config.timestep_bias,
+            TIMESTEP_BIASES.join(", ")
+        )
+        .into());
+    }
+    if !LOSS_TYPES.contains(&normalize_cfg(&req.config.loss_type).as_str()) {
+        return Err(format!(
+            "z_image_turbo trainer: loss_type '{}' is not recognized (supported: {})",
+            req.config.loss_type,
+            LOSS_TYPES.join(", ")
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -333,7 +387,19 @@ impl Trainer for ZImageTurboTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> Result<()> {
-        validate_request(req)
+        validate_request(req)?;
+        // Non-default `lora_target_modules` that match no adaptable module on the DiT would resolve
+        // to an empty target set — a full-length run that trains zero parameters yet "succeeds"
+        // (F-041). Catch it here, where the loaded DiT is available to match suffixes against.
+        if resolve_target_paths(&self.transformer, &req.config).is_empty() {
+            return Err(format!(
+                "z_image_turbo trainer: lora_target_modules {:?} matched no adaptable module on the \
+                 DiT",
+                req.config.lora_target_modules
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn train(
@@ -667,5 +733,25 @@ mod validate_request_tests {
         assert!(validate_request(&request(1, 100, 16)).is_ok());
         assert!(validate_request(&request(0, 100, 16)).is_err()); // empty dataset
         assert!(validate_request(&request(1, 100, 0)).is_err()); // zero rank
+    }
+
+    #[test]
+    fn rejects_unrecognized_schedule_and_loss_strings() {
+        // F-041: a typo in these strings used to silently fall back to a default sampler/loss.
+        let with = |f: fn(&mut TrainingConfig)| {
+            let mut r = request(1, 100, 16);
+            f(&mut r.config);
+            validate_request(&r)
+        };
+        assert!(with(|c| c.timestep_type = "sgmoid".into()).is_err());
+        assert!(with(|c| c.timestep_bias = "hihg_noise".into()).is_err());
+        assert!(with(|c| c.loss_type = "huber".into()).is_err());
+
+        // The defaults and documented spellings still pass, case- and separator-insensitively.
+        assert!(with(|c| c.timestep_type = "Linear".into()).is_ok());
+        assert!(with(|c| c.timestep_bias = "High-Noise".into()).is_ok());
+        assert!(with(|c| c.loss_type = "L1".into()).is_ok());
+        // A default request (sigmoid / balanced / mse) is accepted.
+        assert!(validate_request(&request(1, 100, 16)).is_ok());
     }
 }
