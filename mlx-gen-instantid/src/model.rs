@@ -46,6 +46,23 @@ use crate::restore;
 /// the SDXL loader).
 const DTYPE: Dtype = Dtype::Float16;
 
+/// Number of face landmarks `draw_kps` indexes (`[left_eye, right_eye, nose, mouth_left,
+/// mouth_right]`).
+const FACE_KP_COUNT: usize = 5;
+
+/// Reject a caller-supplied `kps` slice shorter than [`FACE_KP_COUNT`] with a typed error, mirroring
+/// the 512-d embedding check in the public seams. Without this, `kps::draw_kps` asserts and panics the
+/// process on a truncated landmark list (F-079).
+fn validate_kps(kps: &[(f32, f32)]) -> Result<()> {
+    if kps.len() < FACE_KP_COUNT {
+        return Err(Error::Msg(format!(
+            "instantid: need {FACE_KP_COUNT} face keypoints, got {}",
+            kps.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Default `ip_adapter_scale` (the vendored pipeline's `set_ip_adapter_scale(0.8)`).
 pub const DEFAULT_IP_SCALE: f32 = 0.8;
 /// Default IdentityNet `controlnet_conditioning_scale` (the vendored default 0.8).
@@ -269,6 +286,7 @@ impl InstantId {
                 embedding.len()
             )));
         }
+        validate_kps(kps)?;
         let cfg_on = req.guidance > 1.0;
 
         // Seed up front so the first RNG draw is the prior (conditioning draws no RNG).
@@ -436,6 +454,9 @@ impl InstantId {
                 embedding.len()
             )));
         }
+        if let Some(kps) = face_kps {
+            validate_kps(kps)?;
+        }
         let openpose = self.openpose.as_ref().ok_or_else(|| {
             Error::Msg("instantid: pose mode needs the OpenPose ControlNet (with_openpose)".into())
         })?;
@@ -575,5 +596,27 @@ impl InstantId {
         let mut out = base.clone();
         restore::paste_alpha(&mut out, &small, crop_w, crop_h, a, b, &alpha);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_kps_rejects_short_slices() {
+        // F-079: a truncated landmark list from the public seam must return a typed error rather than
+        // tripping draw_kps's assert and panicking the worker.
+        for len in 0..FACE_KP_COUNT {
+            let kps = vec![(0.0f32, 0.0f32); len];
+            let err = validate_kps(&kps).unwrap_err().to_string();
+            assert!(
+                err.contains("need 5 face keypoints"),
+                "len {len} got: {err}"
+            );
+        }
+        // Exactly 5 (and more) is accepted.
+        assert!(validate_kps(&[(0.0, 0.0); FACE_KP_COUNT]).is_ok());
+        assert!(validate_kps(&[(0.0, 0.0); FACE_KP_COUNT + 1]).is_ok());
     }
 }
