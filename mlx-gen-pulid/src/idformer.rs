@@ -80,6 +80,14 @@ impl MappingMlp {
 }
 
 /// PerceiverAttention: q from `latents`, k/v from `cat(ctx, latents)`. bias-free linears.
+///
+/// **Shares its structure with [`crate::ca`]'s `PerceiverAttentionCA`** (same `norm1`/`norm2` +
+/// `to_q`/`to_kv`/`to_out` weight keys, head split, `EPS = 1e-5`, SDPA `scale = dim_head^-0.5`, and
+/// out-projection). They are kept as separate 1:1 mirrors of the two distinct upstream Python classes
+/// (F-085). The **only** behavioral difference is the k/v source: here k/v come from
+/// `cat(ctx, latents)`, whereas the CA variant uses `x` (the id_embedding) alone. Any change to the
+/// shared plumbing — EPS, the SDPA scale, the bias-free linears, a future quantization path — must be
+/// applied to **both** to preserve parity.
 struct PerceiverAttention {
     norm1_w: Array,
     norm1_b: Array,

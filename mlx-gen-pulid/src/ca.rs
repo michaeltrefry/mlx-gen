@@ -27,6 +27,14 @@ fn join(p: &str, leaf: &str) -> String {
 
 /// Cross-attention block: q from `latents` (image tokens, dim=3072), k/v from `x` (id_embedding,
 /// kv_dim=2048). All linears bias-free.
+///
+/// **Shares its structure with [`crate::idformer`]'s `PerceiverAttention`** (same `norm1`/`norm2` +
+/// `to_q`/`to_kv`/`to_out` weight keys, head split, `EPS = 1e-5`, SDPA `scale = dim_head^-0.5`, and
+/// out-projection). They are kept as separate 1:1 mirrors of the two distinct upstream Python classes
+/// (F-085). The **only** behavioral difference is the k/v source: here k/v come from `x` alone (the
+/// id_embedding), whereas IDFormer's variant uses `cat(ctx, latents)`. Any change to the shared
+/// plumbing — EPS, the SDPA scale, the bias-free linears, a future quantization path — must be applied
+/// to **both** to preserve parity.
 pub struct PerceiverAttentionCA {
     norm1_w: Array, // over kv_dim (id_embedding)
     norm1_b: Array,
