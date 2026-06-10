@@ -535,8 +535,9 @@ impl Wan14b {
 /// from_weights`] builds the experts quantized directly (the `loading.py` consume path), so **no**
 /// load-time re-quantization is applied (returns `None`). A *dense bf16* snapshot honors
 /// `spec.quantize` (quantized in-memory after load). A bits conflict is a hard error: the on-disk
-/// manifest is authoritative, so we don't silently ignore (or re-quantize at) a different width
-/// (mirrors the spirit of `mlx_gen::quant::resolve_bits`, "stored wins", but surfaced loudly).
+/// manifest is authoritative, so we don't silently ignore (or re-quantize at) a different width.
+/// (This is a deliberately *loud* "stored wins" — a pre-quantized snapshot at a different width is a
+/// hard error here, not a silent downgrade.)
 fn resolve_load_time_quant(
     id: &str,
     cfg: &WanModelConfig,
