@@ -9,14 +9,12 @@
 //! RMSNorm/LayerNorm weights stay full precision. With f32 activations the quantized forward feeds
 //! `quantized_matmul` f32 inputs (no bf16 upcast needed). LoRA over these bases = sc-2646.
 
-use std::f32::consts::LN_10;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, split, subtract};
+use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, split};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
+use std::f32::consts::LN_10;
 
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
@@ -36,23 +34,11 @@ type CacheSlot<'a> = Option<(&'a Flux2KvCache, usize)>;
 const LN_EPS: f32 = 1e-6;
 const RMS_EPS: f32 = 1e-5;
 
-/// sc-2963 (rollout of the Wan sc-2957 template): when on, the FLUX.2 MMDiT's fusable elementwise
-/// *glue* — adaLN affine (`(1+scale)·norm+shift`), SwiGLU activation, gated residual (`x+gate·y`),
-/// and the complex RoPE rotation — runs through `mx.compile` so MLX fuses each chain into a single
-/// Metal kernel (vs one kernel per primitive op when eager). The big GEMMs / SDPA / `mx.fast` norms
-/// stay eager (already single fused kernels). **Bit-exact** to the eager form (`compile_parity.rs`
-/// gates `max|Δ|=0`). **Enabled by the production denoise loop** ([`crate::model`]); left **off by
-/// default** so the reference-parity gates run eager and `compile_parity` can A/B both.
-static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
-
-/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
-pub fn set_compile_glue(on: bool) {
-    COMPILE_GLUE.store(on, Ordering::Relaxed);
-}
-
-pub(crate) fn compile_glue() -> bool {
-    COMPILE_GLUE.load(Ordering::Relaxed)
-}
+// sc-2963 compiled-glue toggle + the `modulate`/`gated`/`rope_rotate` helpers are hoisted into core
+// (F-101) so FLUX.1/FLUX.2 share one implementation. Re-export the toggle as this crate's public API;
+// FLUX.2's modulate keeps a strong f32 `1` via `one_matches_scale = false`. SwiGLU stays crate-specific.
+use mlx_gen::nn::compile_glue;
+pub use mlx_gen::nn::set_compile_glue;
 
 /// Wrap a stored `[out, in]` weight as a bias-less dense [`AdaptableLinear`] (every FLUX.2
 /// transformer projection). Dense forward = `matmul(x, wᵀ)`, bit-identical to the prior raw
@@ -91,25 +77,10 @@ fn process_qkv(
     Ok((q, k, v))
 }
 
-/// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`. When the
-/// sc-2963 glue toggle is on, MLX fuses the 4 multiplies + add/sub into one kernel (vs 6 eager ops,
-/// applied to both q and k every block). Bit-exact to the eager form.
+/// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`. Forwards to
+/// the shared [`mlx_gen::nn::rope_rotate`].
 fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
-        let (r, i, c, s) = (&inp[0], &inp[1], &inp[2], &inp[3]);
-        let out0 = subtract(&multiply(r, c)?, &multiply(i, s)?)?;
-        let out1 = add(&multiply(i, c)?, &multiply(r, s)?)?;
-        Ok(vec![out0, out1])
-    };
-    let args = [real.clone(), imag.clone(), cos.clone(), sin.clone()];
-    let mut out = if compile_glue() {
-        compile(f, true)(&args)?
-    } else {
-        f(&args)?
-    };
-    let out1 = out.pop().unwrap();
-    let out0 = out.pop().unwrap();
-    Ok((out0, out1))
+    mlx_gen::nn::rope_rotate(real, imag, cos, sin)
 }
 
 /// Interleaved RoPE (`AttentionUtils.apply_rope_bshd`): pairs `(x[2i], x[2i+1])` rotated by
@@ -160,30 +131,15 @@ fn swiglu(x: &Array) -> Result<Array> {
     }
 }
 
-/// `(1 + scale) · norm(x) + shift` with `scale`/`shift` broadcast `[B,1,D]`. One fused kernel when
-/// the sc-2963 glue toggle is on; the body is bit-identical to the eager affine.
+/// `(1 + scale) · norm(x) + shift` — FLUX.2 keeps a strong f32 `1`. Forwards to the shared
+/// [`mlx_gen::nn::modulate`] with `one_matches_scale = false`.
 fn modulate(norm: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    let f = |(n, s, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(&multiply(n, &add(s, scalar(1.0))?)?, sh)
-    };
-    if compile_glue() {
-        Ok(compile(f, true)((norm, scale, shift))?)
-    } else {
-        Ok(f((norm, scale, shift))?)
-    }
+    mlx_gen::nn::modulate(norm, scale, shift, false)
 }
 
-/// Gated residual `x + gate·y` — one fused kernel when the sc-2963 glue toggle is on; bit-identical
-/// to the eager `add(x, gate·y)`.
+/// Gated residual `x + gate·y`. Forwards to the shared [`mlx_gen::nn::gated`].
 fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
-    let f = |(x, g, y): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(x, &multiply(g, y)?)
-    };
-    if compile_glue() {
-        Ok(compile(f, true)((x, gate, y))?)
-    } else {
-        Ok(f((x, gate, y))?)
-    }
+    mlx_gen::nn::gated(x, gate, y)
 }
 
 /// Sinusoidal timestep embedding (diffusers `_timestep_embedding`, flip_sin_to_cos): `[B]` → `[B,

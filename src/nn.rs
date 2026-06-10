@@ -7,16 +7,96 @@
 //! graduates here only once it is provably model-agnostic; we do not lift a block to a shared
 //! abstraction off a single model.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use mlx_rs::error::Exception;
 use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{
     add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, divide, erf, multiply,
-    power, sigmoid, tanh,
+    power, sigmoid, subtract, tanh,
 };
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 use crate::array::scalar;
 use crate::Result;
+
+/// sc-2963 (rollout of the Wan sc-2957 template): the shared compiled-elementwise-*glue* toggle and
+/// its fusable helpers, hoisted out of the per-family transformers (F-101) so a fix to the wrapper
+/// lands once instead of N times. When on, each helper runs its chain through `mx.compile` so MLX
+/// fuses it into a single Metal kernel; **bit-exact** to the eager form (each family's
+/// `compile_parity` gate asserts `max|Δ|=0`). Process-global; set before the denoise loop, off by
+/// default so reference-parity gates run eager.
+static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+pub fn set_compile_glue(on: bool) {
+    COMPILE_GLUE.store(on, Ordering::Relaxed);
+}
+
+/// Whether the compiled elementwise glue is currently enabled.
+pub fn compile_glue() -> bool {
+    COMPILE_GLUE.load(Ordering::Relaxed)
+}
+
+/// Gated residual `x + gate·y` (`gate` pre-broadcast). One fused kernel when [`compile_glue`] is on;
+/// bit-identical to the eager `add(x, gate·y)`. Shared by the FLUX.1/FLUX.2 MMDiTs (F-101).
+pub fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
+    let f = |(x, g, y): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(x, &multiply(g, y)?)
+    };
+    if compile_glue() {
+        Ok(compile(f, true)((x, gate, y))?)
+    } else {
+        Ok(f((x, gate, y))?)
+    }
+}
+
+/// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`, in f32. One
+/// fused kernel when [`compile_glue`] is on (vs 6 eager ops). Shared by FLUX.1/FLUX.2 (F-101).
+pub fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
+    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
+        let (r, i, c, s) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+        let out0 = subtract(&multiply(r, c)?, &multiply(i, s)?)?;
+        let out1 = add(&multiply(i, c)?, &multiply(r, s)?)?;
+        Ok(vec![out0, out1])
+    };
+    let args = [real.clone(), imag.clone(), cos.clone(), sin.clone()];
+    let mut out = if compile_glue() {
+        compile(f, true)(&args)?
+    } else {
+        f(&args)?
+    };
+    let out1 = out.pop().unwrap();
+    let out0 = out.pop().unwrap();
+    Ok((out0, out1))
+}
+
+/// adaLN affine `(1 + scale)·norm + shift` (`scale`/`shift` pre-broadcast). One fused kernel when
+/// [`compile_glue`] is on; bit-identical to the eager affine. Shared by FLUX.1/FLUX.2 (F-101) with
+/// **`one_matches_scale`** carrying each family's deliberate dtype policy for the literal `1`: `true`
+/// casts it to `scale`'s dtype so `1+scale` rounds in bf16 (FLUX.1 — the fork's weak python `1`,
+/// sc-2787); `false` keeps a strong f32 `1` (FLUX.2), promoting the sum to f32.
+pub fn modulate(
+    norm: &Array,
+    scale: &Array,
+    shift: &Array,
+    one_matches_scale: bool,
+) -> Result<Array> {
+    let f = move |(n, s, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        let one = if one_matches_scale {
+            scalar(1.0).as_dtype(s.dtype())?
+        } else {
+            scalar(1.0)
+        };
+        add(&multiply(n, &add(s, &one)?)?, sh)
+    };
+    if compile_glue() {
+        Ok(compile(f, true)((norm, scale, shift))?)
+    } else {
+        Ok(f((norm, scale, shift))?)
+    }
+}
 
 /// `y = x · Wᵀ + b` for a stored `[out, in]` weight + bias (PyTorch `nn.Linear` convention).
 ///
@@ -212,6 +292,53 @@ mod tests {
     use super::*;
     use mlx_rs::ops::{abs, array_eq, max, subtract};
     use mlx_rs::Dtype;
+
+    #[test]
+    fn compile_glue_helpers_are_bit_exact_and_modulate_dtype_policy() {
+        // F-101: the hoisted glue helpers must be bit-identical eager vs compiled (the sc-2963
+        // invariant), now testable in core without weights.
+        let bit_exact = |on: bool| {
+            set_compile_glue(false);
+            let x = Array::from_slice(&[1.0f32, -2.0, 3.0, 0.5], &[1, 1, 4]);
+            let g = Array::from_slice(&[0.5f32, 0.25, -0.5, 2.0], &[1, 1, 4]);
+            let y = Array::from_slice(&[2.0f32, 2.0, 2.0, 2.0], &[1, 1, 4]);
+            let eager_gated = gated(&x, &g, &y).unwrap();
+            let eager_mod = modulate(&x, &g, &y, false).unwrap();
+            let (er, ei) = rope_rotate(&x, &g, &y, &x).unwrap();
+            set_compile_glue(on);
+            let c_gated = gated(&x, &g, &y).unwrap();
+            let c_mod = modulate(&x, &g, &y, false).unwrap();
+            let (cr, ci) = rope_rotate(&x, &g, &y, &x).unwrap();
+            set_compile_glue(false);
+            for (a, b) in [
+                (eager_gated, c_gated),
+                (eager_mod, c_mod),
+                (er, cr),
+                (ei, ci),
+            ] {
+                assert!(array_eq(&a, &b, None).unwrap().item::<bool>());
+            }
+        };
+        bit_exact(false); // eager == eager (sanity)
+        bit_exact(true); // compiled == eager (the invariant)
+
+        // modulate dtype policy (F-101): with a bf16 `scale`, `one_matches_scale=true` keeps the
+        // `1+scale` add in bf16 (coarse), while `false` promotes it to f32 — a real, different value.
+        set_compile_glue(false);
+        let norm = Array::from_slice(&[1.0f32], &[1]);
+        // 0.003 is not representable in bf16; (1 + 0.003) rounds differently bf16 vs f32.
+        let scale = Array::from_slice(&[0.003f32], &[1])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let shift = Array::from_slice(&[0.0f32], &[1]);
+        let bf16_one = modulate(&norm, &scale, &shift, true).unwrap();
+        let f32_one = modulate(&norm, &scale, &shift, false).unwrap();
+        assert_ne!(
+            bf16_one.as_dtype(Dtype::Float32).unwrap().item::<f32>(),
+            f32_one.as_dtype(Dtype::Float32).unwrap().item::<f32>(),
+            "the dtype policy for the literal 1 must actually change the result"
+        );
+    }
 
     #[test]
     fn linear_is_fused_addmm() {
