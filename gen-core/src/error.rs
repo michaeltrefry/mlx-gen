@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn backend_wraps_a_source_error() {
-        let io = std::io::Error::new(std::io::ErrorKind::Other, "device lost");
+        let io = std::io::Error::other("device lost");
         let e = Error::backend(io);
         assert!(matches!(e, Error::Backend(_)));
         assert_eq!(e.to_string(), "backend op failed: device lost");

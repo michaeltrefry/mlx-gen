@@ -58,5 +58,22 @@ impl From<Error> for gen_core::Error {
     }
 }
 
+/// The reverse bridge: gen-core contract calls (tokenizer, registry, imageops, capability
+/// validation) return `gen_core::Error`; mlx-gen and family code invoke them with `?` inside
+/// `mlx_gen::Result` fns, so down-convert here. `Backend`/`Unsupported`/`Canceled` have no rich
+/// mlx-gen analog and collapse to `Msg` (keeping the display text).
+impl From<gen_core::Error> for Error {
+    fn from(e: gen_core::Error) -> Self {
+        match e {
+            gen_core::Error::Backend(b) => Error::Msg(b.to_string()),
+            gen_core::Error::MissingTensor(s) => Error::MissingTensor(s),
+            gen_core::Error::Io(io) => Error::Io(io),
+            gen_core::Error::Unsupported(s) => Error::Msg(format!("unsupported: {s}")),
+            gen_core::Error::Canceled => Error::Msg("cancelled".to_string()),
+            gen_core::Error::Msg(s) => Error::Msg(s),
+        }
+    }
+}
+
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
