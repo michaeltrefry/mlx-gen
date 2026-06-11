@@ -25,13 +25,7 @@ use crate::config::HieraConfig;
 /// LayerNorm epsilon (`nn.LayerNorm(dim, eps=1e-6)`).
 const EPS: f32 = 1e-6;
 
-fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_string()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
+use crate::util::join;
 
 /// Non-overlapping max-pool (`nn.MaxPool2d(kernel_size=stride, stride=stride)`) over NHWC `x`.
 /// Output spatial dim is `floor((d - stride)/stride) + 1`, matching torch/MLX pooling.

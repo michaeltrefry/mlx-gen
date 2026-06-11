@@ -25,13 +25,7 @@ use crate::hiera::Hiera;
 const POS_NUM_FEATS: i32 = 256;
 const POS_TEMPERATURE: f64 = 10000.0;
 
-fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_string()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
+use crate::util::join;
 
 /// Sinusoidal position encoding (`PositionEmbeddingSine`, `normalize=True`). `x`: NHWC `[b,h,w,c]`;
 /// returns NHWC `[b, h, w, num_pos_feats]`. The values depend only on `(h, w)`, so the per-axis

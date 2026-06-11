@@ -46,13 +46,7 @@ const D_MODEL: i32 = 256;
 /// Axial-RoPE base.
 const ROPE_THETA: f64 = 10000.0;
 
-fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_string()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
+use crate::util::{join, layer_norm_2d};
 
 fn weight_bias(w: &Weights, prefix: &str) -> Result<(Array, Array)> {
     Ok((
@@ -81,20 +75,6 @@ fn conv2d_nchw(
     )?;
     let y = add(&y, b)?; // bias over the last (channel) axis, NHWC
     Ok(y.transpose_axes(&[0, 3, 1, 2])?)
-}
-
-/// `LayerNorm2d`: normalize an **NCHW** tensor over the channel axis (per spatial position).
-fn layer_norm_2d(x: &Array, weight: &Array, bias: &Array) -> Result<Array> {
-    let mean = ops::mean_axes(x, &[1], true)?;
-    let centered = subtract(x, &mean)?;
-    let var = ops::mean_axes(&ops::square(&centered)?, &[1], true)?;
-    let normed = multiply(
-        &centered,
-        &ops::rsqrt(&add(&var, Array::from_f32(LN2D_EPS))?)?,
-    )?;
-    let wt = weight.reshape(&[1, -1, 1, 1])?;
-    let bs = bias.reshape(&[1, -1, 1, 1])?;
-    Ok(add(&multiply(&normed, &wt)?, &bs)?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -137,7 +117,7 @@ impl MaskDownSampler {
             let (cw, cb, stride, pad) = &self.convs[i];
             x = conv2d_nchw(&x, cw, cb, *stride, *pad, 1)?;
             let (nw, nb) = &self.norms[i];
-            x = gelu_exact(&layer_norm_2d(&x, nw, nb)?)?;
+            x = gelu_exact(&layer_norm_2d(&x, nw, nb, LN2D_EPS)?)?;
         }
         let (cw, cb, stride, pad) = &self.convs[4];
         conv2d_nchw(&x, cw, cb, *stride, *pad, 1)
@@ -171,7 +151,7 @@ impl CxBlock {
         let residual = x;
         // Depthwise conv keeps channels; groups == channels (256).
         let h = conv2d_nchw(x, &self.dwconv.0, &self.dwconv.1, 1, 3, D_MODEL)?;
-        let h = layer_norm_2d(&h, &self.norm.0, &self.norm.1)?;
+        let h = layer_norm_2d(&h, &self.norm.0, &self.norm.1, LN2D_EPS)?;
         // Channel MLP runs in NHWC (last-dim linears), gated by gamma, then back to NCHW.
         let h = h.transpose_axes(&[0, 2, 3, 1])?;
         let h = linear(

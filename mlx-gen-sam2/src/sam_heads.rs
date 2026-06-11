@@ -15,9 +15,7 @@ use std::sync::OnceLock;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::nn::relu;
-use mlx_rs::ops::{
-    self, broadcast_to, concatenate_axis, matmul, mean_axes, multiply, rsqrt, sigmoid, stack_axis,
-};
+use mlx_rs::ops::{self, broadcast_to, concatenate_axis, matmul, multiply, sigmoid, stack_axis};
 use mlx_rs::Array;
 
 use mlx_gen::nn::{conv2d, gelu_exact, linear};
@@ -27,13 +25,7 @@ use mlx_gen::Result;
 /// LayerNorm epsilon (`nn.LayerNorm` and `LayerNorm2d` both use 1e-6).
 const EPS: f32 = 1e-6;
 
-fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_string()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
+use crate::util::{join, layer_norm_2d, take_range};
 
 /// 2-D conv over an **NCHW** input with an OHWI weight (+ bias): transpose → `conv2d` → transpose.
 fn conv2d_nchw(x: &Array, w: &Array, b: &Array, stride: i32, pad: i32) -> Result<Array> {
@@ -54,17 +46,6 @@ fn conv_transpose2d_nchw(x: &Array, w: &Array, b: &Array, stride: i32) -> Result
     )?;
     let y = ops::add(&y, b)?; // bias over the last (channel) axis, NHWC
     Ok(y.transpose_axes(&[0, 3, 1, 2])?)
-}
-
-/// `LayerNorm2d`: normalize an **NCHW** tensor over the channel axis (per spatial position).
-fn layer_norm_2d(x: &Array, weight: &Array, bias: &Array) -> Result<Array> {
-    let mean = mean_axes(x, &[1], true)?;
-    let centered = ops::subtract(x, &mean)?;
-    let var = mean_axes(&ops::square(&centered)?, &[1], true)?;
-    let normed = multiply(&centered, &rsqrt(&ops::add(&var, Array::from_f32(EPS))?)?)?;
-    let w = weight.reshape(&[1, -1, 1, 1])?;
-    let b = bias.reshape(&[1, -1, 1, 1])?;
-    Ok(ops::add(&multiply(&normed, &w)?, &b)?)
 }
 
 /// An N-layer MLP (`SamMLP`): linear · (relu|gelu) between layers, optional final sigmoid.
@@ -298,9 +279,9 @@ impl PromptEncoder {
     fn embed_masks(&self, masks: &Array) -> Result<Array> {
         let d = &self.mask_downscaling;
         let x = conv2d_nchw(masks, &d.conv0.0, &d.conv0.1, 2, 0)?;
-        let x = gelu_exact(&layer_norm_2d(&x, &d.norm1.0, &d.norm1.1)?)?;
+        let x = gelu_exact(&layer_norm_2d(&x, &d.norm1.0, &d.norm1.1, EPS)?)?;
         let x = conv2d_nchw(&x, &d.conv3.0, &d.conv3.1, 2, 0)?;
-        let x = gelu_exact(&layer_norm_2d(&x, &d.norm4.0, &d.norm4.1)?)?;
+        let x = gelu_exact(&layer_norm_2d(&x, &d.norm4.0, &d.norm4.1, EPS)?)?;
         conv2d_nchw(&x, &d.conv6.0, &d.conv6.1, 1, 0)
     }
 
@@ -588,7 +569,7 @@ impl MaskDecoder {
         let (hs, src_tokens) = self.transformer.forward(&src, &pos_src, &tokens)?;
         let iou_token_out = hs.take_axis(Array::from_int(1), 1)?; // [b,1,256] -> squeeze later
         let iou_token_out = iou_token_out.reshape(&[b, 256])?;
-        let mask_tokens_out = slice_tokens(&hs, 2, 6)?; // [b,4,256]
+        let mask_tokens_out = take_range(&hs, 2, 6)?; // [b,4,256]
 
         // back to NCHW image grid
         let src = src_tokens
@@ -602,6 +583,7 @@ impl MaskDecoder {
             &ops::add(&x, feat_s1)?,
             &self.upscale1.0,
             &self.upscale1.1,
+            EPS,
         )?)?;
         let x = conv_transpose2d_nchw(&x, &self.upscale3.0, &self.upscale3.1, 2)?;
         let upscaled = gelu_exact(&ops::add(&x, feat_s0)?)?; // [b,32,H,W]
@@ -655,18 +637,18 @@ impl MaskDecoder {
 
         let (masks_out, iou_out, sam_tokens) = if multimask_output {
             (
-                slice_masks(&masks, 1, 4)?,
-                slice_iou(&iou_pred, 1, 4)?,
-                slice_tokens(&tokens, 1, 4)?,
+                take_range(&masks, 1, 4)?,
+                take_range(&iou_pred, 1, 4)?,
+                take_range(&tokens, 1, 4)?,
             )
         } else if self.dynamic_multimask_via_stability {
             let (m, i) = self.dynamic_multimask(&masks, &iou_pred)?;
-            (m, i, slice_tokens(&tokens, 0, 1)?)
+            (m, i, take_range(&tokens, 0, 1)?)
         } else {
             (
-                slice_masks(&masks, 0, 1)?,
-                slice_iou(&iou_pred, 0, 1)?,
-                slice_tokens(&tokens, 0, 1)?,
+                take_range(&masks, 0, 1)?,
+                take_range(&iou_pred, 0, 1)?,
+                take_range(&tokens, 0, 1)?,
             )
         };
         Ok((masks_out, iou_out, sam_tokens, obj_logits))
@@ -708,8 +690,8 @@ impl MaskDecoder {
     }
 
     fn dynamic_multimask(&self, masks: &Array, iou_pred: &Array) -> Result<(Array, Array)> {
-        let multi_logits = slice_masks(masks, 1, 4)?; // [b,3,H,W]
-        let multi_iou = slice_iou(iou_pred, 1, 4)?; // [b,3]
+        let multi_logits = take_range(masks, 1, 4)?; // [b,3,H,W]
+        let multi_iou = take_range(iou_pred, 1, 4)?; // [b,3]
         let best = ops::indexing::argmax_axis(&multi_iou, 1, false)?; // [b]
         let arange = Array::from_slice(&[0i32, 1, 2], &[1, 3]);
         let one_hot = arange.eq(&best.expand_dims(1)?)?.as_dtype(masks.dtype())?; // [b,3]
@@ -717,8 +699,8 @@ impl MaskDecoder {
         let best_logits = ops::sum_axes(&multiply(&multi_logits, &oh_m)?, &[1], true)?;
         let best_iou = ops::sum_axes(&multiply(&multi_iou, &one_hot)?, &[1], true)?;
 
-        let single_logits = slice_masks(masks, 0, 1)?;
-        let single_iou = slice_iou(iou_pred, 0, 1)?;
+        let single_logits = take_range(masks, 0, 1)?;
+        let single_iou = take_range(iou_pred, 0, 1)?;
         let stable = self
             .stability_scores(&single_logits)?
             .ge(Array::from_f32(self.stability_thresh))?; // [b,1]
@@ -736,22 +718,4 @@ fn mean_count_gt(x: &Array, thresh: f32) -> Result<Array> {
         .gt(Array::from_f32(thresh))?
         .as_dtype(mlx_rs::Dtype::Float32)?;
     Ok(ops::sum_axes(&mask, &[-1], false)?)
-}
-
-/// `hs[:, start..end, :]` over the token axis.
-fn slice_tokens(hs: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx = Array::from_slice(&(start..end).collect::<Vec<i32>>(), &[end - start]);
-    Ok(hs.take_axis(&idx, 1)?)
-}
-
-/// `masks[:, start..end, :, :]` over the mask axis.
-fn slice_masks(masks: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx = Array::from_slice(&(start..end).collect::<Vec<i32>>(), &[end - start]);
-    Ok(masks.take_axis(&idx, 1)?)
-}
-
-/// `iou[:, start..end]` over the mask axis.
-fn slice_iou(iou: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx = Array::from_slice(&(start..end).collect::<Vec<i32>>(), &[end - start]);
-    Ok(iou.take_axis(&idx, 1)?)
 }

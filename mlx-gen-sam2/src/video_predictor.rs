@@ -804,38 +804,8 @@ fn best_low_mask(low: &Array, ious: &Array) -> Result<Array> {
         .reshape(&[1, 1, 256, 256])?)
 }
 
-/// Generic half-pixel bilinear resize of a single-channel map (display helper).
-fn resize_bilinear_2d(
-    src: &[f32],
-    in_h: usize,
-    in_w: usize,
-    out_h: usize,
-    out_w: usize,
-) -> Vec<f32> {
-    let mut out = vec![0f32; out_h * out_w];
-    let sy = in_h as f32 / out_h as f32;
-    let sx = in_w as f32 / out_w as f32;
-    for oy in 0..out_h {
-        let fy = ((oy as f32 + 0.5) * sy - 0.5).clamp(0.0, (in_h - 1) as f32);
-        let y0 = fy.floor() as usize;
-        let y1 = (y0 + 1).min(in_h - 1);
-        let wy = fy - y0 as f32;
-        for ox in 0..out_w {
-            let fx = ((ox as f32 + 0.5) * sx - 0.5).clamp(0.0, (in_w - 1) as f32);
-            let x0 = fx.floor() as usize;
-            let x1 = (x0 + 1).min(in_w - 1);
-            let wx = fx - x0 as f32;
-            let v00 = src[y0 * in_w + x0];
-            let v01 = src[y0 * in_w + x1];
-            let v10 = src[y1 * in_w + x0];
-            let v11 = src[y1 * in_w + x1];
-            let top = v00 + (v01 - v00) * wx;
-            let bot = v10 + (v11 - v10) * wx;
-            out[oy * out_w + ox] = top + (bot - top) * wy;
-        }
-    }
-    out
-}
+/// The shared host bilinear resampler (display helper), aliased to its historical name here (F-171).
+use crate::util::bilinear_resize_f32 as resize_bilinear_2d;
 
 #[cfg(test)]
 mod tests {
