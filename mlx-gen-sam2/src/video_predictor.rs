@@ -22,6 +22,19 @@
 //!
 //! Parity: `tests/video_parity.rs` (`#[ignore]`, real weights) runs the reference predictor's golden
 //! clip and asserts the per-frame masks agree.
+//!
+//! **Direction — forward only (F-176).** The single public propagation entry point,
+//! [`Sam2VideoPredictor::propagate`], tracks strictly *forward* and records every frame as forward
+//! (`frames_tracked` ← `false`). The reverse-tracking plumbing it threads — the `track_in_reverse`
+//! flag, the `frames_tracked` bool, and the reverse arms in `maskmem_prev_frame` and the
+//! in-past / strided-frame arithmetic of [`Sam2VideoModel::condition_with_memories`] — mirrors the
+//! reference (`propagate_in_video(reverse=True)`) and is covered by unit tests, but is **currently
+//! unreachable from the public API**: nothing ever inserts `true`, and there is no
+//! `propagate_reverse` method. The arithmetic is kept (not deleted) because it is the faithful
+//! port and the seam a future reverse entry point plugs into — but exposing `propagate_reverse` as
+//! production API is gated on a reverse end-to-end golden (the forward path is only verified via the
+//! real-weights `video_parity.rs`; reverse needs the equivalent). Tracked on sc-4151; do not assume
+//! reverse propagation is callable today.
 
 use std::collections::BTreeMap;
 
@@ -750,6 +763,10 @@ impl Sam2VideoPredictor {
 
     /// `propagate_in_video` (forward, single object). Returns each frame's low-res mask logits
     /// `[1,1,256,256]` in propagation order, starting from the prompted frame.
+    ///
+    /// Forward only: every frame is recorded as forward (`frames_tracked` ← `false`). There is no
+    /// `propagate_reverse` yet — the reverse plumbing is wired and unit-tested but unreachable; see
+    /// the module-level "Direction" note (F-176 / sc-4151).
     pub fn propagate(&self, state: &mut VideoState) -> Result<Vec<(i32, Array)>> {
         self.preflight(state)?;
         let start = *state.cond.keys().min().ok_or_else(|| {
