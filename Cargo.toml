@@ -1,5 +1,5 @@
 [workspace]
-members = ["mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-face", "mlx-gen-pulid", "mlx-gen-instantid", "mlx-gen-svd", "mlx-gen-joycaption", "mlx-gen-sam2", "mlx-gen-sensenova", "mlx-gen-kolors", "mlx-gen-chroma"]
+members = ["gen-core", "mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-face", "mlx-gen-pulid", "mlx-gen-instantid", "mlx-gen-svd", "mlx-gen-joycaption", "mlx-gen-sam2", "mlx-gen-sensenova", "mlx-gen-kolors", "mlx-gen-chroma"]
 resolver = "2"
 
 # Single source of truth for the deps shared across the root and all 16 member crates (F-151). The
@@ -23,6 +23,10 @@ resolver = "2"
 # correct + uses the faster matrix unit. Guarded by mlx-gen-qwen-image/tests/{bf16_matmul_sweep,sdpa_nax_repro}.
 # MLX 0.31.2 matches the SceneWorks production/golden environments (byte-parity target). See sc-2352 / sc-2517 / sc-2714 / sc-2770 / sc-2772 / sc-2781.
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
+# Backend-neutral contract layer (epic 3720). Workspace member; mlx-gen re-exports it so the old
+# `mlx_gen::…` paths keep resolving. Family crates depend on it for `gen_core::Result` at the
+# contract boundary.
+sceneworks-gen-core = { path = "gen-core" }
 thiserror = "2"
 # Link-time model registration (the DI-container stand-in; see docs/MODEL_ARCHITECTURE.md §4).
 inventory = "0.3"
@@ -44,6 +48,7 @@ readme = "README.md"
 [dependencies]
 # Shared pins live in [workspace.dependencies] above (F-151).
 mlx-rs = { workspace = true }
+sceneworks-gen-core = { workspace = true }
 thiserror = { workspace = true }
 inventory = { workspace = true }
 tokenizers = { workspace = true }

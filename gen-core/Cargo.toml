@@ -1,0 +1,20 @@
+[package]
+name = "sceneworks-gen-core"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-neutral generative-model contract layer (zero tensor deps) shared by mlx-gen and candle-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["diffusion", "inference", "generative", "contract"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core::…` regardless of the (unique, publishable) package name.
+name = "gen_core"
+
+[dependencies]
+# Shared pins live in the workspace root [workspace.dependencies] (F-151). gen-core deliberately
+# depends on NOTHING tensor-related — thiserror (error), inventory (registry), tokenizers (text).
+thiserror = { workspace = true }
+inventory = { workspace = true }
+tokenizers = { workspace = true }

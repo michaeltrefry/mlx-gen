@@ -135,6 +135,7 @@ mod tests {
         ModelDescriptor {
             id: "dummy_test_model",
             family: "test",
+            backend: "mlx",
             modality: Modality::Image,
             capabilities: Capabilities::default(),
         }

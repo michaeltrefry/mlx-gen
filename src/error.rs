@@ -41,5 +41,22 @@ impl From<&str> for Error {
     }
 }
 
+/// Bridge the rich mlx-gen error into the backend-neutral [`gen_core::Error`] (epic 3720, D3 /
+/// Option B). Legal under the orphan rule because the source type (`mlx_gen::Error`) is local. This
+/// is what lets a family crate's `Generator::generate` — whose signature is `gen_core::Result` —
+/// keep using `?` on the `mlx_gen::Result` helpers that do the actual tensor work: the device
+/// exceptions box into [`gen_core::Error::Backend`], while the typed variants map across 1:1.
+impl From<Error> for gen_core::Error {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Mlx(ex) => gen_core::Error::backend(ex),
+            Error::SafeTensors(io) => gen_core::Error::backend(io),
+            Error::MissingTensor(s) => gen_core::Error::MissingTensor(s),
+            Error::Io(io) => gen_core::Error::Io(io),
+            Error::Msg(s) => gen_core::Error::Msg(s),
+        }
+    }
+}
+
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;

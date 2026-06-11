@@ -14,24 +14,48 @@
 //! Architecture: a *disciplined hybrid* of the frozen Python mflux fork — see
 //! [`ARCHITECTURE.md`](https://github.com/michaeltrefry/mlx-gen/blob/main/ARCHITECTURE.md).
 
+// The backend-neutral contract layer (epic 3720). gen-core owns the contracts, registry, request/
+// output types, and pure policy math; mlx-gen re-exports them at the historical `mlx_gen::…` paths
+// below so every downstream `use mlx_gen::…` keeps compiling. Re-exported as a module too, so
+// `mlx_gen::gen_core::{Error, Result}` (the neutral contract error) is reachable by name.
+pub use sceneworks_gen_core as gen_core;
+
+// Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;
 pub mod array;
-pub mod caption;
 pub mod error;
-pub mod generator;
-pub mod image;
-pub mod media;
 pub mod nn;
 pub mod quant;
-pub mod registry;
-pub mod runtime;
 pub mod sampler;
 pub mod scheduler;
-pub mod tiling;
+pub mod weights;
+
+// Split modules: contract types in gen-core, MLX impls + lifts local (caption→joycaption,
+// train→kernels, tokenizer→to_arrays, image→decoded_to_image).
+pub mod caption;
+pub mod image;
 pub mod tokenizer;
 pub mod train;
-pub mod transform;
-pub mod weights;
+
+// Moved-verbatim contract modules — re-exported from gen-core at their old paths.
+pub mod generator {
+    pub use gen_core::generator::*;
+}
+pub mod media {
+    pub use gen_core::media::*;
+}
+pub mod registry {
+    pub use gen_core::registry::*;
+}
+pub mod runtime {
+    pub use gen_core::runtime::*;
+}
+pub mod tiling {
+    pub use gen_core::tiling::*;
+}
+pub mod transform {
+    pub use gen_core::transform::*;
+}
 
 pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,

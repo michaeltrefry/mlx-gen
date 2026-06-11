@@ -6,7 +6,7 @@
 //! variant — *not* a per-modality trait split (which breaks on multi-modal models).
 
 use crate::media::{AudioTrack, Image};
-use crate::runtime::{CancelFlag, Progress};
+use crate::runtime::{CancelFlag, Progress, Quant};
 use crate::{Error, Result};
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -399,6 +399,10 @@ pub enum Modality {
 pub struct ModelDescriptor {
     pub id: &'static str,
     pub family: &'static str,
+    /// `"mlx"` | `"candle"` — the tensor backend whose provider crate registered this engine.
+    /// Drives the worker's registry-derived capability advertisement (sc-3723); MLX families set
+    /// `"mlx"`.
+    pub backend: &'static str,
     pub modality: Modality,
     pub capabilities: Capabilities,
 }
@@ -420,6 +424,9 @@ pub struct Capabilities {
     pub max_size: u32,
     pub max_count: u32,
     pub mac_only: bool,
+    /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
+    /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
+    pub supported_quants: &'static [Quant],
     // Loader hints.
     pub supports_kv_cache: bool,
     pub requires_sigma_shift: bool,
