@@ -79,7 +79,10 @@ pub use training::{load_trainer, LtxTrainer};
 pub use transformer::{to_denoised, AvDiT, LtxDiT, Precision, VideoBlock};
 pub use upsampler::{upsample_latents, LatentUpsampler};
 pub use vae::LtxVideoVae;
-pub use vocoder::{Generator, LtxVocoder, VocoderWithBwe};
+// Re-exported as `VocoderGenerator`, not `Generator`: this is the HiFi-GAN vocoder struct, and a
+// bare `Generator` at the crate root would shadow the core `mlx_gen::Generator` *trait* name — an
+// accidental `use mlx_gen_ltx::Generator` would then compile and mean the wrong thing (F-059).
+pub use vocoder::{Generator as VocoderGenerator, LtxVocoder, VocoderWithBwe};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
