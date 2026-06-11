@@ -1,5 +1,13 @@
 # FLUX.1 (schnell + dev) — divergence report
 
+> ⚠️ **HISTORICAL — frozen single-session snapshot, not current parity status.** This report is
+> scoped to the branch `codex/sc-2345-flux1-complete` and mflux **v0.17.5**; FLUX changes merged to
+> `main` since 2026-06-02 are **not** reflected here. Do **not** read the residuals below as the
+> current state of `main`. The **living record of FLUX parity is the parity test suite**
+> (`mlx-gen-flux/tests/*`, e.g. `e2e_real_weights.rs`), which runs against the current code. Kept
+> under `docs/` for the methodology and the one-time measurements; moved off the repo root so it is
+> no longer mistaken for a status page (sc-4145 / F-149).
+
 **Date:** 2026-06-02
 **Branch:** `codex/sc-2345-flux1-complete`
 **Purpose:** Document, without attributing cause, where and how much the Rust `mlx-gen-flux` port diverges from the Python fork (mflux v0.17.5), how each point was tested, and the measured results. Numbers are from a single reproducible session run.
