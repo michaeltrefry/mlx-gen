@@ -66,6 +66,7 @@ impl FluxVariant {
         ModelDescriptor {
             id: self.id(),
             family: "flux",
+            backend: "mlx",
             modality: Modality::Image,
             capabilities: Capabilities {
                 supports_negative_prompt: false,
