@@ -49,7 +49,7 @@ use mlx_gen::train::lora::{
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::{
-    LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
+    gen_core, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
     TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
     WeightsSource,
 };
@@ -135,8 +135,14 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }))
 }
 
+/// Registry adapter: the trainer registry's `load` slot is typed on [`gen_core::Result`] (epic
+/// 3720); bridge the crate's rich-`Result` [`load_trainer`] into it.
+fn load_trainer_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
+    load_trainer(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer }
+    TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer_registered }
 }
 
 impl SdxlTrainer {
@@ -154,7 +160,7 @@ impl Trainer for SdxlTrainer {
         &self.descriptor
     }
 
-    fn validate(&self, req: &TrainingRequest) -> Result<()> {
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         if req.items.is_empty() {
             return Err("sdxl trainer: dataset is empty".into());
         }
@@ -173,6 +179,18 @@ impl Trainer for SdxlTrainer {
     }
 
     fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        self.train_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl SdxlTrainer {
+    /// The rich-`Result` body behind [`Trainer::train`]; the trait wrapper bridges its tail into
+    /// [`gen_core::Error`] (epic 3720), keeping `?` on `mlx_rs`/family helpers transparent here.
+    fn train_impl(
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),

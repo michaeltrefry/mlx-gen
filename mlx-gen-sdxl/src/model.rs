@@ -13,9 +13,10 @@
 //! is wired and parity-proven.
 
 use mlx_gen::{
-    default_seed, AlphaSchedule, Capabilities, Conditioning, ConditioningKind, DiffusionSampler,
-    Error, GenerationOutput, GenerationRequest, Generator, Image, LcmSampler, LightningSampler,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, TcdSampler, WeightsSource,
+    default_seed, gen_core, AlphaSchedule, Capabilities, Conditioning, ConditioningKind,
+    DiffusionSampler, Error, GenerationOutput, GenerationRequest, Generator, Image, LcmSampler,
+    LightningSampler, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
+    TcdSampler, WeightsSource,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Dtype;
@@ -87,6 +88,7 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "sdxl",
+        backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
             // SDXL uses real classifier-free guidance: honors the negative prompt + a CFG scale.
@@ -114,6 +116,9 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: true,
+            // On-the-fly Q4/Q8 over the U-Net + CLIP encoders + IdentityNet, conv_shortcut kept
+            // dense (sc-2769 / sc-3329). Read by the worker capability advertisement (sc-3723).
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -274,11 +279,24 @@ impl Generator for Sdxl {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        validate_request(&self.descriptor.capabilities, req)
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
     }
 
     fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl Sdxl {
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -717,8 +735,14 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    ModelRegistration { descriptor, load }
+    ModelRegistration { descriptor, load: load_registered }
 }
 
 use mlx_gen::ModelRegistration;
