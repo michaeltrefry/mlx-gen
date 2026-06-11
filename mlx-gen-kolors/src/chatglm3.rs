@@ -26,8 +26,9 @@
 //! taken **before** `final_layernorm`. Each is `[B, S, hidden]` (the reference's `[S, B, hidden]`
 //! transposed). Kolors uses **`hidden_states[-2]`** (penultimate, layer-26 output) as the context and
 //! **`hidden_states[-1]` at the last sequence position** as the pooled embedding — neither is
-//! final-normed. [`encode_prompt`](ChatGlmModel::encode_prompt) extracts both. `final_layernorm` is
-//! loaded and applied to expose the conventional `last_hidden_state`, but Kolors does not use it.
+//! final-normed. [`encode_prompt`](ChatGlmModel::encode_prompt) extracts both. The encoder's
+//! `final_layernorm` weight is therefore never consumed — Kolors conditioning is entirely pre-norm —
+//! so it is not loaded.
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::module::Param;
@@ -202,14 +203,14 @@ struct GlmBlock {
 pub struct ChatGlmModel {
     embed: Array, // [vocab, hidden]
     layers: Vec<GlmBlock>,
-    final_ln: Array,
     cfg: ChatGlmConfig,
     dtype: Dtype,
 }
 
 impl ChatGlmModel {
     /// Build from a `Weights` map holding the Kolors `text_encoder` tensors (the
-    /// `embedding.word_embeddings.*` / `encoder.layers.{i}.*` / `encoder.final_layernorm.*` layout).
+    /// `embedding.word_embeddings.*` / `encoder.layers.{i}.*` layout; `encoder.final_layernorm.*` is
+    /// present in the snapshot but unused by Kolors conditioning, so it is not loaded).
     /// `quant` selectively quantizes the projections (sc-3096; `None` is the dense default). `dtype`
     /// is the compute dtype — `Float32` for the near-bit parity gate.
     pub fn from_weights(
@@ -239,7 +240,6 @@ impl ChatGlmModel {
         Ok(Self {
             embed: load_embedding(w, "embedding.word_embeddings", quant, dtype)?,
             layers,
-            final_ln: norm("encoder.final_layernorm.weight")?,
             cfg,
             dtype,
         })
@@ -248,8 +248,8 @@ impl ChatGlmModel {
     /// Load-time quantize the encoder to Q4/Q8 (the memory driver — the 28 GLM blocks dominate the 6B
     /// footprint). Quantizes every block projection (fused `query_key_value` + `dense` + the two MLP
     /// linears); the token embedding stays dense (the gather stays exact, mirroring the mlx-gen-sdxl
-    /// text-encoder `quantize`, which also leaves its embedding dense). `final_layernorm` /
-    /// `*_layernorm` weights are norms, not quantized. Idempotent.
+    /// text-encoder `quantize`, which also leaves its embedding dense). The `*_layernorm` weights are
+    /// norms, not quantized. Idempotent.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         for layer in &mut self.layers {
             layer.qkv.quantize(bits, None)?;
@@ -436,17 +436,6 @@ impl ChatGlmModel {
         let idx = Array::from_slice(&[s - 1], &[1]);
         let pooled = last.take_axis(&idx, 1)?.reshape(&[b, hidden])?;
         Ok((context, pooled))
-    }
-
-    /// The conventional `last_hidden_state` = `final_layernorm(hidden_states[-1])`. Not used by Kolors
-    /// conditioning; exposed for completeness / GLM-family reuse.
-    pub fn last_hidden_state(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
-        let hs = self.forward(input_ids, attention_mask)?;
-        Ok(rms_norm(
-            &hs[hs.len() - 1],
-            &self.final_ln,
-            self.cfg.rms_eps,
-        )?)
     }
 
     /// Additive `(B, 1, S, S)` mask in the compute dtype, mirroring the reference `get_masks`:
