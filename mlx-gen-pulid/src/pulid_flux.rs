@@ -269,8 +269,10 @@ fn env_path(var: &str) -> Result<PathBuf> {
 
 /// Locate `pulid_flux_v0.9.1.safetensors` — `PULID_FLUX_WEIGHTS` override, else the HF cache.
 fn resolve_pulid_weights() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("PULID_FLUX_WEIGHTS") {
-        return Ok(PathBuf::from(p));
+    // Route the override through `env_path` so a typo'd path errors with the var name up front,
+    // matching the sibling weight-path helpers (F-093), instead of a bare later I/O error.
+    if std::env::var_os("PULID_FLUX_WEIGHTS").is_some() {
+        return env_path("PULID_FLUX_WEIGHTS");
     }
     let home = std::env::var("HOME").unwrap_or_default();
     let glob = format!("{home}/.cache/huggingface/hub/models--guozinan--PuLID/snapshots");
@@ -338,6 +340,21 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pulid_weights_override_validates_existence() {
+        // F-093: a set-but-nonexistent PULID_FLUX_WEIGHTS errors up front with the var name (routed
+        // through env_path), not a bare later I/O error. (RUST_TEST_THREADS=1 makes the env mutation
+        // safe — see .cargo/config.toml.)
+        std::env::set_var(
+            "PULID_FLUX_WEIGHTS",
+            "/nonexistent/pulid_flux_v0.9.1.safetensors",
+        );
+        let err = resolve_pulid_weights().unwrap_err().to_string();
+        std::env::remove_var("PULID_FLUX_WEIGHTS");
+        assert!(err.contains("PULID_FLUX_WEIGHTS"), "got: {err}");
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
 
     fn img() -> Image {
         Image {
