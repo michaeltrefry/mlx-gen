@@ -22,6 +22,7 @@
 //! reference, which sets `model.current_index = t_idx` before each step and lets the forward
 //! increment it. The understanding path ([`Path::Und`]) drives text decode.
 
+use mlx_rs::ops::indexing::argmax as argmax_device;
 use mlx_rs::Array;
 
 use mlx_gen::Result;
@@ -87,6 +88,20 @@ impl Qwen3Backbone {
         Ok(logits.reshape(&[vocab])?.as_slice::<f32>().to_vec())
     }
 
+    /// Like [`decode_logits`](Self::decode_logits) but reduces to the greedy next token **on device**
+    /// — only the single argmax index is copied to host, not the whole `[vocab]` f32 row (~600 KB).
+    /// MLX `argmax` breaks ties to the lowest index, matching the host [`argmax`] (`torch.argmax`), so
+    /// the greedy stream is bit-identical (F-140).
+    pub fn decode_argmax(&self, token: i32, pos_t: i32, cache: &mut KvCache) -> Result<i32> {
+        let ids = Array::from_slice(&[token], &[1, 1]);
+        let embeds = self.embed(&ids)?;
+        let hidden = self.forward_cached(&embeds, &[pos_t], &[0], &[0], Path::Und, cache, true)?;
+        let logits = self.lm_head(&hidden)?; // [1, 1, vocab]
+        let vocab = logits.shape()[2];
+        let idx = argmax_device(&logits.reshape(&[vocab])?, None)?;
+        Ok(idx.item::<u32>() as i32)
+    }
+
     /// Splice a run of known tokens into the cache (no sampling), advancing the temporal axis from
     /// `t_idx`. Returns the new `t_idx`. Mirrors the reference `_append_text_tokens_to_cache`: the
     /// tokens take positions `t_idx+1 .. t_idx+len` (`h = w = 0`), so the within-run mask is causal
@@ -117,6 +132,23 @@ impl Qwen3Backbone {
         max_new_tokens: usize,
         sampler: Sampler,
     ) -> Result<Vec<i32>> {
+        // Greedy decodes argmax on device (single-index host transfer per token); sampling needs the
+        // full logits row on host. Split so the common greedy path avoids the ~600 KB copy (F-140).
+        if let Sampler::Greedy = sampler {
+            let mut next = argmax(first_logits);
+            let mut out = Vec::new();
+            let mut t = t_idx;
+            for _ in 0..max_new_tokens {
+                if eos.contains(&next) {
+                    break;
+                }
+                out.push(next);
+                t += 1;
+                next = self.decode_argmax(next, t, cache)?;
+            }
+            return Ok(out);
+        }
+
         let mut rng = SplitMix64::new(sampler.seed());
         let mut logits = first_logits.to_vec();
         let mut out = Vec::new();
@@ -158,16 +190,16 @@ impl Qwen3Backbone {
                 break;
             }
             if next == think_end_id {
-                // Forward `</think>` so the cache includes it, then stop.
-                self.decode_logits(next, t + 1, cache)?;
-                t += 1;
+                // Forward `</think>` so the cache includes it, then stop. No logits needed here, so
+                // splice it in without an lm_head projection (F-140).
+                t = self.append_tokens(&[next], t, cache)?;
                 think_token_ids.push(next);
                 break;
             }
             think_token_ids.push(next);
-            let logits = self.decode_logits(next, t + 1, cache)?;
+            // Greedy: argmax the next-token logits on device (single-index transfer; F-140).
+            next = self.decode_argmax(next, t + 1, cache)?;
             t += 1;
-            next = argmax(&logits);
         }
         t = self.append_tokens(append_ids, t, cache)?;
         Ok(ThinkRollout {
@@ -193,21 +225,29 @@ pub(crate) fn argmax(logits: &[f32]) -> i32 {
 /// Temperature + top-k + nucleus (top-p) sampling over a logits row.
 fn sample(logits: &[f32], temperature: f32, top_p: f32, top_k: usize, rng: &mut SplitMix64) -> i32 {
     let temperature = temperature.max(1e-6);
-    // Sort indices by descending logit.
     let mut order: Vec<usize> = (0..logits.len()).collect();
-    order.sort_by(|&a, &b| {
+    // Total order: descending logit, ties broken by ascending index. This reproduces the previous
+    // stable `sort_by` (logit-only) + `truncate` exactly — equal logits kept ascending-index order —
+    // so the selected top-k set and its order are identical.
+    let by_logit_then_index = |&a: &usize, &b: &usize| {
         logits[b]
             .partial_cmp(&logits[a])
             .unwrap_or(std::cmp::Ordering::Equal)
-    });
+            .then(a.cmp(&b))
+    };
 
-    // top-k truncation.
+    // top-k truncation. For a small `top_k`, partition the k highest indices into `order[..k]` with
+    // `select_nth` instead of sorting all ~152k indices, then sort only those k (F-140).
     let k = if top_k == 0 {
         order.len()
     } else {
         top_k.min(order.len())
     };
-    order.truncate(k);
+    if k < order.len() {
+        order.select_nth_unstable_by(k - 1, by_logit_then_index);
+        order.truncate(k);
+    }
+    order.sort_unstable_by(by_logit_then_index);
 
     // Softmax (in the truncated set) at the given temperature, numerically stabilised.
     let max_logit = logits[order[0]];
@@ -293,6 +333,90 @@ mod tests {
         // top_k = 1 collapses the distribution to the single max → deterministic argmax.
         for _ in 0..16 {
             assert_eq!(sample(&logits, 1.0, 1.0, 1, &mut rng), 1);
+        }
+    }
+
+    /// Brute-force reference: the pre-F-140 selection (full stable sort by logit, then truncate),
+    /// with the same softmax / top-p / inverse-CDF tail. The optimized `sample` (select_nth + total
+    /// order) must match it exactly, including ties at the top-k boundary.
+    fn sample_ref(
+        logits: &[f32],
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+        rng: &mut SplitMix64,
+    ) -> i32 {
+        let temperature = temperature.max(1e-6);
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let k = if top_k == 0 {
+            order.len()
+        } else {
+            top_k.min(order.len())
+        };
+        order.truncate(k);
+        let max_logit = logits[order[0]];
+        let mut probs: Vec<f32> = order
+            .iter()
+            .map(|&i| ((logits[i] - max_logit) / temperature).exp())
+            .collect();
+        let sum: f32 = probs.iter().sum();
+        for p in &mut probs {
+            *p /= sum;
+        }
+        if top_p < 1.0 {
+            let mut cum = 0.0f32;
+            let mut cutoff = probs.len();
+            for (i, &p) in probs.iter().enumerate() {
+                cum += p;
+                if cum >= top_p {
+                    cutoff = i + 1;
+                    break;
+                }
+            }
+            order.truncate(cutoff);
+            probs.truncate(cutoff);
+            let renorm: f32 = probs.iter().sum();
+            for p in &mut probs {
+                *p /= renorm;
+            }
+        }
+        let r = rng.next_f32();
+        let mut cum = 0.0f32;
+        for (i, &p) in probs.iter().enumerate() {
+            cum += p;
+            if r <= cum {
+                return order[i] as i32;
+            }
+        }
+        order[order.len() - 1] as i32
+    }
+
+    #[test]
+    fn select_nth_matches_full_sort_with_ties() {
+        // Logits with many exact ties (including at plausible top-k boundaries), so the optimized
+        // select_nth selection and the reference full-sort selection must agree index-for-index.
+        let logits = [
+            2.0f32, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 3.0, 0.5, 3.0, 2.0, 0.5, 1.0, 3.0, 0.0,
+        ];
+        for &top_k in &[0usize, 1, 2, 3, 5, 8, 13, 15, 100] {
+            for &top_p in &[1.0f32, 0.9, 0.5, 0.1] {
+                for &temperature in &[1.0f32, 0.7] {
+                    for seed in 0..6u64 {
+                        let mut a = SplitMix64::new(seed);
+                        let mut b = SplitMix64::new(seed);
+                        assert_eq!(
+                            sample(&logits, temperature, top_p, top_k, &mut a),
+                            sample_ref(&logits, temperature, top_p, top_k, &mut b),
+                            "mismatch at top_k={top_k} top_p={top_p} temp={temperature} seed={seed}"
+                        );
+                    }
+                }
+            }
         }
     }
 
