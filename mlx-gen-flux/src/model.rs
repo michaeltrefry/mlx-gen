@@ -1,8 +1,8 @@
 //! FLUX.1 provider registration and txt2img generation path.
 
 use mlx_gen::array::scalar;
-use mlx_gen::image::decoded_to_image;
 use mlx_gen::gen_core;
+use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Conditioning, DiffusionSampler, Error, FlowMatchSampler, GenerationOutput,
