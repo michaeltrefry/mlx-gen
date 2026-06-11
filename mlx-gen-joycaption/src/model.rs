@@ -100,10 +100,6 @@ pub struct JoyCaption {
 }
 
 impl JoyCaption {
-    fn normalized_request(&self, req: &CaptionRequest) -> CaptionRequest {
-        normalized_request(req)
-    }
-
     fn prompt_embeds(&self, req: &CaptionRequest) -> Result<(Vec<i32>, Array)> {
         if req.cancel.is_cancelled() {
             return Err(Error::Msg("caption generation cancelled".to_owned()));
@@ -141,7 +137,7 @@ impl Captioner for JoyCaption {
     }
 
     fn validate(&self, req: &CaptionRequest) -> Result<()> {
-        let req = self.normalized_request(req);
+        let req = normalized_request(req);
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, &req)
@@ -152,7 +148,7 @@ impl Captioner for JoyCaption {
         req: &CaptionRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CaptionOutput> {
-        let req = self.normalized_request(req);
+        let req = normalized_request(req);
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, &req)?;
