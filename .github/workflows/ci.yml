@@ -50,10 +50,14 @@ jobs:
           echo "metal: $(xcrun --find metal)"
           xcrun metal --version || true
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        # No `@stable` — that would install whatever stable is current and ignore the pin. `rustup
+        # show` installs the channel named in rust-toolchain.toml (its `components` come with it);
+        # the explicit add is idempotent belt-and-suspenders. Bump the toolchain by editing the toml.
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+          rustc --version
 
       - name: Cache cargo + mlx-sys build
         uses: Swatinem/rust-cache@v2

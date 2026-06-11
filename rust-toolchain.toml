@@ -1,0 +1,12 @@
+# Pin the Rust toolchain so a new `stable` release can't redden CI on an untouched 17-crate
+# workspace — a full rebuild compiles MLX from source, which is expensive (F-158). Every ~6-week
+# stable can add default lints that turn `clippy -D warnings` red with no code change; pinning here
+# makes those bumps deliberate (review the new lints in the same PR that bumps `channel`).
+#
+# This file is the single source of truth: CI installs the channel named here
+# (.github/workflows/ci.yml runs `rustup show`, which honors it), and local `cargo` in this repo
+# uses it too — so CI and dev compile with the same toolchain.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
