@@ -47,9 +47,8 @@ const SAMPLER: &str = "euler_discrete";
 /// Kolors' identity + capabilities — constructible without loading weights (registry
 /// introspection). Advertises **only** the wired + parity-proven surface (the false-capability
 /// guard): T2I + img2img (`Reference`) + ControlNet-pose (`Control`) + IP-Adapter (`Reference` in
-/// IP mode) + Q8/Q4. **LoRA/LoKr is NOT advertised** — epic 3090 did not port Kolors adapters
-/// (sc-3874 note); wiring them is a tracked follow-on, so `load` rejects `spec.adapters` rather than
-/// silently dropping them.
+/// IP mode) + Q8/Q4 + **LoRA/LoKr** (sc-4733 — merged into the SDXL-family U-Net at load via
+/// [`Kolors::apply_lora`], the inference complement to the Kolors trainer sc-4568).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -63,8 +62,9 @@ pub fn descriptor() -> ModelDescriptor {
             // Reference = img2img init (sc-3095) OR the IP-Adapter image prompt when an IP-Adapter is
             // loaded (sc-3098); Control = the Kolors ControlNet-pose branch (sc-3097).
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Control],
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA/LoKr merge into the SDXL-family U-Net at load (sc-4733).
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec![SAMPLER],
             schedulers: vec!["discrete"],
             min_size: 512,
@@ -94,7 +94,7 @@ pub struct KolorsGenerator {
 /// dtype; the VAE stays f32 via `load_vae`). `spec.quantize` ⇒ load-time Q8/Q4 (sc-3096);
 /// `spec.control` ⇒ the Kolors ControlNet-Pose checkpoint (sc-3097); `spec.ip_adapter` ⇒ the
 /// Kolors-IP-Adapter-Plus snapshot dir (sc-3098), whose K/V pairs are installed into the (pre-quant)
-/// U-Net. `spec.adapters` (LoRA/LoKr) is rejected — not ported (sc-3874).
+/// U-Net. `spec.adapters` (LoRA/LoKr) ⇒ merged into the dense U-Net before quantization (sc-4733).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // fp16 dense path (SDXL-family production dtype). `Precision::Bf16` is the registry's
     // "dense default / no override" sentinel here — NOT a literal bf16 request — mapped to fp16
@@ -117,18 +117,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
+    // Load the dense base, merge any LoRA/LoKr adapters into the dense U-Net, then quantize — the
+    // SDXL ordering (sc-4733): the f32 delta lands in the dense weights, which are then packed.
+    let mut kolors = Kolors::load(&root, dtype)?;
     if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "kolors: LoRA/LoKr adapters are not wired (epic 3090 did not port Kolors adapters; \
-             tracked as a follow-on on sc-3874) — load without `adapters`"
-                .into(),
-        ));
+        kolors.apply_lora(&spec.adapters)?;
     }
-
-    let mut kolors = match spec.quantize {
-        Some(q) => Kolors::load_quantized(&root, dtype, q.bits())?,
-        None => Kolors::load(&root, dtype)?,
-    };
+    if let Some(q) = spec.quantize {
+        kolors.quantize(q.bits())?;
+    }
 
     let control = match &spec.control {
         Some(src) => Some(load_controlnet(src, dtype)?),
@@ -432,7 +429,10 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
-        assert!(!d.capabilities.supports_lora, "Kolors LoRA is not ported");
+        assert!(
+            d.capabilities.supports_lora,
+            "Kolors LoRA is wired (sc-4733)"
+        );
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
         assert!(d.capabilities.accepts(ConditioningKind::Control));
         assert!(!d.capabilities.accepts(ConditioningKind::Mask));
@@ -543,10 +543,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lora_adapters() {
-        // LoRA is intentionally unwired (sc-3874 follow-on); load must reject, not silently drop.
-        // (Validated at the load layer; here we assert the descriptor doesn't advertise it.)
-        assert!(!descriptor().capabilities.supports_lora);
-        assert!(!descriptor().capabilities.supports_lokr);
+    fn advertises_lora_adapters() {
+        // sc-4733: LoRA/LoKr are wired — merged into the SDXL-family U-Net at load. The descriptor
+        // advertises both (the real-weight merge + scale=0≡base parity is `tests/lora_parity.rs`).
+        assert!(descriptor().capabilities.supports_lora);
+        assert!(descriptor().capabilities.supports_lokr);
     }
 }

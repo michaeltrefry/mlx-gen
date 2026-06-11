@@ -11,12 +11,13 @@
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, DiffusionSampler, Image, Result};
+use mlx_gen::{AdapterSpec, CancelFlag, DiffusionSampler, Image, Result};
 
 use mlx_gen_sdxl::{
-    decode_image, denoise, denoise_control, denoise_ip, encode_init_latents,
-    load_unet_kolors_dtype, load_vae, preprocess_control_image, Autoencoder, ControlContext,
-    ControlNet, Denoiser, IpImageEncoder, UNet2DConditionModel,
+    apply_sdxl_adapters_with, decode_image, denoise, denoise_control, denoise_ip,
+    encode_init_latents, load_unet_kolors_dtype, load_vae, preprocess_control_image, Autoencoder,
+    ControlContext, ControlNet, Denoiser, IpImageEncoder, LoraCoverage, SdxlLoraReport,
+    UNet2DConditionModel,
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
@@ -76,9 +77,30 @@ impl Kolors {
     /// low precision — the SDXL-family convention). `bits` ∈ {4, 8}.
     pub fn load_quantized(snapshot: &std::path::Path, dtype: Dtype, bits: i32) -> Result<Self> {
         let mut m = Self::load(snapshot, dtype)?;
-        m.chatglm.quantize(bits)?;
-        m.unet.quantize(bits)?;
+        m.quantize(bits)?;
         Ok(m)
+    }
+
+    /// Load-time quantize the memory drivers to `bits` (4 or 8) — the 6B ChatGLM3 encoder **and** the
+    /// SDXL-family U-Net (the VAE stays f32; the SDXL-family convention). Split out of
+    /// [`load_quantized`](Self::load_quantized) so the registry can **merge LoRA/LoKr into the dense
+    /// base first, then quantize** (the SDXL ordering — the f32 delta merges into the dense weights,
+    /// which are then packed). Idempotent per component.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.chatglm.quantize(bits)?;
+        self.unet.quantize(bits)?;
+        Ok(())
+    }
+
+    /// Merge LoRA / LoKr adapters into the dense U-Net weights at load (sc-4733). The Kolors U-Net is
+    /// the SDXL `UNet2DConditionModel`, so this delegates to the SDXL adapter merge
+    /// ([`apply_sdxl_adapters_with`]) at **Complete** coverage — the down/mid/up attention surface the
+    /// Kolors trainer (sc-4568) targets and the diffusers PEFT suffix-match selects (LoKr specs ignore
+    /// coverage and use the vendored down/up surface). Merging (not a forward-time residual) keeps the
+    /// denoise loop unchanged. Out-of-surface keys are surfaced in the returned report, not dropped.
+    /// Must run **before** [`quantize`](Self::quantize) so the f32 delta lands in the dense base.
+    pub fn apply_lora(&mut self, adapters: &[AdapterSpec]) -> Result<SdxlLoraReport> {
+        apply_sdxl_adapters_with(&mut self.unet, adapters, LoraCoverage::Complete)
     }
 
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])`, threading the tokenizer's
