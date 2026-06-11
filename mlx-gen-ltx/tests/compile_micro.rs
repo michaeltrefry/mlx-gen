@@ -54,6 +54,14 @@ fn bench(warmup: usize, iters: usize, mut f: impl FnMut() -> Array) -> f64 {
     median(times)
 }
 
+// --- Pinned copies of the production glue closures (F-061) ---------------------------------------
+// These intentionally duplicate the closure bodies of `src/transformer.rs::{gelu_ffn, modulate,
+// gated}` and `src/rope.rs::rope_rotate`. They are NOT shared because those `fn`s are crate-private
+// (an integration test can only reach `pub` items) and wrap the body in the `compile_glue()` runtime
+// toggle, whereas this benchmark needs the bare closure to hand to `mx.compile` and time in isolation.
+// **Keep each body byte-identical to its production source.** The `max_abs_diff` checks below confirm
+// each compiled chain matches its own eager form, but they do NOT cross-check against production — so
+// a change to the production glue math must be mirrored here by hand or the perf numbers go stale.
 fn gelu_body(x: &Array) -> Result<Array, Exception> {
     let dt = x.dtype();
     let s = |v: f32| -> Result<Array, Exception> { scalar(v).as_dtype(dt) };
