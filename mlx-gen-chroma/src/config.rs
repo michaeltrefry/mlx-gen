@@ -8,7 +8,7 @@
 //! and attention is **masked** by the T5 padding mask. Generation uses **true CFG** (real negative
 //! prompt), not FLUX's distilled guidance.
 
-use mlx_gen::{Capabilities, Modality, ModelDescriptor};
+use mlx_gen::{Capabilities, Modality, ModelDescriptor, Quant};
 
 pub const CHROMA1_HD_ID: &str = "chroma1_hd";
 pub const CHROMA1_BASE_ID: &str = "chroma1_base";
@@ -88,6 +88,7 @@ impl ChromaVariant {
         ModelDescriptor {
             id: self.id(),
             family: "chroma",
+            backend: "mlx",
             modality: Modality::Image,
             capabilities: Capabilities {
                 // Chroma uses real classifier-free guidance with a true negative prompt.
@@ -97,6 +98,7 @@ impl ChromaVariant {
                 supports_true_cfg: true,
                 // v1 = T2I only. ControlNet / IP-Adapter / img2img are later ports.
                 conditioning: vec![],
+                supported_quants: &[Quant::Q4, Quant::Q8],
                 // LoRA/LoKr via the shared core adapter seam (sc-3842), over the diffusers/peft
                 // (and kohya) `transformer_blocks.*`/`single_transformer_blocks.*` paths.
                 supports_lora: true,

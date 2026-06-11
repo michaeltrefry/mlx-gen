@@ -13,9 +13,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, CancelFlag, DiffusionSampler, Error, FlowMatchSampler, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision,
-    Progress, Result, WeightsSource,
+    default_seed, gen_core, CancelFlag, DiffusionSampler, Error, FlowMatchSampler,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor,
+    ModelRegistration, Precision, Progress, Result, WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
 use mlx_gen_z_image::vae::Vae;
@@ -286,7 +286,21 @@ impl Generator for Chroma {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl Chroma {
+    fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
@@ -305,7 +319,7 @@ impl Generator for Chroma {
         Ok(())
     }
 
-    fn generate(
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -344,16 +358,28 @@ impl Generator for Chroma {
     }
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_hd, load: load_hd }
+fn load_hd_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_hd(spec).map_err(Into::into)
+}
+
+fn load_base_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_base(spec).map_err(Into::into)
+}
+
+fn load_flash_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_flash(spec).map_err(Into::into)
 }
 
 inventory::submit! {
-    ModelRegistration { descriptor: descriptor_base, load: load_base }
+    ModelRegistration { descriptor: descriptor_hd, load: load_hd_registered }
 }
 
 inventory::submit! {
-    ModelRegistration { descriptor: descriptor_flash, load: load_flash }
+    ModelRegistration { descriptor: descriptor_base, load: load_base_registered }
+}
+
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_flash, load: load_flash_registered }
 }
 
 #[cfg(test)]

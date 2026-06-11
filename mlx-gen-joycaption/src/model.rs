@@ -14,8 +14,8 @@ use mlx_gen::caption::joycaption::{
 use mlx_gen::runtime::Precision;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor, CaptionerRegistration, Error,
-    LoadSpec, Progress, Result, WeightsSource,
+    gen_core, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor, CaptionerRegistration,
+    Error, LoadSpec, Progress, Result, WeightsSource,
 };
 use mlx_rs::Array;
 
@@ -136,7 +136,7 @@ impl Captioner for JoyCaption {
         &self.descriptor
     }
 
-    fn validate(&self, req: &CaptionRequest) -> Result<()> {
+    fn validate(&self, req: &CaptionRequest) -> gen_core::Result<()> {
         let req = normalized_request(req);
         self.descriptor
             .capabilities
@@ -144,6 +144,19 @@ impl Captioner for JoyCaption {
     }
 
     fn caption(
+        &self,
+        req: &CaptionRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<CaptionOutput> {
+        self.caption_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl JoyCaption {
+    /// The rich-`Result` body behind [`Captioner::caption`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn caption_impl(
         &self,
         req: &CaptionRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -185,8 +198,14 @@ impl Captioner for JoyCaption {
     }
 }
 
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Captioner>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    CaptionerRegistration { descriptor, load }
+    CaptionerRegistration { descriptor, load: load_registered }
 }
 
 #[cfg(test)]

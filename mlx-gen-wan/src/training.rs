@@ -52,7 +52,7 @@ use mlx_gen::train::lora::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
+    gen_core, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
     TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
     WeightsSource,
 };
@@ -251,14 +251,26 @@ pub fn load_trainer_ti2v_5b(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     build_trainer(spec, descriptor_ti2v_5b())
 }
 
+/// Registry adapters: the trainer registry's `load` slot is typed on [`gen_core::Result`] (epic
+/// 3720); bridge each crate's rich-`Result` loader into it.
+fn load_trainer_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
+    load_trainer(spec).map_err(Into::into)
+}
+fn load_trainer_i2v_14b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
+    load_trainer_i2v_14b(spec).map_err(Into::into)
+}
+fn load_trainer_ti2v_5b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
+    load_trainer_ti2v_5b(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    TrainerRegistration { descriptor: descriptor_t2v_14b, load: load_trainer }
+    TrainerRegistration { descriptor: descriptor_t2v_14b, load: load_trainer_registered }
 }
 inventory::submit! {
-    TrainerRegistration { descriptor: descriptor_i2v_14b, load: load_trainer_i2v_14b }
+    TrainerRegistration { descriptor: descriptor_i2v_14b, load: load_trainer_i2v_14b_registered }
 }
 inventory::submit! {
-    TrainerRegistration { descriptor: descriptor_ti2v_5b, load: load_trainer_ti2v_5b }
+    TrainerRegistration { descriptor: descriptor_ti2v_5b, load: load_trainer_ti2v_5b_registered }
 }
 
 impl Trainer for WanMoeTrainer {
@@ -266,7 +278,7 @@ impl Trainer for WanMoeTrainer {
         &self.descriptor
     }
 
-    fn validate(&self, req: &TrainingRequest) -> Result<()> {
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         let id = self.descriptor.id;
         if req.items.is_empty() {
             return Err(format!("{id} trainer: dataset is empty").into());
@@ -286,6 +298,19 @@ impl Trainer for WanMoeTrainer {
     }
 
     fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        self.train_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl WanMoeTrainer {
+    /// Train body — kept on the crate's own [`mlx_gen::Error`] so `?` on mlx-rs ops and crate
+    /// helpers lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`]
+    /// (epic 3720).
+    fn train_impl(
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),

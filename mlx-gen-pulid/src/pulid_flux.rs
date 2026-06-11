@@ -24,8 +24,9 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Progress, Result,
+    gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Progress,
+    Quant, Result,
 };
 use mlx_gen_face::FaceAnalysis;
 use mlx_gen_flux::config::FluxVariant;
@@ -50,6 +51,7 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: "pulid_flux",
         family: "pulid",
+        backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
             supports_negative_prompt: false, // real-CFG + negative prompt = sc-3075
@@ -66,6 +68,7 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: true, // dev
+            supported_quants: &[Quant::Q4, Quant::Q8],
         },
     }
 }
@@ -192,13 +195,26 @@ impl Generator for PulidFlux {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // Require a reference face; the FLUX backbone validates the rest (size/steps/sampler).
         self.reference_face(req)?;
         Ok(())
     }
 
     fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl PulidFlux {
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -333,8 +349,14 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(PulidFlux::new(flux, eva, pulid, face)?))
 }
 
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load_pulid_flux`] into it.
+fn load_pulid_flux_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_pulid_flux(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    ModelRegistration { descriptor, load: load_pulid_flux }
+    ModelRegistration { descriptor, load: load_pulid_flux_registered }
 }
 
 #[cfg(test)]

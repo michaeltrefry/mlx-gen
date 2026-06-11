@@ -75,8 +75,9 @@ fn umt5_embeds_match_reference() {
         let out = tok
             .tokenize_preformatted(&clean_text("a cat playing the piano"))
             .unwrap();
+        let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&out);
         let stages = encoder
-            .forward_capture(&out.input_ids, &out.attention_mask)
+            .forward_capture(&input_ids, &attention_mask)
             .unwrap();
         let dim = 4096i32;
         let flat = stages[1].reshape(&[512, dim]).unwrap();
@@ -105,7 +106,8 @@ fn umt5_embeds_match_reference() {
 
         // Tokenization parity: cleaned + tokenized ids match the reference's (the non-pad prefix).
         let out = tok.tokenize_preformatted(&clean_text(prompt)).unwrap();
-        let ids: Vec<i32> = out.input_ids.as_slice::<i32>()[..seq_len].to_vec();
+        let (input_ids, _) = mlx_gen::tokenizer::to_arrays(&out);
+        let ids: Vec<i32> = input_ids.as_slice::<i32>()[..seq_len].to_vec();
         assert_eq!(ids, ref_ids, "[{name}] token ids differ");
 
         // Embedding parity.

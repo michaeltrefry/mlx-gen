@@ -271,8 +271,10 @@ fn e2e_tokenizer_matches_golden() {
     let prompt = g.metadata("prompt").unwrap().to_string();
     let t5_tok = mlx_gen_flux::load_t5_tokenizer(&snapshot(), variant()).unwrap();
     let clip_tok = mlx_gen_flux::load_clip_tokenizer().unwrap();
-    let t5_ids = t5_tok.tokenize(&prompt).unwrap().input_ids;
-    let clip_ids = clip_tok.tokenize(&prompt).unwrap().input_ids;
+    let t5_out = t5_tok.tokenize(&prompt).unwrap();
+    let t5_ids = mlx_gen::tokenizer::to_arrays(&t5_out).0;
+    let clip_out = clip_tok.tokenize(&prompt).unwrap();
+    let clip_ids = mlx_gen::tokenizer::to_arrays(&clip_out).0;
     let gi = |k: &str| {
         g.require(k)
             .unwrap()

@@ -13,7 +13,7 @@
 //! fast tokenizer auto-pads and its returned mask is all-ones). The full-sequence mask (this text
 //! mask ++ image ones) is assembled in the generate path (sc-3839).
 
-use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::tokenizer::{to_arrays, TextTokenizer};
 use mlx_gen::Result;
 use mlx_gen_flux::T5TextEncoder;
 use mlx_rs::{Array, Dtype};
@@ -31,11 +31,12 @@ pub fn encode_prompt(
     t5: &T5TextEncoder,
     prompt: &str,
 ) -> Result<(Array, Array)> {
-    let out = tokenizer.tokenize(prompt)?;
+    let tok = tokenizer.tokenize(prompt)?;
+    let (input_ids, _) = to_arrays(&tok);
     let pad = tokenizer.config().pad_token_id;
-    let key_mask = t5_key_mask(&out.input_ids, pad)?;
-    let embeds = t5.forward_masked(&out.input_ids, Some(&key_mask))?;
-    let text_mask = transformer_text_mask(&out.input_ids, pad)?;
+    let key_mask = t5_key_mask(&input_ids, pad)?;
+    let embeds = t5.forward_masked(&input_ids, Some(&key_mask))?;
+    let text_mask = transformer_text_mask(&input_ids, pad)?;
     Ok((embeds, text_mask))
 }
 

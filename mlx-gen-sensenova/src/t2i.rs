@@ -841,7 +841,7 @@ impl T2iModel {
             let block = format!("<img>{}</img>", "<IMG_CONTEXT>".repeat(n as usize));
             query = query.replacen("<image>", &block, 1);
         }
-        tokenizer.encode_ids(&query, true)
+        Ok(tokenizer.encode_ids(&query, true)?)
     }
 
     /// Image-conditioned generation (`it2i_generate`): edit / Character-Studio reference. `images`

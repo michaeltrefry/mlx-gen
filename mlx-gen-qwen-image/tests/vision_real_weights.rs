@@ -231,10 +231,11 @@ fn vl_tokenize_matches_fork() {
     let tok = load_tokenizer(&edit_snapshot()).unwrap();
     let text = build_edit_text("make the sky purple at sunset", 36);
     let out = tok.tokenize_preformatted(&text).unwrap();
+    let (input_ids, _) = mlx_gen::tokenizer::to_arrays(&out);
     let want = g.require("input_ids").unwrap();
-    assert_eq!(out.input_ids.shape(), want.shape(), "input_ids shape");
+    assert_eq!(input_ids.shape(), want.shape(), "input_ids shape");
     assert_eq!(
-        out.input_ids.as_slice::<i32>(),
+        input_ids.as_slice::<i32>(),
         want.as_slice::<i32>(),
         "input_ids must be byte-exact vs the fork"
     );

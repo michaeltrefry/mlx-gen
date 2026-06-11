@@ -55,6 +55,7 @@ pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
             pad_to_max_length: false,
         },
     )
+    .map_err(Into::into)
 }
 
 /// Load the Qwen2.5-VL text encoder (text path). The on-disk `model.*` keys map directly onto the

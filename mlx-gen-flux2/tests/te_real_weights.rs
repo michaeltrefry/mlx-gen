@@ -75,11 +75,12 @@ fn rel(a: &Array, b: &Array) -> (f32, f32) {
 fn tokenizer_ids_match_fork() {
     let tok = load_tokenizer(&snapshot()).unwrap();
     let out = tok.tokenize(PROMPT).unwrap();
+    let (input_ids, _) = mlx_gen::tokenizer::to_arrays(&out);
     let (g, _) = golden();
     let want = g.require("input_ids").unwrap();
-    assert_eq!(out.input_ids.shape(), want.shape(), "input_ids shape (512)");
+    assert_eq!(input_ids.shape(), want.shape(), "input_ids shape (512)");
     // Exact integer match: the chat template + BPE + padding must reproduce the fork byte-for-byte.
-    let got = out.input_ids.as_dtype(Dtype::Float32).unwrap();
+    let got = input_ids.as_dtype(Dtype::Float32).unwrap();
     let want_f = want.as_dtype(Dtype::Float32).unwrap();
     let eq = mlx_rs::ops::all_close(&got, &want_f, 0.0, 0.0, false)
         .unwrap()

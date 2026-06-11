@@ -15,8 +15,8 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Result, WeightsSource,
+    default_seed, gen_core, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    ModelDescriptor, ModelRegistration, Precision, Progress, Result, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
@@ -164,7 +164,8 @@ impl Flux2 {
         prompt: &str,
     ) -> Result<(Array, Array)> {
         let tok = tokenizer.tokenize(prompt)?;
-        let embeds = te.prompt_embeds(&tok.input_ids, &tok.attention_mask)?;
+        let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&tok);
+        let embeds = te.prompt_embeds(&input_ids, &attention_mask)?;
         let ids = prepare_text_ids(embeds.shape()[1] as usize);
         Ok((embeds, ids))
     }
@@ -343,11 +344,24 @@ impl Generator for Flux2 {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        validate_request(&self.descriptor, req)
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
     }
 
     fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl Flux2 {
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -531,16 +545,30 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
     Ok(())
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_klein_9b, load: load_klein_9b }
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` load fns into it.
+fn load_klein_9b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_klein_9b(spec).map_err(Into::into)
+}
+
+fn load_klein_9b_edit_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_klein_9b_edit(spec).map_err(Into::into)
+}
+
+fn load_klein_9b_kv_edit_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_klein_9b_kv_edit(spec).map_err(Into::into)
 }
 
 inventory::submit! {
-    ModelRegistration { descriptor: descriptor_klein_9b_edit, load: load_klein_9b_edit }
+    ModelRegistration { descriptor: descriptor_klein_9b, load: load_klein_9b_registered }
 }
 
 inventory::submit! {
-    ModelRegistration { descriptor: descriptor_klein_9b_kv_edit, load: load_klein_9b_kv_edit }
+    ModelRegistration { descriptor: descriptor_klein_9b_edit, load: load_klein_9b_edit_registered }
+}
+
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_klein_9b_kv_edit, load: load_klein_9b_kv_edit_registered }
 }
 
 #[cfg(test)]

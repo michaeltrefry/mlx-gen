@@ -98,11 +98,12 @@ pub fn encode_prompt(
     model_id: &str,
 ) -> Result<Array> {
     let t = tokenizer.tokenize(prompt)?;
-    if t.input_ids.shape()[1] == 0 {
+    if t.ids.is_empty() {
         return Err(Error::Msg(format!("{model_id}: empty prompt")));
     }
+    let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&t);
     // PARITY-BF16 (sc-2609): round embeds to bf16 to match the fork (Qwen is bf16-native on disk).
-    let embeds = text_encoder.encode(&t.input_ids, &t.attention_mask)?;
+    let embeds = text_encoder.encode(&input_ids, &attention_mask)?;
     Ok(embeds.as_dtype(Dtype::Bfloat16)?)
 }
 

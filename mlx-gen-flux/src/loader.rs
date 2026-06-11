@@ -38,7 +38,7 @@ fn build_clip_tokenizer() -> Result<TextTokenizer> {
     // vendored, HF-faithful CLIP `tokenizer.json` compiled into the crate and NEVER fall back to the
     // broken path — a missing/invalid asset errors loudly.
     const CLIP_TOKENIZER_JSON: &str = include_str!("../assets/clip_tokenizer.json");
-    TextTokenizer::from_json_str(CLIP_TOKENIZER_JSON, config)
+    Ok(TextTokenizer::from_json_str(CLIP_TOKENIZER_JSON, config)?)
 }
 
 pub fn load_t5_tokenizer(root: &Path, variant: FluxVariant) -> Result<TextTokenizer> {
@@ -195,7 +195,10 @@ fn load_tokenizer(
         FluxTokenizerKind::T5 => {
             // T5 ships a real `tokenizer.json` in `tokenizer_2/` (verified fork-identical); use it,
             // erroring loudly if absent rather than guessing.
-            TextTokenizer::from_file(root.join(kind.subdir()).join("tokenizer.json"), config)
+            Ok(TextTokenizer::from_file(
+                root.join(kind.subdir()).join("tokenizer.json"),
+                config,
+            )?)
         }
     }
 }

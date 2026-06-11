@@ -113,7 +113,9 @@ pub fn tokenize_edit_text(
     prompt: &str,
     n_image_tokens: usize,
 ) -> Result<TokenizerOutput> {
-    tokenizer.tokenize_preformatted(&build_edit_text(prompt, n_image_tokens))
+    tokenizer
+        .tokenize_preformatted(&build_edit_text(prompt, n_image_tokens))
+        .map_err(Into::into)
 }
 
 /// Tokenize a reference image + edit prompt for the VL encoder. `image` is RGB uint8 HWC. Composes
@@ -127,9 +129,10 @@ pub fn tokenize_edit(
 ) -> Result<EditInputs> {
     let pre = preprocess_edit_image(processor, image)?;
     let tok = tokenize_edit_text(tokenizer, prompt, pre.n_image_tokens)?;
+    let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&tok);
     Ok(EditInputs {
-        input_ids: tok.input_ids,
-        attention_mask: tok.attention_mask,
+        input_ids,
+        attention_mask,
         pixel_values: pre.pixel_values,
         grid_thw: pre.grid_thw,
     })

@@ -139,14 +139,12 @@ fn bench_denoise_per_step() {
     let tok = load_tokenizer(&snap).unwrap();
     let te = load_text_encoder(&snap).unwrap();
     let t = tok.tokenize(PROMPT).unwrap();
-    let num_valid: i32 = t.attention_mask.as_slice::<i32>().iter().sum();
-    let cap = slice_valid(
-        &te.forward(&t.input_ids, &t.attention_mask).unwrap(),
-        num_valid,
-    )
-    .unwrap()
-    .as_dtype(Dtype::Bfloat16)
-    .unwrap();
+    let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&t);
+    let num_valid: i32 = attention_mask.as_slice::<i32>().iter().sum();
+    let cap = slice_valid(&te.forward(&input_ids, &attention_mask).unwrap(), num_valid)
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
     let transformer = load_transformer(&snap).unwrap();
 
     println!("\n# Z-Image-turbo DiT per-step — eval forced each step, bf16 (first step includes graph build)");

@@ -28,9 +28,9 @@ use mlx_rs::Array;
 
 use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Result, WeightsSource,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::config::NeoChatConfig;
@@ -70,6 +70,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
         id,
         family: "sensenova-u1",
+        backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
             supports_negative_prompt: false,
@@ -83,6 +84,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             ],
             supports_lora: false,
             supports_lokr: false,
+            supported_quants: &[Quant::Q4, Quant::Q8],
             samplers: Vec::new(),
             schedulers: Vec::new(),
             min_size: 256,
@@ -239,15 +241,29 @@ impl Generator for SenseNova {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // Use the descriptor's own id so the base and `_fast` variants attribute rejections to the
         // right model (F-143).
         let id = self.descriptor.id;
         self.descriptor.capabilities.validate_request(id, req)?;
-        validate_dims_and_steps(id, req)
+        validate_dims_and_steps(id, req).map_err(Into::into)
     }
 
     fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl SenseNova {
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the
+    /// family helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`]
+    /// (epic 3720).
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -333,12 +349,23 @@ fn image_to_chw01(img: &Image) -> Result<Array> {
     divide(&chw, Array::from_f32(255.0)).map_err(Error::from)
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor, load }
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
+/// Registry adapter for the 8-step distilled variant (sc-3192).
+fn load_fast_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_fast(spec).map_err(Into::into)
 }
 
 inventory::submit! {
-    ModelRegistration { descriptor: descriptor_fast, load: load_fast }
+    ModelRegistration { descriptor, load: load_registered }
+}
+
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_fast, load: load_fast_registered }
 }
 
 #[cfg(test)]

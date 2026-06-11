@@ -16,9 +16,9 @@
 use mlx_rs::{random, Dtype};
 
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, ControlKind, Error,
+    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, ControlKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    ModelRegistration, Progress, Result, WeightsSource,
+    ModelRegistration, Progress, Quant, Result, WeightsSource,
 };
 
 use mlx_gen_sdxl::{
@@ -51,6 +51,7 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "kolors",
+        backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
             // Kolors uses real classifier-free guidance over the ChatGLM3 conditioning.
@@ -69,6 +70,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: true,
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -157,7 +159,24 @@ impl Generator for KolorsGenerator {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl KolorsGenerator {
+    /// The rich-`Result` body behind [`Generator::validate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         validate_request(&self.descriptor.capabilities, req)?;
         // Mode-combination guards (the Kolors paths are mutually exclusive in this build).
         let has_ref = req
@@ -190,7 +209,10 @@ impl Generator for KolorsGenerator {
         Ok(())
     }
 
-    fn generate(
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -314,9 +336,7 @@ impl Generator for KolorsGenerator {
         }
         Ok(GenerationOutput::Images(images))
     }
-}
 
-impl KolorsGenerator {
     /// The single img2img / IP reference image + its strength (the per-reference strength wins). One
     /// reference only; more than one is an error.
     fn resolve_reference<'a>(
@@ -393,8 +413,14 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    ModelRegistration { descriptor, load }
+    ModelRegistration { descriptor, load: load_registered }
 }
 
 #[cfg(test)]

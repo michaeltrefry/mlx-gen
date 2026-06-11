@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput,
+    default_seed, gen_core, AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
     Quant, Result, WeightsSource,
 };
@@ -58,6 +58,7 @@ pub fn descriptor_vace() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID_VACE,
         family: "wan",
+        backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
             // CFG (guide 5.0) + the Chinese anti-artifact negative prompt. The control input is a
@@ -80,6 +81,7 @@ pub fn descriptor_vace() -> ModelDescriptor {
             max_size: 1280,
             max_count: 1,
             mac_only: true,
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -188,7 +190,23 @@ impl Generator for WanVace {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl WanVace {
+    /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
+    /// lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID_VACE, req)?;
@@ -221,7 +239,7 @@ impl Generator for WanVace {
     /// 96-ch control latent from the control clip + mask + reference images; (3) load the VACE DiT,
     /// run the CFG [`denoise_vace`] loop with per-vace-layer `control_hidden_states_scale`; (4) drop
     /// the reference latent frames and z16-VAE-decode → RGB8 frames.
-    fn generate(
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -395,6 +413,12 @@ fn load_vace_transformer_weights(root: &std::path::Path) -> Result<Weights> {
     )))
 }
 
+/// Registry adapter: the generator registry's `load` slot is typed on [`gen_core::Result`] (epic
+/// 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor: descriptor_vace, load }
+    mlx_gen::ModelRegistration { descriptor: descriptor_vace, load: load_registered }
 }

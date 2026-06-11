@@ -50,8 +50,10 @@ fn clip_and_t5_tokenizer_match_fork_battery() {
     let mut failures = 0;
     for i in 0..count {
         let prompt = g.metadata(&format!("prompt_{i}")).unwrap().to_string();
-        let r_clip = ids(&clip_tok.tokenize(&prompt).unwrap().input_ids);
-        let r_t5 = ids(&t5_tok.tokenize(&prompt).unwrap().input_ids);
+        let clip_out = clip_tok.tokenize(&prompt).unwrap();
+        let r_clip = ids(&mlx_gen::tokenizer::to_arrays(&clip_out).0);
+        let t5_out = t5_tok.tokenize(&prompt).unwrap();
+        let r_t5 = ids(&mlx_gen::tokenizer::to_arrays(&t5_out).0);
         let g_clip = ids(g.require(&format!("clip_{i}")).unwrap());
         let g_t5 = ids(g.require(&format!("t5_{i}")).unwrap());
         let clip_ok = r_clip == g_clip;

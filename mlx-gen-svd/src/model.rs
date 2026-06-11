@@ -21,7 +21,7 @@ use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
     Result, WeightsSource,
 };
@@ -68,6 +68,7 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "svd",
+        backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
             supports_negative_prompt: false,
@@ -86,6 +87,7 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            supported_quants: &[],
         },
     }
 }
@@ -301,7 +303,21 @@ impl Generator for Svd {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl Svd {
+    fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         // Shared capability floor: size range (256..=1024), count, unsupported negative-prompt /
         // true_cfg / sampler / scheduler, and conditioning (`Reference` only). `guidance` IS supported
         // — it overrides the frame-wise CFG ceiling.
@@ -317,7 +333,7 @@ impl Generator for Svd {
         Ok(())
     }
 
-    fn generate(
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -442,8 +458,14 @@ fn frames_to_images(decoded: &Array) -> Result<Vec<Image>> {
     Ok(frames)
 }
 
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor, load }
+    mlx_gen::ModelRegistration { descriptor, load: load_registered }
 }
 
 #[cfg(test)]

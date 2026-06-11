@@ -53,7 +53,7 @@ impl LtxTokenizer {
             return Err(Error::Msg("ltx tokenizer: empty prompt".into()));
         }
         let out = self.inner.tokenize(prompt)?; // (1, L): <bos> + tokens, mask all 1
-        let mut ids: Vec<i32> = out.input_ids.as_slice::<i32>().to_vec();
+        let mut ids: Vec<i32> = out.ids.clone();
         if ids.len() > max_length {
             ids.truncate(max_length); // HF truncation=True keeps the leading max_length tokens
         }
@@ -75,13 +75,13 @@ impl LtxTokenizer {
     /// (no auto BOS — the template supplies the `<start_of_turn>` markers itself). The prompt-enhancer
     /// path (sc-2845) uses this, mirroring the reference `processor(formatted, add_special_tokens=False)`.
     pub fn encode_chat(&self, text: &str) -> Result<Vec<i32>> {
-        self.inner.encode_ids(text, false)
+        self.inner.encode_ids(text, false).map_err(Into::into)
     }
 
     /// Detokenize generated ids → text, dropping special tokens — the reference
     /// `processor.decode(generated_tokens, skip_special_tokens=True)`.
     pub fn decode(&self, ids: &[i32]) -> Result<String> {
         let u: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-        self.inner.decode(&u, true)
+        self.inner.decode(&u, true).map_err(Into::into)
     }
 }

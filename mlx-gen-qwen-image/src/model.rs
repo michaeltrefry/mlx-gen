@@ -12,9 +12,9 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress,
-    Result, WeightsSource,
+    gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::loader;
@@ -39,6 +39,7 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "qwen-image",
+        backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
             // True CFG with a negative prompt + guidance (not distilled).
@@ -62,6 +63,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: true,
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             // Flow-match schedule uses the resolution-dependent sigma shift.
             requires_sigma_shift: true,
@@ -159,11 +161,24 @@ impl Generator for QwenImage {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        validate_request(&self.descriptor.capabilities, req)
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
     }
 
     fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl QwenImage {
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -316,8 +331,14 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    ModelRegistration { descriptor, load }
+    ModelRegistration { descriptor, load: load_registered }
 }
 
 #[cfg(test)]

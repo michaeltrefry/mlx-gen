@@ -24,10 +24,11 @@ fn text_mask_matches_diffusers() {
 
     for (i, prompt) in PROMPTS.iter().enumerate() {
         let out = tok.tokenize(prompt).unwrap();
+        let (input_ids, _) = mlx_gen::tokenizer::to_arrays(&out);
 
         // (a) input_ids identical to the diffusers T5TokenizerFast.
         let ids_golden = io.require(&format!("input_ids_{i}")).unwrap();
-        let ids_got = out.input_ids.as_dtype(Dtype::Int32).unwrap();
+        let ids_got = input_ids.as_dtype(Dtype::Int32).unwrap();
         assert_eq!(ids_got.shape(), ids_golden.shape(), "input_ids shape [{i}]");
         let id_diff = max_abs(
             &subtract(
@@ -39,7 +40,7 @@ fn text_mask_matches_diffusers() {
         assert_eq!(id_diff, 0.0, "input_ids diverge for prompt {i}");
 
         // (b) transformer mask reproduces (arange <= seq_lengths), keep-one-extra-pad.
-        let mask_got = transformer_text_mask(&out.input_ids, 0).unwrap();
+        let mask_got = transformer_text_mask(&input_ids, 0).unwrap();
         let mask_golden = io.require(&format!("attention_mask_{i}")).unwrap();
         let m_diff = max_abs(&subtract(&mask_got, mask_golden).unwrap());
         assert_eq!(m_diff, 0.0, "transformer mask diverges for prompt {i}");

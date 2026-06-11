@@ -46,22 +46,19 @@ fn z_image_tokenizer_matches_fork() {
 
     for (i, prompt) in PROMPTS.iter().enumerate() {
         let out = tok.tokenize(prompt).unwrap();
+        let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&out);
         let want_ids = w.require(&format!("p{i}.input_ids")).unwrap();
         let want_mask = w.require(&format!("p{i}.attention_mask")).unwrap();
 
-        assert_eq!(
-            out.input_ids.shape(),
-            want_ids.shape(),
-            "p{i}: input_ids shape"
-        );
+        assert_eq!(input_ids.shape(), want_ids.shape(), "p{i}: input_ids shape");
         assert!(
-            array_eq(&out.input_ids, want_ids, false)
+            array_eq(&input_ids, want_ids, false)
                 .unwrap()
                 .item::<bool>(),
             "p{i}: input_ids diverged from the fork"
         );
         assert!(
-            array_eq(&out.attention_mask, want_mask, false)
+            array_eq(&attention_mask, want_mask, false)
                 .unwrap()
                 .item::<bool>(),
             "p{i}: attention_mask diverged from the fork"

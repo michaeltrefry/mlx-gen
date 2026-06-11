@@ -46,7 +46,7 @@ use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
     Precision as LoadPrecision, Progress, Result, WeightsSource,
 };
@@ -144,6 +144,7 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "ltx",
+        backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
             // Distilled 2-stage path: CFG is forced to 1.0, so no guidance / negative prompt.
@@ -165,6 +166,9 @@ pub fn descriptor() -> ModelDescriptor {
             // strength over the full video+audio+cross-modal surface.
             supports_lora: true,
             supports_lokr: true,
+            // Quantization is checkpoint-driven (split_model.json); load() rejects on-the-fly
+            // spec.quantize that disagrees with the manifest. No on-the-fly re-quant available.
+            supported_quants: &[],
             samplers: Vec::new(),
             schedulers: Vec::new(),
             // height/width must be divisible by 64 (stage-1 runs at //2//32).
@@ -868,11 +872,24 @@ impl Generator for Ltx {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        validate_request(&self.descriptor.capabilities, req)
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
     }
 
     fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl Ltx {
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -921,9 +938,17 @@ impl Generator for Ltx {
     }
 }
 
-inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor, load }
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
 }
+
+inventory::submit! {
+    ModelRegistration { descriptor, load: load_registered }
+}
+
+use mlx_gen::ModelRegistration;
 
 #[cfg(test)]
 mod tests {

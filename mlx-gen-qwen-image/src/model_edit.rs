@@ -14,9 +14,9 @@
 use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress,
-    Result, WeightsSource,
+    gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
@@ -46,6 +46,7 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "qwen-image",
+        backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
             supports_negative_prompt: true,
@@ -66,6 +67,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: true,
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: true,
         },
@@ -133,9 +135,10 @@ impl QwenImageEdit {
     /// vision tower is **not** re-run for the positive vs negative prompt (F-004).
     fn encode_edit(&self, prompt: &str, n_image_tokens: usize, vision: &Array) -> Result<Array> {
         let tok = tokenize_edit_text(&self.tokenizer, prompt, n_image_tokens)?;
-        let embeds =
-            self.vl_encoder
-                .encode_with_vision(&tok.input_ids, &tok.attention_mask, vision)?;
+        let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&tok);
+        let embeds = self
+            .vl_encoder
+            .encode_with_vision(&input_ids, &attention_mask, vision)?;
         Ok(embeds.as_dtype(Dtype::Float16)?)
     }
 }
@@ -145,12 +148,25 @@ impl Generator for QwenImageEdit {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         validate_request(&self.descriptor.capabilities, req)?;
-        validate_reference_images(req)
+        validate_reference_images(req).map_err(Into::into)
     }
 
     fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl QwenImageEdit {
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -301,8 +317,14 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
     Ok(())
 }
 
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    ModelRegistration { descriptor, load }
+    ModelRegistration { descriptor, load: load_registered }
 }
 
 #[cfg(test)]

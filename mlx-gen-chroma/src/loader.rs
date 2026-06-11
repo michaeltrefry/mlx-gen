@@ -35,7 +35,7 @@ pub fn load_tokenizer_with_max_len(max_length: usize) -> Result<TextTokenizer> {
         chat_template: ChatTemplate::None,
         pad_to_max_length: true,
     };
-    TextTokenizer::from_json_str(T5_TOKENIZER_JSON, config)
+    TextTokenizer::from_json_str(T5_TOKENIZER_JSON, config).map_err(Into::into)
 }
 
 pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {

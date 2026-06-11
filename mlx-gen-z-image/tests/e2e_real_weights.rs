@@ -271,10 +271,11 @@ fn e2e_full_pipeline_generates_fox() {
     // Tokenizer parity: the prompt with the Qwen chat template reproduces the fork's ids exactly.
     let tok = load_tokenizer(&snap).unwrap();
     let t = tok.tokenize(&prompt).unwrap();
+    let (input_ids, _) = mlx_gen::tokenizer::to_arrays(&t);
     let take_n =
         |a: &Array| a.reshape(&[-1]).unwrap().as_slice::<i32>()[..num_valid as usize].to_vec();
     assert_eq!(
-        take_n(&t.input_ids),
+        take_n(&input_ids),
         take_n(g.require("input_ids").unwrap()),
         "tokenizer input_ids diverge from the fork"
     );

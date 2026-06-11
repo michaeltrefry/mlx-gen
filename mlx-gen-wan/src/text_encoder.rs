@@ -175,8 +175,9 @@ impl Umt5Encoder {
     pub fn encode(&self, tok: &TextTokenizer, prompt: &str) -> Result<Array> {
         let cleaned = clean_text(prompt);
         let out = tok.tokenize_preformatted(&cleaned)?;
-        let seq_len: i32 = out.attention_mask.sum(None)?.item();
-        let embeds = self.forward(&out.input_ids, &out.attention_mask)?;
+        let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&out);
+        let seq_len: i32 = attention_mask.sum(None)?.item();
+        let embeds = self.forward(&input_ids, &attention_mask)?;
         let dim = embeds.shape()[2];
         let flat = embeds.reshape(&[embeds.shape()[1], dim])?;
         let idx = Array::from_slice(&(0..seq_len).collect::<Vec<i32>>(), &[seq_len]);

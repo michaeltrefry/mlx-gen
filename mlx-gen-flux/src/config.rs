@@ -1,7 +1,7 @@
 //! FLUX.1 family configuration, lifted from the frozen Python mflux fork's
 //! `ModelConfig.{schnell,dev}` and `FluxWeightDefinition.get_tokenizers`.
 
-use mlx_gen::{Capabilities, ConditioningKind, Modality, ModelDescriptor};
+use mlx_gen::{Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant};
 
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
 pub const FLUX1_DEV_ID: &str = "flux1_dev";
@@ -79,6 +79,7 @@ impl FluxVariant {
                 // false-capability trap — `validate` rejects MultiReference / multiple references).
                 // The Redux/Depth/Fill/Control variants remain later ports.
                 conditioning: vec![ConditioningKind::Reference],
+                supported_quants: &[Quant::Q4, Quant::Q8],
                 supports_lora: true,
                 supports_lokr: true,
                 // The base flow-match sampler plus, for dev, the Hyper-FLUX few-step profile

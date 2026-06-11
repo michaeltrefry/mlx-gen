@@ -95,7 +95,7 @@ pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
             path.display()
         )));
     }
-    TextTokenizer::from_file(
+    Ok(TextTokenizer::from_file(
         path,
         TokenizerConfig {
             max_length: 32_768,
@@ -103,7 +103,7 @@ pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
             chat_template: ChatTemplate::None,
             pad_to_max_length: false,
         },
-    )
+    )?)
 }
 
 /// The three position rows for a run of `len` **text** tokens: temporal = `0..len`, height = width

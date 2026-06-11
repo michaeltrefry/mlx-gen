@@ -13,7 +13,7 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
     GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Result, WeightsSource,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
@@ -60,7 +60,7 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supported_quants: &[],
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // Turbo is guidance-distilled: no CFG, no negative prompt.
             supports_negative_prompt: false,
             supports_guidance: false,
@@ -101,7 +101,7 @@ pub struct ZImageTurbo {
 /// every quantizable Linear (plus the text encoder's token Embedding) so a Q4/Q8 consumer gets the
 /// full memory saving and fork-matching output (sc-2532). An fp32 precision override is not wired
 /// (the validated dense path is bf16) and is rejected rather than silently ignored.
-pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "z_image_turbo: only dense bf16 is wired in the Rust port; the text encoder already \
@@ -162,6 +162,19 @@ impl Generator for ZImageTurbo {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl ZImageTurbo {
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
         self.validate(req)?;
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
@@ -293,8 +306,14 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    ModelRegistration { descriptor, load }
+    ModelRegistration { descriptor, load: load_registered }
 }
 
 #[cfg(test)]

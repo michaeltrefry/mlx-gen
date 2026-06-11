@@ -38,6 +38,7 @@ pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
             pad_to_max_length: true,
         },
     )
+    .map_err(Into::into)
 }
 
 /// Load the Qwen3 text encoder. The on-disk `model.*` keys map directly onto the encoder tree

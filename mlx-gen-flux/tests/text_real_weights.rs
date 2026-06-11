@@ -32,8 +32,10 @@ fn flux_text_path_runs_on_real_weights() {
     let prompt = "a red fox";
     let t5_out = t5_tok.tokenize(prompt).unwrap();
     let clip_out = clip_tok.tokenize(prompt).unwrap();
-    let prompt_embeds = t5.forward(&t5_out.input_ids).unwrap();
-    let pooled = clip.forward(&clip_out.input_ids).unwrap();
+    let (t5_ids, _) = mlx_gen::tokenizer::to_arrays(&t5_out);
+    let (clip_ids, _) = mlx_gen::tokenizer::to_arrays(&clip_out);
+    let prompt_embeds = t5.forward(&t5_ids).unwrap();
+    let pooled = clip.forward(&clip_ids).unwrap();
 
     assert_eq!(prompt_embeds.shape()[0], 1);
     assert_eq!(

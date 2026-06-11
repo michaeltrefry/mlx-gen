@@ -512,12 +512,20 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
     Ok(())
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_schnell, load: load_schnell }
+fn load_schnell_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_schnell(spec).map_err(Into::into)
+}
+
+fn load_dev_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_dev(spec).map_err(Into::into)
 }
 
 inventory::submit! {
-    ModelRegistration { descriptor: descriptor_dev, load: load_dev }
+    ModelRegistration { descriptor: descriptor_schnell, load: load_schnell_registered }
+}
+
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_dev, load: load_dev_registered }
 }
 
 #[cfg(test)]

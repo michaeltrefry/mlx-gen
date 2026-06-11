@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
+    default_seed, gen_core, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
     MoeExpert, Precision, Progress, Quant, Result, WeightsSource,
 };
@@ -47,6 +47,7 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "wan",
+        backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
             // 5B uses real CFG (guide 5.0) with the Chinese anti-artifact negative prompt, and
@@ -69,6 +70,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 1280,
             max_count: 1,
             mac_only: true,
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // Cross-attention text K/V is cached across denoise steps.
             supports_kv_cache: true,
             // Wan pins a static `sample_shift` from config (not the empirical per-resolution mu).
@@ -181,7 +183,23 @@ impl Generator for Wan {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl Wan {
+    /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
+    /// lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         // Shared capability floor: size range (the advertised `min_size` = patch×vae_stride = 32 is
         // the sub-tile lower bound; `max_size` caps the long edge), count, guidance/negative/true_cfg,
         // sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and conditioning (`Reference`/`Keyframe`).
@@ -206,7 +224,7 @@ impl Generator for Wan {
     /// first-frame mask + per-token mask, blend the noise init; (2) load the 5B DiT (merge adapters,
     /// quantize), embed the contexts, run the dense [`denoise`] (T2V) or [`denoise_ti2v`] mask-blend
     /// loop; (3) load the vae22 decoder → RGB8 frames. CFG runs with the single guidance scale.
-    fn generate(
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -408,8 +426,14 @@ impl Generator for Wan {
     }
 }
 
+/// Registry adapter: the generator registry's `load` slot is typed on [`gen_core::Result`] (epic
+/// 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor, load }
+    mlx_gen::ModelRegistration { descriptor, load: load_registered }
 }
 
 // ===========================================================================================
@@ -424,6 +448,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID_T2V_14B,
         family: "wan",
+        backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
             // CFG with the per-expert (low, high) guidance pair + the Chinese anti-artifact negative
@@ -443,6 +468,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             max_size: 1280,
             max_count: 1,
             mac_only: true,
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // Cross-attention text K/V is cached across denoise steps (per expert).
             supports_kv_cache: true,
             requires_sigma_shift: false,
@@ -591,7 +617,23 @@ impl Generator for Wan14b {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl Wan14b {
+    /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
+    /// lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         let id = self.descriptor.id;
         // Shared capability floor: size range (the advertised `min_size` = patch×vae_stride = 16 is
         // the sub-tile lower bound; `max_size` caps the long edge), count, guidance/negative/true_cfg,
@@ -633,7 +675,7 @@ impl Generator for Wan14b {
     /// embed the contexts per expert, run the boundary-switched [`denoise_moe`] loop (with `y` for
     /// I2V), drop the experts; (3) load the z16 VAE, decode to RGB8 frames. CFG runs with the
     /// per-expert (low, high) guidance.
-    fn generate(
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -804,8 +846,14 @@ impl Generator for Wan14b {
     }
 }
 
+/// Registry adapter: the generator registry's `load` slot is typed on [`gen_core::Result`] (epic
+/// 3720); bridge the crate's rich-`Result` [`load_t2v_14b`] into it.
+fn load_t2v_14b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_t2v_14b(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor: descriptor_t2v_14b, load: load_t2v_14b }
+    mlx_gen::ModelRegistration { descriptor: descriptor_t2v_14b, load: load_t2v_14b_registered }
 }
 
 // ===========================================================================================
@@ -830,6 +878,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID_I2V_14B,
         family: "wan",
+        backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
             supports_negative_prompt: true,
@@ -848,6 +897,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             max_size: 1280,
             max_count: 1,
             mac_only: true,
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: true,
             requires_sigma_shift: false,
         },
@@ -902,6 +952,12 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
+/// Registry adapter: the generator registry's `load` slot is typed on [`gen_core::Result`] (epic
+/// 3720); bridge the crate's rich-`Result` [`load_i2v_14b`] into it.
+fn load_i2v_14b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_i2v_14b(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor: descriptor_i2v_14b, load: load_i2v_14b }
+    mlx_gen::ModelRegistration { descriptor: descriptor_i2v_14b, load: load_i2v_14b_registered }
 }
