@@ -53,7 +53,7 @@ fn config_from_meta(w: &Weights) -> NeoChatConfig {
         "noise_scale_base_image_seq_len": 64, "add_noise_scale_embedding": true,
         "llm_config": llm, "vision_config": vision,
     });
-    NeoChatConfig::from_config_json(&v)
+    NeoChatConfig::from_config_json(&v).expect("synthetic parity config is valid")
 }
 
 fn argmax(v: &[f32]) -> i32 {

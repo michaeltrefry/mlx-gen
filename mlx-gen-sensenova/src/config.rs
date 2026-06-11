@@ -162,10 +162,17 @@ pub struct NeoChatConfig {
 
 impl NeoChatConfig {
     /// Parse a `config.json` `Value` (the `neo_chat` layout).
-    pub fn from_config_json(v: &Value) -> Self {
-        let llm = NeoLlmConfig::from_value(v.get("llm_config").unwrap_or(&Value::Null));
-        let vision = NeoVisionConfig::from_value(v.get("vision_config").unwrap_or(&Value::Null));
-        Self {
+    ///
+    /// Per-field defaults follow the provider convention, but this config additionally carries
+    /// generation-math scalars (`timestep_shift`, `noise_scale_*`, …) where a silent default means
+    /// *wrong images*, not a load error. So gate on the `llm_config`/`vision_config` sub-objects
+    /// being present-and-object before trusting those defaults: a snapshot missing either is corrupt
+    /// or mislabeled, and must fail at load rather than fabricate an 8B-MoT and render garbage
+    /// (F-145). Fields *within* each present sub-object still default individually.
+    pub fn from_config_json(v: &Value) -> Result<Self> {
+        let llm = NeoLlmConfig::from_value(require_object(v, "llm_config")?);
+        let vision = NeoVisionConfig::from_value(require_object(v, "vision_config")?);
+        Ok(Self {
             model_type: get_str(v, "model_type", "neo_chat"),
             template: v
                 .get("template")
@@ -196,7 +203,7 @@ impl NeoChatConfig {
             use_adaln: get_bool(v, "use_adaLN", false),
             llm,
             vision,
-        }
+        })
     }
 
     /// Read and parse `<root>/config.json`.
@@ -206,7 +213,20 @@ impl NeoChatConfig {
             .map_err(|e| Error::Msg(format!("sensenova: reading {}: {e}", path.display())))?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("sensenova: parsing {}: {e}", path.display())))?;
-        Ok(Self::from_config_json(&v))
+        Self::from_config_json(&v)
+    }
+}
+
+/// Require a sub-object (`llm_config`/`vision_config`) to be present and a JSON object. A snapshot
+/// missing one is corrupt or mislabeled — error rather than silently default the whole object
+/// (F-145). `null`, a scalar, or an array all fail the `is_object` check.
+fn require_object<'a>(v: &'a Value, key: &str) -> Result<&'a Value> {
+    match v.get(key) {
+        Some(o) if o.is_object() => Ok(o),
+        _ => Err(Error::Msg(format!(
+            "sensenova: config.json is missing the `{key}` object (corrupt or wrong snapshot); \
+             refusing to fall back to 8B-MoT defaults for generation-math scalars"
+        ))),
     }
 }
 
@@ -290,6 +310,7 @@ const MOT_8B_CONFIG: &str = r#"{
 #[cfg(test)]
 pub(crate) fn mot_8b() -> NeoChatConfig {
     NeoChatConfig::from_config_json(&serde_json::from_str(MOT_8B_CONFIG).unwrap())
+        .expect("8B-MoT fixture has llm_config + vision_config")
 }
 
 #[cfg(test)]
@@ -328,12 +349,37 @@ mod tests {
     #[test]
     fn detects_a3b_moe_when_experts_present() {
         // A synthetic A3B-style llm_config: a `qwen3_moe` type with experts → is_moe() == true.
+        // vision_config is an empty object: present (passes the F-145 gate), fields default.
         let v: Value = serde_json::from_str(
-            r#"{"llm_config":{"model_type":"qwen3_moe","num_experts":128,"gen_num_experts":128}}"#,
+            r#"{"llm_config":{"model_type":"qwen3_moe","num_experts":128,"gen_num_experts":128},"vision_config":{}}"#,
         )
         .unwrap();
-        let c = NeoChatConfig::from_config_json(&v);
+        let c = NeoChatConfig::from_config_json(&v).unwrap();
         assert!(c.llm.is_moe());
         assert_eq!(c.llm.num_experts, Some(128));
+    }
+
+    #[test]
+    fn errors_on_missing_subconfigs() {
+        // F-145: a config.json without the sub-objects must fail at load rather than fabricate an
+        // 8B-MoT from per-field defaults (wrong generation-math scalars → garbage images).
+        let no_llm: Value = serde_json::from_str(r#"{"vision_config":{}}"#).unwrap();
+        let err =
+            NeoChatConfig::from_config_json(&no_llm).expect_err("missing llm_config must error");
+        assert!(err.to_string().contains("llm_config"), "got: {err}");
+
+        let no_vision: Value = serde_json::from_str(r#"{"llm_config":{}}"#).unwrap();
+        let err = NeoChatConfig::from_config_json(&no_vision)
+            .expect_err("missing vision_config must error");
+        assert!(err.to_string().contains("vision_config"), "got: {err}");
+
+        // A non-object sub-config (null / scalar) is corrupt too → error.
+        let null_llm: Value =
+            serde_json::from_str(r#"{"llm_config":null,"vision_config":{}}"#).unwrap();
+        assert!(NeoChatConfig::from_config_json(&null_llm).is_err());
+
+        // Both present-and-object → parses.
+        let ok: Value = serde_json::from_str(r#"{"llm_config":{},"vision_config":{}}"#).unwrap();
+        assert!(NeoChatConfig::from_config_json(&ok).is_ok());
     }
 }

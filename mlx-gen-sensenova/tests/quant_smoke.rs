@@ -37,8 +37,8 @@ fn config_from_meta(w: &Weights) -> NeoChatConfig {
         "vocab_size": m("vocab_size").parse::<u64>().unwrap(),
         "attention_bias": false,
     });
-    let v = serde_json::json!({ "model_type": "neo_chat", "tie_word_embeddings": false, "llm_config": llm });
-    NeoChatConfig::from_config_json(&v)
+    let v = serde_json::json!({ "model_type": "neo_chat", "tie_word_embeddings": false, "llm_config": llm, "vision_config": {} });
+    NeoChatConfig::from_config_json(&v).expect("synthetic parity config is valid")
 }
 
 fn index_rows(idx: &Array) -> (Vec<i32>, Vec<i32>, Vec<i32>) {

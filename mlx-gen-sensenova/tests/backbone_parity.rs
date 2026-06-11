@@ -38,8 +38,8 @@ fn config_from_meta(w: &Weights) -> NeoChatConfig {
         "vocab_size": m("vocab_size").parse::<u64>().unwrap(),
         "attention_bias": false,
     });
-    let v = serde_json::json!({ "model_type": "neo_chat", "tie_word_embeddings": false, "llm_config": llm });
-    NeoChatConfig::from_config_json(&v)
+    let v = serde_json::json!({ "model_type": "neo_chat", "tie_word_embeddings": false, "llm_config": llm, "vision_config": {} });
+    NeoChatConfig::from_config_json(&v).expect("synthetic parity config is valid")
 }
 
 /// The three position rows of an int32 `[3, S]` index tensor.

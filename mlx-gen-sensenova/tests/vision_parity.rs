@@ -28,7 +28,10 @@ fn config_from_meta(w: &Weights) -> NeoChatConfig {
         "downsample_ratio": m("downsample_ratio").parse::<f64>().unwrap(),
         "rope_theta_vision": m("rope_theta_vision").parse::<f64>().unwrap(),
     });
-    NeoChatConfig::from_config_json(&serde_json::json!({ "vision_config": vision }))
+    NeoChatConfig::from_config_json(
+        &serde_json::json!({ "llm_config": {}, "vision_config": vision }),
+    )
+    .expect("synthetic vision parity config is valid")
 }
 
 fn errors(a: &Array, b: &Array) -> (f32, f32) {

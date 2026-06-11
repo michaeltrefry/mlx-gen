@@ -62,7 +62,7 @@ fn config_from_meta(w: &Weights) -> NeoChatConfig {
         "llm_config": llm,
         "vision_config": vision,
     });
-    NeoChatConfig::from_config_json(&v)
+    NeoChatConfig::from_config_json(&v).expect("synthetic parity config is valid")
 }
 
 fn peak_rel(a: &Array, b: &Array) -> f32 {
