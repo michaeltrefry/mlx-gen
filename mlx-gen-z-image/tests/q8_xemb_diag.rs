@@ -1,3 +1,9 @@
+//! **RESOLVED — not an open numeric question (F-044).** The sc-2349/2532/2604 Q8 investigation is
+//! closed (re-validated on MLX 0.31.2 in sc-2782); the live Q8 regression is covered by the e2e Q8
+//! gate. This `#[ignore]`d diagnostic is kept only as a localization probe — it pinpoints which op a
+//! residual lives in *if* that gate ever reddens. It needs the original investigation's probe golden
+//! (`tools/golden/q8_xemb_probe.safetensors`, from `probe_q8_xemb_loaded.py`), so it never runs in CI.
+//!
 //! sc-2604 Q8 root-cause diagnostic: localize the base z_image Q8 per-op residual by comparing the
 //! *loaded* Rust x-embedder against the fork's loaded x-embedder (`tools/probe_q8_xemb_loaded.py`),
 //! component by component. The fork side proved (within one build): loaded wq == fresh mx.quantize,

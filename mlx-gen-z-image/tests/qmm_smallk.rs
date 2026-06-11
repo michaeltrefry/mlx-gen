@@ -1,3 +1,9 @@
+//! **RESOLVED — not an open numeric question (F-044).** The sc-2349/2532 Q8 investigation is closed
+//! (re-validated on MLX 0.31.2 in sc-2782); the live Q8 regression is covered by the e2e Q8 gate.
+//! This `#[ignore]`d diagnostic is kept only as a localization probe for `quantized_matmul` at small
+//! K, run if that gate ever reddens. It needs the original probe golden
+//! (`tools/golden/qmm_smallK_probe.safetensors`, from `probe_qmm_smallK.py`), so it never runs in CI.
+//!
 //! sc-2349 → sc-2532 decisive probe: is the base z_image Q8 residual the `quantized_matmul`
 //! **kernel**, and is it **K-dependent**?
 //!
