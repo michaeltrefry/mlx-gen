@@ -33,7 +33,7 @@ use crate::fm::{
     FmHead, TimestepEmbedder,
 };
 use crate::qwen3::{KvCache, Path, Qwen3Backbone};
-use crate::runtime::Sampler;
+use crate::runtime::{argmax, Sampler, SplitMix64, SPLITMIX64_INCREMENT};
 use crate::text::{build_neo1_query, image_indexes, text_indexes, tokens, SYSTEM_MESSAGE_FOR_GEN};
 use crate::vision::NeoVisionEmbedder;
 
@@ -1172,7 +1172,7 @@ impl T2iModel {
         let mut text = String::new();
         let mut images = Vec::new();
         let mut total_tokens = 0usize;
-        let mut next = argmax_i32(&cond_logits);
+        let mut next = argmax(&cond_logits);
 
         loop {
             // ---- Text generation on the condition cache ----
@@ -1188,7 +1188,7 @@ impl T2iModel {
                     self.backbone
                         .decode_logits(next, (t_cond + 1) as i32, &mut cache_cond)?;
                 t_cond += 1;
-                next = argmax_i32(&logits);
+                next = argmax(&logits);
                 if total_tokens >= max_new_tokens {
                     hit_max = true;
                     break;
@@ -1242,7 +1242,7 @@ impl T2iModel {
                 self.append_generated_image(&image, token_h, token_w, t_tu, &mut cache_tu)?;
             t_tu = nt_tu;
             images.push(image);
-            next = argmax_i32(&cond_next);
+            next = argmax(&cond_next);
         }
 
         Ok(InterleaveOutput { text, images })
@@ -1517,19 +1517,6 @@ fn optimized_scale(v_cond: &Array, v_uncond: &Array) -> Result<f32> {
     Ok(dot / (nrm + 1e-8))
 }
 
-/// Index of the maximum element (ties → lowest index, matching `torch.argmax`).
-fn argmax_i32(v: &[f32]) -> i32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > best_v {
-            best_v = x;
-            best = i;
-        }
-    }
-    best as i32
-}
-
 /// `smart_resize` (Qwen2.5-VL, the vendored `utils.smart_resize`): round `height`/`width` to
 /// multiples of `factor` (use `patch·merge = 32`) with total pixels held in `[min_pixels,
 /// max_pixels]`. Returns `(height, width)`.
@@ -1562,16 +1549,13 @@ pub fn smart_resize(
 /// Standard-normal `[shape]` via Box–Muller over a SplitMix64 stream (deterministic per `seed`).
 fn gaussian(shape: &[i32], seed: u64) -> Result<Array> {
     let n: usize = shape.iter().map(|&d| d as usize).product();
-    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut next_f = || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        // (0, 1] to keep ln() finite.
-        ((z >> 11) as f64 + 1.0) / ((1u64 << 53) as f64)
-    };
+    // Reuse the shared `SplitMix64` so the scramble constants live in one place (F-133). The original
+    // inline form pre-incremented `seed` once before producing any value, so seed the RNG offset by
+    // one increment to keep the produced stream byte-identical. The f64 (0, 1] mapping below is
+    // gaussian-specific (53-bit mantissa, biased off zero to keep `ln()` finite) and differs from
+    // `SplitMix64::next_f32`, so it stays here.
+    let mut rng = SplitMix64::new(seed.wrapping_add(SPLITMIX64_INCREMENT));
+    let mut next_f = || ((rng.next_u64() >> 11) as f64 + 1.0) / ((1u64 << 53) as f64);
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
         let u1 = next_f();
@@ -1593,6 +1577,44 @@ mod tests {
     fn slice(a: &Array) -> Vec<f32> {
         let n = a.shape().iter().product::<i32>();
         a.reshape(&[n]).unwrap().as_slice::<f32>().to_vec()
+    }
+
+    #[test]
+    fn gaussian_matches_inline_reference() {
+        // Guard the F-133 dedup: the refactored `gaussian` (now reusing `runtime::SplitMix64`) must
+        // produce a byte-identical stream to the original inline SplitMix64 Box–Muller. Reconstruct
+        // the original algorithm here independently so future drift in either copy is caught.
+        fn reference(shape: &[i32], seed: u64) -> Vec<f32> {
+            let n: usize = shape.iter().map(|&d| d as usize).product();
+            let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut next_f = || {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                ((z >> 11) as f64 + 1.0) / ((1u64 << 53) as f64)
+            };
+            let mut out = Vec::with_capacity(n);
+            while out.len() < n {
+                let u1 = next_f();
+                let u2 = next_f();
+                let r = (-2.0 * u1.ln()).sqrt();
+                let theta = 2.0 * std::f64::consts::PI * u2;
+                out.push((r * theta.cos()) as f32);
+                if out.len() < n {
+                    out.push((r * theta.sin()) as f32);
+                }
+            }
+            out
+        }
+        // Cover both even and odd element counts (the trailing-sin branch).
+        for shape in [[3, 5].as_slice(), [1, 7].as_slice()] {
+            for seed in [0u64, 1, 42, 0xDEAD_BEEF] {
+                let got = slice(&gaussian(shape, seed).unwrap());
+                assert_eq!(got, reference(shape, seed), "shape={shape:?} seed={seed}");
+            }
+        }
     }
 
     #[test]

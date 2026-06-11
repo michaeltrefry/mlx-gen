@@ -178,7 +178,7 @@ impl Qwen3Backbone {
 }
 
 /// Index of the maximum logit (ties → lowest index, matching `torch.argmax`).
-fn argmax(logits: &[f32]) -> i32 {
+pub(crate) fn argmax(logits: &[f32]) -> i32 {
     let mut best = 0usize;
     let mut best_v = f32::NEG_INFINITY;
     for (i, &v) in logits.iter().enumerate() {
@@ -251,16 +251,20 @@ fn sample(logits: &[f32], temperature: f32, top_p: f32, top_k: usize, rng: &mut 
     order[order.len() - 1] as i32
 }
 
+/// SplitMix64 increment (the golden-ratio odd constant). Single source for the seed-advance step so
+/// the value-producing constants can't drift between callers (F-133).
+pub(crate) const SPLITMIX64_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// SplitMix64 — a tiny deterministic PRNG for reproducible sampling (mirrors the joycaption runtime).
-struct SplitMix64(u64);
+pub(crate) struct SplitMix64(u64);
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    pub(crate) fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(SPLITMIX64_INCREMENT);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
