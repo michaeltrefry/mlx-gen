@@ -384,14 +384,15 @@ impl KolorsGenerator {
 
 /// Capability-driven request validation (unit-testable without loaded weights).
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    // Shared capability contract: count/size range, negative_prompt/guidance/true_cfg support,
+    // sampler, scheduler, and conditioning kinds. Delegating to core keeps Kolors from drifting
+    // out of sync with the descriptor (F-132); this was previously a hand-rolled copy that had
+    // already lost the negative_prompt/guidance/true_cfg/scheduler checks.
+    caps.validate_request(MODEL_ID, req)?;
+
+    // Kolors-specific checks layered on top of the shared contract:
     if req.prompt.is_empty() {
         return Err(Error::Msg("kolors: prompt must not be empty".into()));
-    }
-    if req.count == 0 || req.count > caps.max_count {
-        return Err(Error::Msg(format!(
-            "count {} out of range 1..={}",
-            req.count, caps.max_count
-        )));
     }
     // `steps == 0` divides by zero in `KolorsEulerSampler::new` (`num_train_timesteps / num_steps`),
     // and `steps > 1100` (the train-timestep count) makes `step_ratio == 0` so every timestep
@@ -404,37 +405,12 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
-    if req.width < caps.min_size
-        || req.height < caps.min_size
-        || req.width > caps.max_size
-        || req.height > caps.max_size
-    {
-        return Err(Error::Msg(format!(
-            "{}x{} out of supported range {}..={}",
-            req.width, req.height, caps.min_size, caps.max_size
-        )));
-    }
+    // Kolors VAE downsamples by 8; non-multiple-of-8 dims would mismatch latent shapes.
     if !req.width.is_multiple_of(8) || !req.height.is_multiple_of(8) {
         return Err(Error::Msg(format!(
             "kolors: width/height must be multiples of 8 (got {}x{})",
             req.width, req.height
         )));
-    }
-    if let Some(s) = &req.sampler {
-        if !caps.samplers.contains(&s.as_str()) {
-            return Err(Error::Msg(format!(
-                "kolors: unsupported sampler {s:?} (supported: {:?})",
-                caps.samplers
-            )));
-        }
-    }
-    for c in &req.conditioning {
-        let kind = c.kind();
-        if !caps.accepts(kind) {
-            return Err(Error::Msg(format!(
-                "kolors does not accept {kind:?} conditioning"
-            )));
-        }
     }
     Ok(())
 }
@@ -524,6 +500,45 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("num_steps must be >= 1"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_delegates_to_core_capability_checks() {
+        // F-132: `validate_request` now delegates the shared contract to `Capabilities::validate_request`
+        // rather than re-implementing it. Assert the checks the hand-rolled copy had dropped now fire:
+        // an unsupported scheduler and a `true_cfg` the descriptor doesn't advertise.
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+
+        let bad_scheduler = GenerationRequest {
+            scheduler: Some("ddim".into()),
+            ..base.clone()
+        };
+        assert!(
+            validate_request(&caps, &bad_scheduler).is_err(),
+            "unsupported scheduler must be rejected (delegated to core)"
+        );
+
+        let bad_true_cfg = GenerationRequest {
+            true_cfg: Some(4.0),
+            ..base.clone()
+        };
+        assert!(
+            validate_request(&caps, &bad_true_cfg).is_err(),
+            "true_cfg must be rejected — Kolors advertises supports_true_cfg=false"
+        );
+
+        // The advertised scheduler still passes.
+        let good = GenerationRequest {
+            scheduler: Some("discrete".into()),
+            ..base
+        };
+        assert!(validate_request(&caps, &good).is_ok());
     }
 
     #[test]
