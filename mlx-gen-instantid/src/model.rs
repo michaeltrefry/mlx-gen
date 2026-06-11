@@ -228,13 +228,15 @@ impl InstantId {
             .face
             .as_ref()
             .ok_or_else(|| Error::Msg("instantid: face stack not attached (with_face)".into()))?;
-        let mut faces = face.analyze(img, h, w)?;
-        if faces.is_empty() {
+        // Detect all faces but embed only the largest (F-090): the identity comes from a single
+        // ArcFace forward, not one per detected face.
+        let dets = face.detect(img, h, w)?;
+        if dets.is_empty() {
             return Err(Error::Msg(
                 "instantid: no face detected in the reference".into(),
             ));
         }
-        Ok(faces.remove(0)) // analyze() sorts largest-first
+        face.embed(img, h, w, &dets[0]) // detect() sorts largest-first
     }
 
     /// Full T2I: letterbox the reference to the output size (the sc-2009 kps-distortion rule), detect
@@ -616,11 +618,13 @@ impl InstantId {
             .as_ref()
             .ok_or_else(|| Error::Msg("instantid: face stack not attached (with_face)".into()))?;
         let (bw, bh) = (base.width as usize, base.height as usize);
-        let mut faces = face.analyze(&base.pixels, bh, bw)?;
-        if faces.is_empty() {
+        // Only the box/landmarks are used here (the identity embedding is a separate parameter), so
+        // detect without embedding any face (F-090).
+        let dets = face.detect(&base.pixels, bh, bw)?;
+        if dets.is_empty() {
             return Ok(base.clone()); // no face to restore — leave the base untouched
         }
-        let f = faces.remove(0); // analyze() sorts largest-first
+        let f = &dets[0]; // detect() sorts largest-first
 
         // Crop box: a square-ish window around the face center, padded ×1.9, clamped to the image.
         let [x1, y1, x2, y2] = f.bbox;

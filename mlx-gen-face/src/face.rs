@@ -21,7 +21,7 @@ use mlx_rs::Array;
 
 use crate::bisenet::BiSeNet;
 use crate::iresnet::ArcFace;
-use crate::scrfd::{Scrfd, DET_SIZE};
+use crate::scrfd::{Detection, Scrfd, DET_SIZE};
 use crate::{align, bisenet};
 
 /// One detected face — mirrors insightface's `Face` fields the consumers use.
@@ -37,10 +37,9 @@ pub struct Face {
     pub embedding: Vec<f32>,
 }
 
-impl Face {
-    fn area(&self) -> f32 {
-        (self.bbox[2] - self.bbox[0]) * (self.bbox[3] - self.bbox[1])
-    }
+/// Bounding-box area of a detection (for largest-first ordering).
+fn det_area(d: &Detection) -> f32 {
+    (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1])
 }
 
 /// cv2 `resize` `INTER_LINEAR` for an RGB `u8` HWC image — the SCRFD detector preprocessing.
@@ -203,30 +202,57 @@ impl FaceAnalysis {
         Ok(self)
     }
 
-    /// Detect → align → embed every face in an RGB `u8` image, sorted **largest-first** (insightface
-    /// `app.get()` order — PuLID uses `[0]`, the max face). `h`/`w` are the image dimensions.
-    pub fn analyze(&self, img: &[u8], h: usize, w: usize) -> Result<Vec<Face>> {
+    /// Detect every face in an RGB `u8` image and return the detections sorted **largest-first**
+    /// (insightface `app.get()` order). No ArcFace recognition forward is run — consumers that need
+    /// only the box/landmarks (e.g. InstantID's `restore_face`, or picking the largest face before
+    /// embedding just that one) use this and skip embedding every detection (F-090). `h`/`w` are the
+    /// image dimensions.
+    pub fn detect(&self, img: &[u8], h: usize, w: usize) -> Result<Vec<Detection>> {
         // The worker hands us a decoded buffer plus `(h, w)`; a mismatch would index out of bounds in
-        // the detector/align primitives. Reject it with a typed error rather than crash generation
-        // (F-081) — this is the public worker entry, so it owns the diagnosable check.
+        // the detector primitives. Reject it with a typed error rather than crash generation (F-081).
         if img.len() < h * w * 3 {
             return Err(Error::Msg(format!(
-                "face analyze: img buffer of {} bytes too small for {h}×{w}×3",
+                "face detect: img buffer of {} bytes too small for {h}×{w}×3",
                 img.len()
             )));
         }
         let (blob, det_scale) = detector_blob(img, h, w);
-        let dets = self
+        let mut dets = self
             .scrfd
             .detect(&blob, det_scale, self.det_thresh, self.nms_thresh)?;
+        dets.sort_by(|a, b| det_area(b).total_cmp(&det_area(a)));
+        Ok(dets)
+    }
 
+    /// Align + ArcFace-embed a single [`detect`](Self::detect) result into a [`Face`]. Use this for
+    /// embed-on-demand — when only one face's identity is needed (e.g. the largest), this runs a single
+    /// `[1,112,112,3]` recognition forward instead of embedding every detection (F-090).
+    pub fn embed(&self, img: &[u8], h: usize, w: usize, det: &Detection) -> Result<Face> {
+        let crop = align::norm_crop(img, h, w, &det.kps);
+        let emb = self.arcface.forward(&align::to_arcface_input(&[crop])?)?;
+        Ok(Face {
+            bbox: det.bbox,
+            kps: det.kps,
+            det_score: det.score,
+            embedding: emb
+                .try_as_slice::<f32>()
+                .map_err(|e| format!("embedding readback: {e}"))?
+                .to_vec(),
+        })
+    }
+
+    /// Detect → align → embed every face in an RGB `u8` image, sorted **largest-first** (insightface
+    /// `app.get()` order — PuLID uses `[0]`, the max face). `h`/`w` are the image dimensions. Callers
+    /// that need only one face's identity should prefer [`detect`](Self::detect) + [`embed`](Self::embed).
+    pub fn analyze(&self, img: &[u8], h: usize, w: usize) -> Result<Vec<Face>> {
+        let dets = self.detect(img, h, w)?;
         if dets.is_empty() {
             return Ok(Vec::new());
         }
         // Warp every detected face, then run ONE batched `[N,112,112,3]` ArcFace forward instead of N
         // sequential iresnet100 GPU dispatches (F-089). iresnet100 inference has no cross-batch ops
         // (its BatchNorms are folded into per-channel affines), so each `[N,512]` row is bit-identical
-        // to the per-face forward.
+        // to the per-face forward. `dets` is already area-sorted, so the rows come out largest-first.
         let crops: Vec<Vec<u8>> = dets
             .iter()
             .map(|d| align::norm_crop(img, h, w, &d.kps))
@@ -237,17 +263,16 @@ impl FaceAnalysis {
             .map_err(|e| format!("embedding readback: {e}"))?;
         let dim = emb.len() / dets.len(); // [N, 512] → 512 per row
 
-        let mut faces = Vec::with_capacity(dets.len());
-        for (i, d) in dets.iter().enumerate() {
-            faces.push(Face {
+        Ok(dets
+            .iter()
+            .enumerate()
+            .map(|(i, d)| Face {
                 bbox: d.bbox,
                 kps: d.kps,
                 det_score: d.score,
                 embedding: emb[i * dim..(i + 1) * dim].to_vec(),
-            });
-        }
-        faces.sort_by(|a, b| b.area().total_cmp(&a.area()));
-        Ok(faces)
+            })
+            .collect())
     }
 
     /// PuLID `face_features_image`: facexlib 512² align of `face` → BiSeNet parse → background
