@@ -2,16 +2,20 @@
 //! DETR detector (C), and mask head (D) into the end-to-end `Sam3Model` image path (epic 4910).
 //!
 //! `pixel_values[1,3,1008,1008] + "person" → per-instance masks`. Mirrors `Sam3Model.forward` for
-//! the text-only (no geometry prompt) Promptable Concept Segmentation path.
+//! both the text-only **PCS** path ([`Sam3ImageSegmenter::forward`]) and the box-prompted **PVS**
+//! path ([`Sam3ImageSegmenter::forward_with_boxes`], sc-4923) — the latter prepends geometry prompt
+//! tokens to the text features as the reference's `combined_prompt_features`.
 
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use crate::config::{Sam3DetrConfig, Sam3TextConfig, Sam3VisionConfig};
+use crate::config::{Sam3DetrConfig, Sam3GeometryConfig, Sam3TextConfig, Sam3VisionConfig};
+use crate::detr::sine_position_embedding_flat;
 use crate::mask::{post_process_instances, Instance, Sam3MaskHead};
-use crate::{Sam3Detector, Sam3TextEncoder, Sam3VisionEncoder};
+use crate::{Sam3Detector, Sam3GeometryEncoder, Sam3TextEncoder, Sam3VisionEncoder};
 
 /// Full raw outputs of the image segmenter (pre-post-process).
 pub struct SegmentationOutput {
@@ -31,6 +35,7 @@ pub struct SegmentationOutput {
 pub struct Sam3ImageSegmenter {
     vision: Sam3VisionEncoder,
     text: Sam3TextEncoder,
+    geometry: Sam3GeometryEncoder,
     detector: Sam3Detector,
     mask_head: Sam3MaskHead,
 }
@@ -51,13 +56,18 @@ impl Sam3ImageSegmenter {
                 "detector_model.text_projection",
                 &Sam3TextConfig::sam3(),
             )?,
+            geometry: Sam3GeometryEncoder::from_weights(
+                w,
+                "detector_model.geometry_encoder",
+                &Sam3GeometryConfig::sam3(),
+            )?,
             detector: Sam3Detector::from_weights(w, "detector_model", &detr_cfg)?,
             mask_head: Sam3MaskHead::from_weights(w, "detector_model", &detr_cfg)?,
         })
     }
 
     /// `pixel_values`: NCHW `[1, 3, 1008, 1008]`; `input_ids`: `[1, 32]`; `text_mask`: per-token
-    /// validity (`1`/`0`). Runs the full detector + mask head.
+    /// validity (`1`/`0`). Text-only PCS — runs the full detector + mask head.
     pub fn forward(
         &self,
         pixel_values: &Array,
@@ -66,18 +76,56 @@ impl Sam3ImageSegmenter {
     ) -> Result<SegmentationOutput> {
         let fpn = self.vision.forward(pixel_values)?; // NHWC [288²,144²,72²,36²]
         let text = self.text.forward(input_ids, text_mask)?; // [1,32,256]
-        let det = self.detector.forward(&fpn[2], &text, text_mask)?;
+        self.detect_and_segment(&fpn, &text, text_mask)
+    }
 
+    /// Box-prompted **PVS** path (sc-4923): the geometry encoder turns `boxes` (normalized cxcywh,
+    /// `[1, N, 4]`) + `box_labels` (length `N`, `1`=positive/`0`=negative) into `N + 1` prompt
+    /// tokens, which are concatenated *after* the text features as the reference's
+    /// `combined_prompt_features` and drive the detector + mask head.
+    pub fn forward_with_boxes(
+        &self,
+        pixel_values: &Array,
+        input_ids: &Array,
+        text_mask: &[i32],
+        boxes: &Array,
+        box_labels: &[i32],
+    ) -> Result<SegmentationOutput> {
+        let fpn = self.vision.forward(pixel_values)?;
+        let text = self.text.forward(input_ids, text_mask)?; // [1,32,256]
+
+        // geometry prompt tokens cross-attend to the 72² feature (fpn[2]) + its sine pos embed.
+        let sh = fpn[2].shape();
+        let vision_pos =
+            sine_position_embedding_flat(sh[1], sh[2], Sam3GeometryConfig::sam3().hidden_size)?;
+        let geo = self
+            .geometry
+            .forward(boxes, box_labels, &fpn[2], &vision_pos)?; // [1,N+1,256]
+
+        let combined = concatenate_axis(&[&text, &geo], 1)?;
+        let mut combined_mask = text_mask.to_vec();
+        combined_mask.extend(std::iter::repeat_n(1, geo.shape()[1] as usize));
+
+        self.detect_and_segment(&fpn, &combined, &combined_mask)
+    }
+
+    /// Shared detector + mask-head tail. `prompt`/`prompt_mask` are the text features (PCS) or the
+    /// text⊕geometry `combined_prompt_features` (PVS).
+    fn detect_and_segment(
+        &self,
+        fpn: &[Array],
+        prompt: &Array,
+        prompt_mask: &[i32],
+    ) -> Result<SegmentationOutput> {
+        let det = self.detector.forward(&fpn[2], prompt, prompt_mask)?;
         let backbone = [fpn[0].clone(), fpn[1].clone(), fpn[2].clone()];
-        let prompt_key_mask = prompt_key_mask(text_mask);
         let masks = self.mask_head.forward(
             &det.query_hidden,
             &backbone,
             &det.encoder_hidden_states,
-            &text,
-            &prompt_key_mask,
+            prompt,
+            &prompt_key_mask(prompt_mask),
         )?;
-
         Ok(SegmentationOutput {
             pred_logits: det.pred_logits,
             pred_boxes: det.pred_boxes,
@@ -100,6 +148,31 @@ impl Sam3ImageSegmenter {
         mask_threshold: f32,
     ) -> Result<Vec<Instance>> {
         let out = self.forward(pixel_values, input_ids, text_mask)?;
+        post_process_instances(
+            &out.pred_logits,
+            &out.pred_boxes,
+            &out.presence_logits,
+            &out.pred_masks,
+            target_wh,
+            threshold,
+            mask_threshold,
+        )
+    }
+
+    /// Box-prompted PVS convenience: [`Self::forward_with_boxes`] + instance post-process.
+    #[allow(clippy::too_many_arguments)]
+    pub fn segment_with_boxes(
+        &self,
+        pixel_values: &Array,
+        input_ids: &Array,
+        text_mask: &[i32],
+        boxes: &Array,
+        box_labels: &[i32],
+        target_wh: (f32, f32),
+        threshold: f32,
+        mask_threshold: f32,
+    ) -> Result<Vec<Instance>> {
+        let out = self.forward_with_boxes(pixel_values, input_ids, text_mask, boxes, box_labels)?;
         post_process_instances(
             &out.pred_logits,
             &out.pred_boxes,

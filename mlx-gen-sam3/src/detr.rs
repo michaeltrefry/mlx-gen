@@ -63,7 +63,8 @@ fn attend(q: &Array, k: &Array, v: &Array, scale: f32, mask: Option<&Array>) -> 
 }
 
 /// Generic multi-head attention (`Sam3Attention`): separate q/k/v/o, optional additive mask.
-struct Attn {
+/// Shared by the DETR stack (sc-4921) and the geometry encoder (sc-4923).
+pub(crate) struct Attn {
     q_w: Array,
     q_b: Array,
     k_w: Array,
@@ -79,8 +80,18 @@ struct Attn {
 
 impl Attn {
     fn from_weights(w: &Weights, prefix: &str, cfg: &Sam3DetrConfig) -> Result<Self> {
+        Self::from_dims(w, prefix, cfg.num_attention_heads, cfg.head_dim())
+    }
+
+    /// Construct from explicit head geometry — the geometry encoder reuses the same `Sam3Attention`
+    /// shape but carries its own (numerically identical) config.
+    pub(crate) fn from_dims(
+        w: &Weights,
+        prefix: &str,
+        num_heads: i32,
+        head_dim: i32,
+    ) -> Result<Self> {
         let g = |n: &str| -> Result<Array> { Ok(w.require(&join(prefix, n))?.clone()) };
-        let head_dim = cfg.head_dim();
         Ok(Self {
             q_w: g("q_proj.weight")?,
             q_b: g("q_proj.bias")?,
@@ -90,13 +101,13 @@ impl Attn {
             v_b: g("v_proj.bias")?,
             o_w: g("o_proj.weight")?,
             o_b: g("o_proj.bias")?,
-            num_heads: cfg.num_attention_heads,
+            num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         query: &Array,
         key: &Array,
@@ -122,7 +133,8 @@ impl Attn {
 }
 
 /// `Sam3MLP` (DETR enc/dec FFN): `fc1` → **ReLU** → `fc2` (`hidden_act = "relu"`).
-struct Ffn {
+/// Shared with the geometry encoder (sc-4923).
+pub(crate) struct Ffn {
     fc1_w: Array,
     fc1_b: Array,
     fc2_w: Array,
@@ -130,7 +142,7 @@ struct Ffn {
 }
 
 impl Ffn {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    pub(crate) fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let g = |n: &str| -> Result<Array> { Ok(w.require(&join(prefix, n))?.clone()) };
         Ok(Self {
             fc1_w: g("fc1.weight")?,
@@ -139,7 +151,7 @@ impl Ffn {
             fc2_b: g("fc2.bias")?,
         })
     }
-    fn forward(&self, x: &Array) -> Result<Array> {
+    pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
         let h = relu(&linear(x, &self.fc1_w, &self.fc1_b)?)?;
         linear(&h, &self.fc2_w, &self.fc2_b)
     }
@@ -248,10 +260,21 @@ impl DotScoring {
         let t = self.text_mlp.forward(text)?;
         let t = add(&t, text)?;
         let t = ln(&t, &self.text_mlp_out_w, &self.text_mlp_out_b, self.eps)?;
-        // mean-pool over valid tokens
-        let n_valid = text_mask.iter().filter(|&&m| m == 1).count() as i32;
-        let valid = Array::from_slice(&(0..n_valid).collect::<Vec<i32>>(), &[n_valid]);
-        let pooled = t.take_axis(&valid, 1)?.mean_axis(1, false)?; // [1, D]
+        // masked mean over valid tokens. NOTE: valid positions need not be contiguous — the PVS
+        // path (sc-4923) concatenates valid geometry-prompt tokens *after* the text padding, so we
+        // weight by the mask rather than assuming a leading valid run. Equivalent to a leading-run
+        // take for the text-only PCS path.
+        let l = text_mask.len() as i32;
+        let isv: Vec<f32> = text_mask
+            .iter()
+            .map(|&m| if m == 1 { 1.0 } else { 0.0 })
+            .collect();
+        let n_valid = isv.iter().sum::<f32>().max(1.0);
+        let is_valid = Array::from_slice(&isv, &[1, l, 1]);
+        let pooled = divide(
+            &multiply(&t, &is_valid)?.sum_axis(1, false)?,
+            Array::from_f32(n_valid),
+        )?; // [1, D]
         let proj_text = linear(&pooled, &self.text_proj_w, &self.text_proj_b)?; // [1, D]
         let proj_q = linear(queries, &self.query_proj_w, &self.query_proj_b)?; // [1, Q, D]
                                                                                // ⟨q, text⟩ over D → [1, Q]
@@ -642,7 +665,7 @@ fn text_key_mask(text_mask: &[i32]) -> Array {
 
 /// Sine position embedding (normalize=True), flattened to `[1, H·W, D]` (host-computed constant for
 /// a fixed grid). Mirrors `Sam3SinePositionEmbedding.build_sine_position_embedding` for the neck.
-fn sine_position_embedding_flat(h: i32, w: i32, d: i32) -> Result<Array> {
+pub(crate) fn sine_position_embedding_flat(h: i32, w: i32, d: i32) -> Result<Array> {
     let np = (d / 2) as usize; // 128
     let dt = dim_t();
     let eps = 1e-6f32;

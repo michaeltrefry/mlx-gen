@@ -135,6 +135,50 @@ impl Sam3DetrConfig {
     }
 }
 
+/// Geometry/exemplar prompt-encoder configuration — mirrors `Sam3GeometryEncoderConfig`
+/// (`transformers/models/sam3`). The box/point **PVS** prompt path (sc-4923). Numerically the same
+/// working width as the DETR stack (256/8 heads/2048 FFN), with a distinct `roi_size`.
+#[derive(Clone, Debug)]
+pub struct Sam3GeometryConfig {
+    /// Working width (256).
+    pub hidden_size: i32,
+    /// FFN intermediate dim (2048).
+    pub intermediate_size: i32,
+    /// Transformer layers (3).
+    pub num_layers: i32,
+    /// Attention heads (8); `head_dim = hidden_size / num_attention_heads` (32).
+    pub num_attention_heads: i32,
+    /// ROI-align output side for box pooling (7).
+    pub roi_size: i32,
+    /// LayerNorm epsilon (1e-6).
+    pub layer_norm_eps: f32,
+}
+
+impl Default for Sam3GeometryConfig {
+    fn default() -> Self {
+        Self::sam3()
+    }
+}
+
+impl Sam3GeometryConfig {
+    /// The shipped `facebook/sam3` geometry-encoder configuration.
+    pub fn sam3() -> Self {
+        Self {
+            hidden_size: 256,
+            intermediate_size: 2048,
+            num_layers: 3,
+            num_attention_heads: 8,
+            roi_size: 7,
+            layer_norm_eps: 1e-6,
+        }
+    }
+
+    /// `head_dim = hidden_size / num_attention_heads`.
+    pub fn head_dim(&self) -> i32 {
+        self.hidden_size / self.num_attention_heads
+    }
+}
+
 /// CLIP text-encoder configuration (the `Sam3Config.text_config`, a CLIP-H text tower) + the SAM3
 /// `text_projection` output dim. Defaults are the shipped `facebook/sam3` values.
 #[derive(Clone, Debug)]
