@@ -298,7 +298,7 @@ impl ViTLayer {
 }
 
 /// PE ViT backbone: patch-embed → tiled position embedding → front LayerNorm → layers.
-struct Backbone {
+pub(crate) struct Backbone {
     patch_w: Array, // OHWI, no bias
     pos_embed: Array,
     front_norm_w: Array,
@@ -311,7 +311,7 @@ struct Backbone {
 }
 
 impl Backbone {
-    fn from_weights(w: &Weights, prefix: &str, cfg: &Sam3VisionConfig) -> Result<Self> {
+    pub(crate) fn from_weights(w: &Weights, prefix: &str, cfg: &Sam3VisionConfig) -> Result<Self> {
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| {
                 let global = cfg.global_attn_indexes.contains(&i);
@@ -358,7 +358,7 @@ impl Backbone {
 
     /// `pixel_values`: NCHW `[1, 3, 1008, 1008]`. Returns the backbone feature map NHWC
     /// `[1, grid, grid, C]`.
-    fn forward(&self, pixel_values: &Array) -> Result<Array> {
+    pub(crate) fn forward(&self, pixel_values: &Array) -> Result<Array> {
         let x = pixel_values.transpose_axes(&[0, 2, 3, 1])?; // NHWC
         let x = conv2d(&x, &self.patch_w, None, self.patch_size, 0)?; // [1,grid,grid,C]
         let mut x = add(&x, &self.tiled_pos()?)?;
@@ -376,7 +376,7 @@ impl Backbone {
 }
 
 /// One FPN branch (`Sam3FPNLayer`): scale the backbone map, then `proj1` (1×1) → `proj2` (3×3).
-struct FpnLayer {
+pub(crate) struct FpnLayer {
     /// Transposed-conv up-scale stages (OHWI weight + bias), applied in order with exact-gelu
     /// between consecutive stages (matches `nn.GELU()` in the scale_factor==4 branch).
     up_stages: Vec<(Array, Array)>,
@@ -389,7 +389,7 @@ struct FpnLayer {
 }
 
 impl FpnLayer {
-    fn from_weights(w: &Weights, prefix: &str, scale: f32) -> Result<Self> {
+    pub(crate) fn from_weights(w: &Weights, prefix: &str, scale: f32) -> Result<Self> {
         // Branch on an integer code (`scale·2` → 8/4/2/1) to avoid float-literal matching.
         // scale_layers indices: ConvTranspose at 0 (and 2 for scale 4), GELU at 1 (no weights),
         // MaxPool at 0 for scale 0.5 (no weights).
@@ -422,7 +422,7 @@ impl FpnLayer {
     }
 
     /// `x`: NHWC `[1, 72, 72, 1024]`. Returns NHWC `[1, Hs, Ws, fpn_dim]`.
-    fn forward(&self, x: &Array) -> Result<Array> {
+    pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
         let mut h = x.clone();
         for (i, (w, b)) in self.up_stages.iter().enumerate() {
             let y = conv_transpose2d(&h, w, (2, 2), None, None, None, None)?;
@@ -469,10 +469,23 @@ impl Sam3VisionEncoder {
     /// `pixel_values`: NCHW `[1, 3, 1008, 1008]`. Returns the FPN feature maps as **NHWC**
     /// `[1, Hs, Ws, fpn_dim]`, fine→coarse (288²/144²/72²/36²), one per `scale_factors` entry.
     pub fn forward(&self, pixel_values: &Array) -> Result<Vec<Array>> {
-        let features = self.backbone.forward(pixel_values)?;
+        let features = self.backbone_features(pixel_values)?;
+        self.fpn_from_backbone(&features)
+    }
+
+    /// Run **only** the PE ViT backbone (the half shared by the detector neck and the tracker neck),
+    /// returning the NHWC `[1, grid, grid, C]` feature map. The video tracker runs this once per
+    /// frame and feeds both necks, avoiding a second backbone pass (sc-4924).
+    pub fn backbone_features(&self, pixel_values: &Array) -> Result<Array> {
+        self.backbone.forward(pixel_values)
+    }
+
+    /// Run the detector FPN neck over already-computed backbone features (see
+    /// [`Self::backbone_features`]). Returns the FPN maps NHWC, fine→coarse.
+    pub fn fpn_from_backbone(&self, features: &Array) -> Result<Vec<Array>> {
         self.fpn_layers
             .iter()
-            .map(|l| l.forward(&features))
+            .map(|l| l.forward(features))
             .collect()
     }
 }
