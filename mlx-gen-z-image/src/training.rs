@@ -95,6 +95,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
         id: MODEL_ID,
         family: "z_image",
+        backend: "mlx",
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,

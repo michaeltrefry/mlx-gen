@@ -23,6 +23,7 @@ pub fn descriptor() -> CaptionerDescriptor {
     CaptionerDescriptor {
         id: JOY_CAPTION_MODEL_ID,
         family: JOY_CAPTION_FAMILY,
+        backend: "mlx",
         capabilities: joycaption::capabilities(),
     }
 }

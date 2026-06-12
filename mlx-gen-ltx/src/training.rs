@@ -103,6 +103,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
         id: MODEL_ID,
         family: "ltx",
+        backend: "mlx",
         modality: Modality::Video,
         supports_lora: true,
         // The reference LTX MLX trainer is LoRA-only; LoKr training is unsupported (see `validate`).

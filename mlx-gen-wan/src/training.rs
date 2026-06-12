@@ -147,6 +147,7 @@ fn trainer_descriptor(id: &'static str) -> TrainerDescriptor {
     TrainerDescriptor {
         id,
         family: "wan",
+        backend: "mlx",
         modality: Modality::Video,
         supports_lora: true,
         supports_lokr: true,

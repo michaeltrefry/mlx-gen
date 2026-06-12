@@ -193,6 +193,9 @@ pub struct TrainerDescriptor {
     /// Registry id, e.g. `"z_image_turbo"` (matches the generator id of the same base model).
     pub id: &'static str,
     pub family: &'static str,
+    /// Tensor backend that registered this trainer ("mlx" | "candle"); used by the worker's
+    /// per-backend capability advertisement (sc-4906, epic 3720).
+    pub backend: &'static str,
     pub modality: Modality,
     pub supports_lora: bool,
     pub supports_lokr: bool,

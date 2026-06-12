@@ -179,6 +179,7 @@ mod tests {
         CaptionerDescriptor {
             id: "dummy_test_captioner",
             family: "test",
+            backend: "mlx",
             capabilities: CaptionCapabilities {
                 min_image_size: 1,
                 max_image_size: 4096,

@@ -112,6 +112,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
         id: MODEL_ID,
         family: "kolors",
+        backend: "mlx",
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,

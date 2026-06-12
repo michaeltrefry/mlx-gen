@@ -54,6 +54,9 @@ impl Default for TargetSize {
 pub struct TransformDescriptor {
     pub id: &'static str,
     pub family: &'static str,
+    /// Tensor backend that registered this transform ("mlx" | "candle"); used by the worker's
+    /// per-backend capability advertisement (sc-4906, epic 3720).
+    pub backend: &'static str,
     pub capabilities: TransformCapabilities,
 }
 
