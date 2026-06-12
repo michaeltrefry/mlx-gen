@@ -22,7 +22,13 @@ resolver = "2"
 # it to garbage for 16-bit). mlx-gen builds the kernels at 26.2 (.cargo/config.toml) so NAX 16-bit is
 # correct + uses the faster matrix unit. Guarded by mlx-gen-qwen-image/tests/{bf16_matmul_sweep,sdpa_nax_repro}.
 # MLX 0.31.2 matches the SceneWorks production/golden environments (byte-parity target). See sc-2352 / sc-2517 / sc-2714 / sc-2770 / sc-2772 / sc-2781.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "b6e4e56930d3b639e4989d51be0abface5addf58" }
+# SHA 44929a00 = b6e4e56 + sc-5009: a Metal command-buffer error (GPU watchdog
+# kIOGPUCommandBufferCallbackErrorTimeout / OOM) is detected inside a MTL completion handler on an
+# internal Metal thread, where MLX's throw escaped a noexcept boundary -> std::terminate -> SIGABRT
+# (non-recoverable worker kill). The new mlx-sys/patches/command-buffer-recoverable.patch records the
+# error and re-throws it synchronously on the waiting thread (eval -> Result::Err) instead. Pure
+# MLX-core-patch change; no Rust API moved, so the worker import surface is unchanged.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "44929a001ab8a8837403a71c65cf064224de0cdc" }
 # Backend-neutral contract layer (epic 3720). Workspace member; mlx-gen re-exports it so the old
 # `mlx_gen::…` paths keep resolving. Family crates depend on it for `gen_core::Result` at the
 # contract boundary.
