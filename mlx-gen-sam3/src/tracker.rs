@@ -561,6 +561,10 @@ pub struct Sam3Tracker {
     /// encoder's `shared_embedding`; supplies the dense image positional encoding (the two are not
     /// the same matrix in the checkpoint — `get_image_wide_positional_embeddings`).
     image_pe_embed: PositionEmbeddingRandom,
+    /// `tracker_model.no_memory_embedding` `[1, 1, 256]` — the learned "no memory yet" bias added to
+    /// the image embedding on a frame with no memory conditioning (the single-frame / init path).
+    /// On a memory-conditioned video frame this is replaced by memory attention (F2).
+    no_memory_embedding: Array,
 }
 
 /// A single-frame tracker prediction: the best (argmax-IoU) low-res mask logits + its IoU + the
@@ -586,6 +590,7 @@ impl Sam3Tracker {
                     .require("tracker_model.shared_image_embedding.positional_embedding")?
                     .clone(),
             },
+            no_memory_embedding: w.require("tracker_model.no_memory_embedding")?.clone(),
         })
     }
 
@@ -604,11 +609,17 @@ impl Sam3Tracker {
         box_xyxy_1008: [f32; 4],
     ) -> Result<TrackerMask> {
         let g = image_embedding.shape()[1];
+        // No-memory single-frame path: add the learned no-memory bias to the image embedding
+        // (broadcast over the spatial grid). A memory-conditioned video frame skips this (F2).
+        let image_embedding = add(
+            image_embedding,
+            &self.no_memory_embedding.reshape(&[1, 1, 1, HIDDEN])?,
+        )?;
         let (sparse, dense) = self.prompt.encode_box(box_xyxy_1008, g)?;
         let image_pe = self.image_pe_embed.dense_pe(g)?;
         let (masks, ious, obj_score) =
             self.decoder
-                .forward(image_embedding, &image_pe, &sparse, &dense, high_res, true)?;
+                .forward(&image_embedding, &image_pe, &sparse, &dense, high_res, true)?;
         // argmax IoU over the 3 candidates (host).
         let iv = ious
             .reshape(&[-1])?
