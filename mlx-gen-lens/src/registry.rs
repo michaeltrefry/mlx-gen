@@ -11,8 +11,8 @@
 //! **Surface.** This is a pure **T2I** generator: no img2img / ControlNet / IP conditioning (none
 //! exists in the Lens port). **LoRA + LoKr** merge into the DiT's joint-attention projections at load
 //! (sc-3174 — inference consumption; training stays Python). The dense path is bf16; the `Fp32`
-//! precision override is honored. **Q4/Q8** quantize the gpt-oss encoder's MoE experts at load
-//! (sc-3172 — the ~38 GB / 20 B-param bulk → ~12 GB); the DiT stays dense (sc-3175).
+//! precision override is honored. **Q4/Q8** quantize the gpt-oss encoder's MoE experts (sc-3172 —
+//! the ~38 GB / 20 B-param bulk → ~12 GB) **and** the DiT's linears (sc-3175) at load.
 //!
 //! **Registration mechanism:** the two `inventory::submit!`s below are collected by `mlx_gen`'s
 //! `inventory::collect!` at *link* time, so they activate whenever a consumer (the worker, or this
@@ -78,8 +78,8 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             max_size: 2080,
             max_count: 8,
             mac_only: true,
-            // sc-3172: Q4/Q8 quantize the gpt-oss encoder's MoE experts (the ~38 GB / 20 B-param bulk)
-            // at load → ~12 GB. The DiT stays dense (its quant is sc-3175).
+            // Q4/Q8 quantize the gpt-oss encoder's MoE experts (sc-3172 — the ~38 GB / 20 B-param
+            // bulk → ~12 GB) and the DiT's linears (sc-3175) at load.
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
@@ -130,9 +130,14 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
         )))
         }
     };
+    // Encoder MoE experts quantize during load (sc-3172). The DiT quantizes **after** any adapter
+    // merge (sc-3175) — the quantize-after-merge order (adapters are residuals over the quantized base).
     let mut pipe = LensPipeline::load_quant(&root, dtype, spec.quantize)?;
     if !spec.adapters.is_empty() {
         pipe.apply_adapters(&spec.adapters)?;
+    }
+    if let Some(q) = spec.quantize {
+        pipe.quantize_dit(q)?;
     }
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),

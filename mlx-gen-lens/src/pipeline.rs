@@ -336,6 +336,14 @@ impl LensPipeline {
         crate::adapters::apply_lens_adapters(&mut self.transformer, specs)?;
         Ok(())
     }
+
+    /// Quantize the DiT's linears to Q4/Q8 (sc-3175 — the complement to the encoder quant in
+    /// [`load_quant`](Self::load_quant)). Call **after** [`apply_adapters`](Self::apply_adapters): the
+    /// adapters are forward-time residuals over the now-quantized base, so quantize-after-merge is the
+    /// correct order (the registry orchestrates it).
+    pub fn quantize_dit(&mut self, quant: Quant) -> Result<()> {
+        self.transformer.quantize(quant.bits())
+    }
 }
 
 /// Zero-pad each `[B, cur, C]` feature layer along the sequence axis to length `target`.

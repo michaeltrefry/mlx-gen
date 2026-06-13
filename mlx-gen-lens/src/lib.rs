@@ -57,8 +57,13 @@
 //!   load ([`text_encoder::encoder::LensTextEncoder::from_weights_quant`] →
 //!   [`pipeline::LensPipeline::load_quant`] → the `lens`/`lens_turbo` `supported_quants`), so the
 //!   per-layer bf16 dequant is the only transient (it is `eval`'d into the pack and freed before the
-//!   next layer). Attention / router / embedding stay dense. The DiT stays dense (its quant is
-//!   sc-3175). Validated vs the bf16 reference captures (Q8 near-lossless, Q4 coherent).
+//!   next layer). Attention / router / embedding stay dense. Validated vs the bf16 reference captures
+//!   (Q8 near-lossless, Q4 coherent).
+//! - **sc-3175** — the **DiT Q4/Q8 quantization** ([`dit::LensTransformer::quantize`] →
+//!   [`pipeline::LensPipeline::quantize_dit`]): the DiT's compute-heavy linears (`img_in`/`txt_in`/
+//!   `proj_out` + every block's joint-attention projections + SwiGLU MLPs) quantize at load
+//!   (quantize-**after**-adapter-merge); the timestep embedder, AdaLN modulations, `norm_out`, and
+//!   RMSNorms stay full precision. Q8 near-lossless / Q4 coherent vs the dense bf16 DiT.
 //!
 //! - **sc-3174** — **LoRA + LoKr** inference consumption on the DiT ([`adapters`] +
 //!   `AdaptableHost for LensTransformer`): the four joint-attention projections

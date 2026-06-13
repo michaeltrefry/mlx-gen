@@ -15,19 +15,24 @@ use super::{join, load_weight, LensJointAttention, Linear};
 
 const NORM_EPS: f32 = 1e-6;
 
-/// SwiGLU MLP (`GateMLP`): `w2(silu(w1(x)) · w3(x))`, all bias-less. Hidden width `dim/3·8`.
+/// SwiGLU MLP (`GateMLP`): `w2(silu(w1(x)) · w3(x))`, all bias-less. Hidden width `dim/3·8`. The
+/// three projections are [`AdaptableLinear`] so they can be Q4/Q8-quantized (sc-3175).
 struct GateMlp {
-    w1: Linear,
-    w2: Linear,
-    w3: Linear,
+    w1: AdaptableLinear,
+    w2: AdaptableLinear,
+    w3: AdaptableLinear,
 }
 
 impl GateMlp {
     fn from_weights(w: &Weights, prefix: &str, dtype: Dtype) -> Result<Self> {
+        let load = |name: &str| -> Result<AdaptableLinear> {
+            let weight = load_weight(w, &join(prefix, name), dtype)?;
+            Ok(AdaptableLinear::dense(weight, None))
+        };
         Ok(Self {
-            w1: Linear::load(w, &join(prefix, "w1"), false, dtype)?,
-            w2: Linear::load(w, &join(prefix, "w2"), false, dtype)?,
-            w3: Linear::load(w, &join(prefix, "w3"), false, dtype)?,
+            w1: load("w1")?,
+            w2: load("w2")?,
+            w3: load("w3")?,
         })
     }
 
@@ -35,6 +40,13 @@ impl GateMlp {
         let gate = silu(&self.w1.forward(x)?)?;
         let up = self.w3.forward(x)?;
         self.w2.forward(&multiply(&gate, &up)?)
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.w1.quantize(bits, None)?;
+        self.w2.quantize(bits, None)?;
+        self.w3.quantize(bits, None)?;
+        Ok(())
     }
 }
 
@@ -75,6 +87,16 @@ impl LensTransformerBlock {
             img_mlp: GateMlp::from_weights(w, &join(prefix, "img_mlp"), dtype)?,
             txt_mlp: GateMlp::from_weights(w, &join(prefix, "txt_mlp"), dtype)?,
         })
+    }
+
+    /// Quantize the block's compute-heavy linears to Q4/Q8 (sc-3175): the joint-attention projections
+    /// and both SwiGLU MLPs. The AdaLN modulations (`img_mod`/`txt_mod`) and the RMSNorm weights stay
+    /// full precision (small and precision-sensitive).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize(bits)?;
+        self.img_mlp.quantize(bits)?;
+        self.txt_mlp.quantize(bits)?;
+        Ok(())
     }
 
     /// Returns `(encoder_hidden_states, hidden_states)` (text, image) — the reference block's order.

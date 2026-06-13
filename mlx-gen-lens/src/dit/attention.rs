@@ -63,6 +63,17 @@ impl LensJointAttention {
         })
     }
 
+    /// Quantize the four projections to Q4/Q8 (sc-3175). Call **after** any adapter merge — the
+    /// adapters are forward-time residuals over the (now quantized) base, exactly as the shared seam
+    /// intends, so a quantized base + LoRA residual compose. The QK-norm weights stay full precision.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.img_qkv.quantize(bits, None)?;
+        self.txt_qkv.quantize(bits, None)?;
+        self.to_out.quantize(bits, None)?;
+        self.to_add_out.quantize(bits, None)?;
+        Ok(())
+    }
+
     /// `img`/`txt`: `[B, seq, dim]`; rope tables `[seq, head_dim/2]`; `mask`: optional additive
     /// `[B, 1, 1, img+txt]`. Returns `(img_attn, txt_attn)`.
     #[allow(clippy::too_many_arguments)]

@@ -86,17 +86,24 @@ impl AdaLayerNormContinuous {
     }
 }
 
+/// Load a biased diffusers `[out, in]` projection as a quantizable [`AdaptableLinear`] (sc-3175).
+fn load_biased_adaptable(w: &Weights, prefix: &str, dtype: Dtype) -> Result<AdaptableLinear> {
+    let weight = w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?;
+    let bias = w.require(&format!("{prefix}.bias"))?.as_dtype(dtype)?;
+    Ok(AdaptableLinear::dense(weight, Some(bias)))
+}
+
 /// The Lens denoising DiT.
 pub struct LensTransformer {
-    img_in: Linear,
+    img_in: AdaptableLinear,
     txt_norm: Vec<Array>, // per-layer RMSNorm weights (eps 1e-5)
-    txt_in: Linear,
+    txt_in: AdaptableLinear,
     time_linear_1: Linear,
     time_linear_2: Linear,
     rope: LensRope3d,
     blocks: Vec<LensTransformerBlock>,
     norm_out: AdaLayerNormContinuous,
-    proj_out: Linear,
+    proj_out: AdaptableLinear,
     cfg: LensDitConfig,
     dtype: Dtype,
 }
@@ -119,9 +126,9 @@ impl LensTransformer {
             )?);
         }
         Ok(Self {
-            img_in: Linear::load(w, "img_in", true, dtype)?,
+            img_in: load_biased_adaptable(w, "img_in", dtype)?,
             txt_norm,
-            txt_in: Linear::load(w, "txt_in", true, dtype)?,
+            txt_in: load_biased_adaptable(w, "txt_in", dtype)?,
             time_linear_1: Linear::load(
                 w,
                 "time_text_embed.timestep_embedder.linear_1",
@@ -137,10 +144,25 @@ impl LensTransformer {
             rope: LensRope3d::new(10000.0, cfg.axes_dims_rope),
             blocks,
             norm_out: AdaLayerNormContinuous::from_weights(w, "norm_out", dtype)?,
-            proj_out: Linear::load(w, "proj_out", true, dtype)?,
+            proj_out: load_biased_adaptable(w, "proj_out", dtype)?,
             cfg: *cfg,
             dtype,
         })
+    }
+
+    /// Quantize the DiT's compute-heavy linears to Q4/Q8 (sc-3175): `img_in`, `txt_in`, `proj_out`,
+    /// and every block's attention projections and SwiGLU MLPs. The timestep embedder, the AdaLN
+    /// modulations, `norm_out`, and all RMSNorm weights stay full precision. Call **after** any adapter
+    /// merge (the `apply_adapters` → `quantize_dit` order in the registry) — adapters are forward-time
+    /// residuals over the now-quantized base.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.img_in.quantize(bits, None)?;
+        self.txt_in.quantize(bits, None)?;
+        self.proj_out.quantize(bits, None)?;
+        for block in &mut self.blocks {
+            block.quantize(bits)?;
+        }
+        Ok(())
     }
 
     /// `temb = linear_2(silu(linear_1(proj(t))))`, `[B] → [B, inner]`.
