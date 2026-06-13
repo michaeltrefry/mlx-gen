@@ -24,7 +24,7 @@
 //! Linears are [`AdaptableLinear`]s so sc-5146 can quantize them Q4/Q8 at load.
 
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, softmax_axis, split};
+use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, softmax_axis, split, split_sections};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -506,9 +506,38 @@ impl VisionTower {
     }
 }
 
+/// `get_vit_features`: split the concatenated tower output `[Σ merged, out_hidden]` back into one
+/// `[merged, out_hidden]` chunk per grid, by `t·h·w / merge²` (the reference's
+/// `torch.split(image_embeds, grid.prod(-1) // merge²)`).
+pub fn split_vit_features(embeds: &Array, grids: &[[i32; 3]], merge: i32) -> Result<Vec<Array>> {
+    let m2 = merge * merge;
+    let sizes: Vec<i32> = grids.iter().map(|g| g[0] * g[1] * g[2] / m2).collect();
+    if sizes.len() <= 1 {
+        return Ok(vec![embeds.clone()]);
+    }
+    let mut pts = Vec::with_capacity(sizes.len() - 1);
+    let mut acc = 0;
+    for s in &sizes[..sizes.len() - 1] {
+        acc += s;
+        pts.push(acc);
+    }
+    Ok(split_sections(embeds, &pts, 0)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// split_vit_features chunks by per-grid merged-token count.
+    #[test]
+    fn vit_feature_split() {
+        // two grids: (1,4,6)->6 merged, (1,4,4)->4 merged; total 10 rows.
+        let embeds = Array::zeros::<f32>(&[10, 8]).unwrap();
+        let chunks = split_vit_features(&embeds, &[[1, 4, 6], [1, 4, 4]], 2).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].shape(), &[6, 8]);
+        assert_eq!(chunks[1].shape(), &[4, 8]);
+    }
 
     /// `vit_merger_window_size = window // merge // patch` and `head_dim` / `merge_unit` derivations
     /// match Qwen2.5-VL-7B.

@@ -36,7 +36,7 @@ pub const MERGE_SIZE: i64 = 2;
 pub const FACTOR: i64 = PATCH_SIZE * MERGE_SIZE;
 
 /// Python `round` (round half to **even**) — banker's rounding, which Rust's `f64::round` does not do.
-fn py_round(x: f64) -> i64 {
+pub(crate) fn py_round(x: f64) -> i64 {
     let f = x.floor();
     let diff = x - f;
     if diff < 0.5 {

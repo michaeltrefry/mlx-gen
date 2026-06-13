@@ -31,5 +31,6 @@ pub mod process;
 pub mod qwen2_5_vl;
 pub mod rope;
 pub mod template;
+pub mod vae_preprocess;
 pub mod vision;
 pub mod vit_preprocess;
