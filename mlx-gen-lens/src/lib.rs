@@ -45,11 +45,21 @@
 //!   the core [`mlx_gen::FlowMatchEuler`] verbatim (same constants), plus the shifted-σ timestep
 //!   convention and the norm-rescaled CFG. Bit-exact vs the diffusers scheduler (sigmas Δ 0, CFG 2e-7).
 //!
-//! Still to come: the memory-efficient weight conversion / Q4-Q8 re-quant (sc-3172), and the
-//! generate/e2e integration (sc-3173 — ties encoder + DiT + VAE + scheduler together).
+//! - **sc-3173** — the **generate / e2e integration** ([`pipeline`] + [`resolution`] + [`registry`]):
+//!   [`pipeline::LensPipeline`] ties the four components into one `generate` (tokenize → encode +
+//!   `txt_offset` slice → align pos/neg → joint-CFG denoise → VAE decode), [`resolution`] ports the
+//!   1024/1440 × 9-aspect buckets, and [`registry`] registers the `lens` + `lens_turbo` ids (4-step /
+//!   g1 turbo vs 20-step / CFG-5 base). Validated end-to-end against the vendor `LensPipeline` on real
+//!   bf16 weights with injected starting noise: decoded-image cosine **0.996**, final-latent cosine
+//!   **0.979** (cross-build structural gate), coherent render (std matches the reference exactly).
+//!
+//! Still to come: the memory-efficient weight conversion / Q4-Q8 re-quant (sc-3172).
 
 pub mod config;
 pub mod dit;
+pub mod pipeline;
+pub mod registry;
+pub mod resolution;
 pub mod schedule;
 pub mod text;
 pub mod text_encoder;

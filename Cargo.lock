@@ -634,6 +634,7 @@ dependencies = [
 name = "mlx-gen-lens"
 version = "0.0.0"
 dependencies = [
+ "inventory",
  "mlx-gen",
  "mlx-gen-flux2",
  "pmetal-mlx-rs",
