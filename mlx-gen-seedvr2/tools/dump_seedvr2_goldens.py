@@ -162,9 +162,12 @@ def main():
         return
 
     else:  # dit
+        # 3B keeps the historic unsuffixed filenames; 7B (pixel-mode RoPE, sc-5197) is suffixed so
+        # both goldens coexist in one dir.
+        tag = "" if args.model == "3b" else f"_{args.model}"
         tr = model.transformer
         cast_f32(tr)
-        save(os.path.join(args.dir, "dit_f32.safetensors"), f32_params(tr))
+        save(os.path.join(args.dir, f"dit{tag}_f32.safetensors"), f32_params(tr))
 
         # small image-mode input: latentT=1, h=w=8 -> 1*4*4=16 vid tokens
         mx.random.seed(1)
@@ -174,9 +177,9 @@ def main():
         timestep = mx.array(float(cfg.num_train_steps or 1000.0))
 
         # localization intermediates (public submodules, known signatures)
-        txt_proj = tr.txt_in(txt)                # (1,58,2560)
-        vid_tok, vid_shape = tr.vid_in(vid)      # (1,16,2560), (1,3)
-        emb = tr.emb_in(timestep)                # (1,15360)
+        txt_proj = tr.txt_in(txt)                # (1,58,dim)
+        vid_tok, vid_shape = tr.vid_in(vid)      # (1,16,dim), (1,3)
+        emb = tr.emb_in(timestep)
         out = tr(vid=vid, txt=txt, timestep=timestep)  # (1,16,1,8,8)
 
         io = {
@@ -187,7 +190,7 @@ def main():
         }
         for k, v in io.items():
             print(f"   dit io {k}: {list(v.shape)}")
-        save(os.path.join(args.dir, "dit_io_f32.safetensors"), io)
+        save(os.path.join(args.dir, f"dit{tag}_io_f32.safetensors"), io)
 
 
 if __name__ == "__main__":

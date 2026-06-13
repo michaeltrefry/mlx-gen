@@ -27,10 +27,22 @@ use crate::pipeline::Seedvr2Pipeline;
 
 pub const MODEL_ID: &str = "seedvr2";
 pub const MODEL_ID_3B: &str = "seedvr2_3b";
+pub const MODEL_ID_7B: &str = "seedvr2_7b";
 const VAE_SCALE: u32 = 16; // VAE /8 · patch /2
 const DIT_FILE_3B: &str = "seedvr2_ema_3b_fp16.safetensors";
+const DIT_FILE_7B: &str = "seedvr2_ema_7b_fp16.safetensors";
 /// Output fps when the request omits one (the worker normally supplies the source cadence).
 const DEFAULT_FPS: u32 = 24;
+
+/// The DiT checkpoint file + transformer config for a registered id (3B default; 7B is the
+/// pixel-mode-RoPE variant — sc-5197). The VAE is shared across both.
+fn variant(id: &str) -> (&'static str, DitConfig) {
+    if id == MODEL_ID_7B {
+        (DIT_FILE_7B, DitConfig::seedvr2_7b())
+    } else {
+        (DIT_FILE_3B, DitConfig::seedvr2_3b())
+    }
+}
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
@@ -64,6 +76,9 @@ pub fn descriptor() -> ModelDescriptor {
 }
 pub fn descriptor_3b() -> ModelDescriptor {
     descriptor_for(MODEL_ID_3B)
+}
+pub fn descriptor_7b() -> ModelDescriptor {
+    descriptor_for(MODEL_ID_7B)
 }
 
 pub struct Seedvr2Generator {
@@ -99,7 +114,8 @@ fn load_with(spec: &LoadSpec, id: &'static str) -> Result<Box<dyn Generator>> {
             )))
         }
     };
-    let pipe = Seedvr2Pipeline::load(&dir, DIT_FILE_3B, &DitConfig::seedvr2_3b(), dtype)?;
+    let (dit_file, cfg) = variant(id);
+    let pipe = Seedvr2Pipeline::load(&dir, dit_file, &cfg, dtype)?;
     Ok(Box::new(Seedvr2Generator {
         descriptor: descriptor_for(id),
         pipe,
@@ -210,12 +226,18 @@ fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 fn load_registered_3b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_with(spec, MODEL_ID_3B).map_err(Into::into)
 }
+fn load_registered_7b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_with(spec, MODEL_ID_7B).map_err(Into::into)
+}
 
 inventory::submit! {
     ModelRegistration { descriptor, load: load_registered }
 }
 inventory::submit! {
     ModelRegistration { descriptor: descriptor_3b, load: load_registered_3b }
+}
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_7b, load: load_registered_7b }
 }
 
 #[cfg(test)]
@@ -243,7 +265,7 @@ mod tests {
 
     #[test]
     fn both_ids_resolve_in_registry() {
-        for id in [MODEL_ID, MODEL_ID_3B] {
+        for id in [MODEL_ID, MODEL_ID_3B, MODEL_ID_7B] {
             let spec = LoadSpec {
                 weights: WeightsSource::Dir("/nonexistent/seedvr2".into()),
                 quantize: None,

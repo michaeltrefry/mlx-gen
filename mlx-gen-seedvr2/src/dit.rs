@@ -306,20 +306,48 @@ fn axial_1d(freqs: &Array, pos: &Array) -> Result<Array> {
     Ok(dup.reshape(&[len, nf * 2])?)
 }
 
-/// Per-window video freqs `(f*h*w, 126)`; temporal positions offset by `txt_off` (lang mode).
-fn vid_freq_block(freqs: &Array, f: i32, h: i32, w: i32, txt_off: i32) -> Result<Array> {
+/// 1-D axis positions for 3-D RoPE. **lang mode** (3B): integer `arange(n) + offset` (the reference
+/// `_get_axial_freqs` non-pixel branch; vid temporal is offset by `txt_len`). **pixel mode** (7B):
+/// normalized `linspace(-1, 1, n)` (the `freqs_for="pixel"` branch; the offset is unused because the
+/// 7B attention takes the non-mm rope path — `rope_on_text=false` — with no temporal offset). mlx
+/// `linspace(-1,1,1)` returns `[-1]`.
+fn axis_pos(n: i32, pixel: bool, offset: i32) -> Result<Array> {
+    if pixel {
+        let data: Vec<f32> = if n <= 1 {
+            vec![-1.0]
+        } else {
+            let step = 2.0 / (n - 1) as f32;
+            (0..n).map(|i| -1.0 + step * i as f32).collect()
+        };
+        Ok(Array::from_slice(&data, &[n]))
+    } else if offset == 0 {
+        Ok(arange_f32(n)) // bit-identical to the original plain `arange` for the h/w axes
+    } else {
+        Ok(add(arange_f32(n), Array::from_f32(offset as f32))?)
+    }
+}
+
+/// Per-window video freqs `(f*h*w, nf2*3)`; temporal positions offset by `txt_off` (lang mode only —
+/// pixel mode normalizes each window's f/h/w independently with no offset).
+fn vid_freq_block(
+    freqs: &Array,
+    f: i32,
+    h: i32,
+    w: i32,
+    txt_off: i32,
+    pixel: bool,
+) -> Result<Array> {
     let nf2 = freqs.shape()[0] * 2;
-    let t_pos = add(arange_f32(f), Array::from_f32(txt_off as f32))?;
     let axt = broadcast_to(
-        &axial_1d(freqs, &t_pos)?.reshape(&[f, 1, 1, nf2])?,
+        &axial_1d(freqs, &axis_pos(f, pixel, txt_off)?)?.reshape(&[f, 1, 1, nf2])?,
         &[f, h, w, nf2],
     )?;
     let axh = broadcast_to(
-        &axial_1d(freqs, &arange_f32(h))?.reshape(&[1, h, 1, nf2])?,
+        &axial_1d(freqs, &axis_pos(h, pixel, 0)?)?.reshape(&[1, h, 1, nf2])?,
         &[f, h, w, nf2],
     )?;
     let axw = broadcast_to(
-        &axial_1d(freqs, &arange_f32(w))?.reshape(&[1, 1, w, nf2])?,
+        &axial_1d(freqs, &axis_pos(w, pixel, 0)?)?.reshape(&[1, 1, w, nf2])?,
         &[f, h, w, nf2],
     )?;
     Ok(concatenate_axis(&[&axt, &axh, &axw], -1)?.reshape(&[f * h * w, nf2 * 3])?)
@@ -494,6 +522,7 @@ struct MMAttention {
     window: (i32, i32, i32),
     shift: bool,
     rope_on_text: bool,
+    rope_pixel: bool,
 }
 impl MMAttention {
     fn load(w: &Weights, prefix: &str, cfg: &DitConfig, shift: bool) -> Result<Self> {
@@ -514,6 +543,7 @@ impl MMAttention {
             window: cfg.window,
             shift,
             rope_on_text: cfg.rope_on_text,
+            rope_pixel: cfg.rope_pixel,
         })
     }
 
@@ -573,10 +603,19 @@ impl MMAttention {
         )?;
         let v_t = qkv_t.take_axis(Array::from_int(2), 1)?;
 
-        // RoPE: vid freqs concatenated per window (relative positions, temporal offset by txt_len)
+        // RoPE: vid freqs concatenated per window. lang mode (3B) offsets the temporal axis by
+        // txt_len; pixel mode (7B, rope_on_text=false → non-mm path) uses no offset.
+        let txt_off = if self.rope_on_text { lt } else { 0 };
         let mut blocks = Vec::with_capacity(plan.window_shapes.len());
         for (f, wh, ww) in &plan.window_shapes {
-            blocks.push(vid_freq_block(&self.freqs, *f, *wh, *ww, lt)?);
+            blocks.push(vid_freq_block(
+                &self.freqs,
+                *f,
+                *wh,
+                *ww,
+                txt_off,
+                self.rope_pixel,
+            )?);
         }
         let refs: Vec<&Array> = blocks.iter().collect();
         let vid_freqs = concatenate_axis(&refs, 0)?; // (L, 126)
