@@ -108,3 +108,64 @@ fn seedvr2_loads_and_runs_from_real_checkpoint() {
         out.pixels.len()
     );
 }
+
+/// 7B (sc-5197) real-weight smoke: load the 36-layer pixel-mode-RoPE variant from the raw checkpoint
+/// (bf16, ~17 GB) and run `generate` end-to-end. The numeric pixel-RoPE parity is gated separately in
+/// `dit_parity.rs::seedvr2_dit_7b_matches_reference`; this proves the full 7B pipeline loads + runs.
+#[test]
+fn seedvr2_7b_loads_and_generates() {
+    let Some(snap) = raw_dir() else {
+        eprintln!("SKIP: raw checkpoint absent");
+        return;
+    };
+    if !snap.join("seedvr2_ema_7b_fp16.safetensors").exists() {
+        eprintln!("SKIP: 7B checkpoint absent");
+        return;
+    }
+    let pipe = Seedvr2Pipeline::load(
+        &snap,
+        "seedvr2_ema_7b_fp16.safetensors",
+        &DitConfig::seedvr2_7b(),
+        Dtype::Bfloat16,
+    )
+    .expect("load 7B from raw checkpoint");
+
+    let lr = Image {
+        width: 96,
+        height: 96,
+        pixels: (0..96 * 96 * 3).map(|i| (i % 256) as u8).collect(),
+    };
+    let out = pipe.generate(&lr, 128, 128, 7, 0.0).expect("7B generate");
+    assert_eq!((out.width, out.height), (128, 128));
+    assert_eq!(out.pixels.len(), 128 * 128 * 3);
+    eprintln!("7B generate ok: {}x{}", out.width, out.height);
+}
+
+/// Q8 (sc-5198) real-weight smoke: load 3B, quantize the DiT Linears to Q8, and run `generate`
+/// end-to-end (exercises the `quantized_matmul` forward path + the load-time quantize wiring). The
+/// numeric near-losslessness is gated separately in `quant_parity.rs`.
+#[test]
+fn seedvr2_q8_loads_and_generates() {
+    let Some(snap) = raw_dir() else {
+        eprintln!("SKIP: raw checkpoint absent");
+        return;
+    };
+    let mut pipe = Seedvr2Pipeline::load(
+        &snap,
+        "seedvr2_ema_3b_fp16.safetensors",
+        &DitConfig::seedvr2_3b(),
+        Dtype::Bfloat16,
+    )
+    .expect("load 3B from raw checkpoint");
+    pipe.quantize(8).expect("quantize Q8");
+
+    let lr = Image {
+        width: 96,
+        height: 96,
+        pixels: (0..96 * 96 * 3).map(|i| (i % 256) as u8).collect(),
+    };
+    let out = pipe.generate(&lr, 128, 128, 7, 0.0).expect("Q8 generate");
+    assert_eq!((out.width, out.height), (128, 128));
+    assert_eq!(out.pixels.len(), 128 * 128 * 3);
+    eprintln!("Q8 generate ok: {}x{}", out.width, out.height);
+}
