@@ -1,10 +1,16 @@
 //! `Seedvr2Generator` — the [`mlx_gen::Generator`] wiring the SeedVR2 pipeline into `mlx_gen`'s
-//! registry (sc-4813). Registered under `seedvr2` (alias) + `seedvr2_3b`.
+//! registry (sc-4813 image, sc-4814 video). Registered under `seedvr2` (alias) + `seedvr2_3b`.
 //!
-//! **Surface.** A one-step image **upscaler**: the input LR image arrives as a
-//! [`Conditioning::Reference`]; `width`/`height` are the target output size (both ÷16). No prompt,
-//! no guidance/CFG (1-step), no LoRA. `spec.weights` is the raw `numz/SeedVR2_comfyUI` checkpoint dir
-//! (converted in-memory at load — no Python). Dense bf16 default; `Fp32` honored (the parity path).
+//! **Surface.** A one-step super-resolution **upscaler** over image **and** video (`Modality::Both`),
+//! dispatched on the request's conditioning:
+//!   * [`Conditioning::Reference`] — the LR input image → [`GenerationOutput::Images`];
+//!   * [`Conditioning::VideoClip`] — the LR input frame sequence → [`GenerationOutput::Video`]
+//!     (temporal chunking + overlap cross-fade + a memory-budgeted chunk sizer; sc-4814).
+//!
+//! `width`/`height` are the target output size (both ÷16). No prompt, no guidance/CFG (1-step), no
+//! LoRA. `spec.weights` is the raw `numz/SeedVR2_comfyUI` checkpoint dir (converted in-memory at
+//! load — no Python). Dense bf16 default; `Fp32` honored (the parity path). Video `fps` passes
+//! through `req.fps` (the worker supplies the source cadence; audio mux is the worker's job).
 //!
 //! 7B (needs pixel-mode RoPE) and int8 (Linear-only quant) are tracked follow-ups; only 3B is wired.
 
@@ -23,18 +29,21 @@ pub const MODEL_ID: &str = "seedvr2";
 pub const MODEL_ID_3B: &str = "seedvr2_3b";
 const VAE_SCALE: u32 = 16; // VAE /8 · patch /2
 const DIT_FILE_3B: &str = "seedvr2_ema_3b_fp16.safetensors";
+/// Output fps when the request omits one (the worker normally supplies the source cadence).
+const DEFAULT_FPS: u32 = 24;
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
         id,
         family: "seedvr2",
         backend: "mlx",
-        modality: Modality::Image,
+        modality: Modality::Both, // image (Reference) + video (VideoClip) upscaling
         capabilities: Capabilities {
             supports_negative_prompt: false, // precomputed neg-embed; no prompt surface
             supports_guidance: false,        // one-step, guidance fixed at 1.0
             supports_true_cfg: false,
-            conditioning: vec![ConditioningKind::Reference], // the LR input image
+            // the LR input image (image upscale) or LR frame sequence (video upscale)
+            conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
             supports_lora: false,
             supports_lokr: false,
             samplers: vec!["seedvr2_euler"],
@@ -126,9 +135,11 @@ impl Seedvr2Generator {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
-        if reference_image(req).is_none() {
+        let has_video = req.video_clips().iter().any(|c| !c.frames.is_empty());
+        if !has_video && reference_image(req).is_none() {
             return Err(Error::Msg(format!(
-                "{}: requires a Reference (input) image to upscale",
+                "{}: requires a Reference image (image upscale) or a non-empty VideoClip frame \
+                 sequence (video upscale)",
                 self.descriptor.id
             )));
         }
@@ -147,10 +158,32 @@ impl Seedvr2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate_impl(req)?;
-        let image = reference_image(req).expect("validated");
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let softness = 0.0; // no request field; the reference default
 
+        // Video upscale: a VideoClip carries the LR source frame sequence → one upscaled clip.
+        if let Some(clip) = req.video_clips().into_iter().next() {
+            on_progress(Progress::Step {
+                current: 1,
+                total: 1,
+            });
+            let frames = self.pipe.generate_video(
+                clip.frames,
+                req.width as i32,
+                req.height as i32,
+                base_seed,
+                softness,
+                None,
+            )?;
+            on_progress(Progress::Decoding);
+            return Ok(GenerationOutput::Video {
+                frames,
+                fps: req.fps.unwrap_or(DEFAULT_FPS),
+                audio: None,
+            });
+        }
+
+        let image = reference_image(req).expect("validated");
         let mut out = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             if req.cancel.is_cancelled() {
@@ -195,11 +228,15 @@ mod tests {
         assert_eq!(d.id, MODEL_ID);
         assert_eq!(d.family, "seedvr2");
         assert_eq!(d.backend, "mlx");
-        assert_eq!(d.modality, Modality::Image);
+        assert_eq!(d.modality, Modality::Both); // image (Reference) + video (VideoClip)
         assert!(d
             .capabilities
             .conditioning
             .contains(&ConditioningKind::Reference));
+        assert!(d
+            .capabilities
+            .conditioning
+            .contains(&ConditioningKind::VideoClip));
         assert!(!d.capabilities.supports_guidance);
         assert!(d.capabilities.mac_only);
     }

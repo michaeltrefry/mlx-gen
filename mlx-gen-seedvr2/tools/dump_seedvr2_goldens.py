@@ -43,7 +43,7 @@ def cast_f32(module):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--component", required=True, choices=["vae", "dit", "e2e"])
+    ap.add_argument("--component", required=True, choices=["vae", "dit", "e2e", "video"])
     ap.add_argument("--dir", default=os.path.expanduser("~/.cache/mlx-gen-seedvr2-golden"))
     ap.add_argument("--model", default="3b", choices=["3b", "7b"])
     ap.add_argument("--image", default="/tmp/sc_seedvr2/candle_hr1024.png")
@@ -129,6 +129,36 @@ def main():
         for k, v in io.items():
             print(f"   e2e io {k}: {list(v.shape)}")
         save(os.path.join(args.dir, "e2e_io_f32.safetensors"), io)
+        return
+
+    elif args.component == "video":
+        # Multi-frame (T=8 → latentT=2 → decodedT=8) model path at f32 with injected noise, mirroring
+        # the Rust `Seedvr2Pipeline::run_model_5d` (encode → ones-mask condition → noise → DiT (1 step)
+        # → 1-step Euler → decode). Validates the 5-D temporal pass the video chunker rides on. Content
+        # is synthetic (the model math is content-independent for parity). H=W=64 (mult-of-16 → no crop).
+        cast_f32(model.vae)
+        cast_f32(model.transformer)
+        mx.random.seed(7)
+        T, H, W = 8, 64, 64
+        processed = (mx.random.normal((1, 3, T, H, W)) * 0.5).astype(mx.float32)
+        lat = model.vae.encode(processed)                       # (1,16,2,8,8)
+        t_lat, h, w = lat.shape[2], lat.shape[-2], lat.shape[-1]
+        mask = mx.ones((1, 1, t_lat, h, w))
+        cond = mx.concatenate([lat, mask], axis=1)              # (1,17,2,8,8)
+        noise = mx.random.normal((1, 16, t_lat, h, w), key=mx.random.key(args.seed)).astype(mx.float32)
+        txt_pos = SeedVR2TextEmbeddings.load_positive().astype(mx.float32)
+        ts = mx.array(float(cfg.num_train_steps or 1000.0))
+        model_input = mx.concatenate([noise, cond], axis=1)     # (1,33,2,8,8)
+        dit_out = model.transformer(txt=txt_pos, vid=model_input, timestep=ts)
+        latents = noise - dit_out                               # 1-step euler (t_norm=1, s=0)
+        decoded = model.vae.decode(latents)                     # (1,3,8,64,64)
+        io = {
+            "processed": processed, "noise": noise, "neg_embed": txt_pos,
+            "timestep": ts, "decoded": decoded,
+        }
+        for k, v in io.items():
+            print(f"   video io {k}: {list(v.shape)}")
+        save(os.path.join(args.dir, "video_io_f32.safetensors"), io)
         return
 
     else:  # dit

@@ -13,11 +13,17 @@
 //!    `temporal_down/up_blocks=2` (4:1 temporal compression), GroupNorm, per-frame spatial attention.
 //! 3. **One-step Euler** schedule + a precomputed negative-prompt embedding (`pos_emb.safetensors`).
 //!
-//! The model is natively video-capable (5-D `(B,C,T,H,W)` tensors); this crate ships **image-mode
-//! parity** first (sc-4813), with video mode (temporal chunking/overlap) as the next slice (sc-4814).
+//! The model is natively video-capable (5-D `(B,C,T,H,W)` tensors): image mode is the `T=1`
+//! special case. **Image mode** (sc-4813) and **video mode** (sc-4814 — multi-frame 5-D pass +
+//! temporal chunking with overlap cross-fade + a memory-budgeted chunk sizer; see [`video`]) both
+//! ship through one [`registry::Seedvr2Generator`] (`Modality::Both`), dispatched on the request's
+//! conditioning: a `Reference` image → [`GenerationOutput::Images`](mlx_gen::GenerationOutput); a
+//! `VideoClip` frame sequence → [`GenerationOutput::Video`](mlx_gen::GenerationOutput).
 //!
 //! ## Status
-//! Under construction (sc-4813). See the per-module docs as components land.
+//! Image + video engine complete (sc-4813 + sc-4814). HD spatial tiling (composing `VAETiler` with
+//! temporal chunking) is a tracked follow-up; the budget sizer + per-frame fallback bound memory
+//! across the realistic operating range and refuse over-budget HD catchably.
 
 pub mod color;
 pub mod config;
@@ -26,3 +32,4 @@ pub mod dit;
 pub mod pipeline;
 pub mod registry;
 pub mod vae;
+pub mod video;
