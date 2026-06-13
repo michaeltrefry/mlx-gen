@@ -58,16 +58,24 @@ pub struct GenerateOptions<'a> {
     pub num_steps: usize,
     pub guidance_scale: f32,
     pub seed: u64,
-    /// Harmony-preamble `Current date:` (image-irrelevant; see [`DEFAULT_DATE`]).
+    /// Harmony-preamble `Current date:` (image-irrelevant for the encode path; the **reasoner** uses
+    /// it for its own preamble — see [`DEFAULT_DATE`]).
     pub date: &'a str,
+    /// Refine the prompt through the attached local [`LensReasoner`](crate::reasoner::LensReasoner)
+    /// before encoding (sc-3176, the vendor `enable_reasoner`). Requires
+    /// [`attach_reasoner`](LensPipeline::attach_reasoner); off by default.
+    pub enable_reasoner: bool,
 }
 
-/// A loaded Lens pipeline: the four components, shared by both variants.
+/// A loaded Lens pipeline: the four components, shared by both variants, plus the **optional** local
+/// prompt reasoner (sc-3176 — `None` unless [`attach_reasoner`](LensPipeline::attach_reasoner)d, so the
+/// default pipeline carries no extra gpt-oss footprint for an off-by-default feature).
 pub struct LensPipeline {
     tokenizer: LensTokenizer,
     encoder: LensTextEncoder,
     transformer: LensTransformer,
     vae: Flux2Vae,
+    reasoner: Option<crate::reasoner::LensReasoner>,
     num_text_layers: usize,
     dtype: Dtype,
 }
@@ -108,9 +116,17 @@ impl LensPipeline {
             encoder,
             transformer,
             vae,
+            reasoner: None,
             num_text_layers: dit_cfg.num_text_layers,
             dtype,
         })
+    }
+
+    /// Attach a local prompt [`LensReasoner`](crate::reasoner::LensReasoner) (sc-3176), enabling the
+    /// `enable_reasoner` path in [`generate`](Self::generate). Loaded separately (its own gpt-oss copy)
+    /// so the base pipeline pays nothing for this off-by-default feature.
+    pub fn attach_reasoner(&mut self, reasoner: crate::reasoner::LensReasoner) {
+        self.reasoner = Some(reasoner);
     }
 
     /// Encode one prompt to its per-layer DiT text features (sliced at [`TXT_OFFSET`]) + the valid
@@ -268,8 +284,27 @@ impl LensPipeline {
         let latent_w = (opts.width / VAE_SCALE_FACTOR) as usize;
         let seq_len = (latent_h * latent_w) as i32;
 
+        // Optional prompt refinement via the local reasoner (sc-3176) — before encoding.
+        let refined;
+        let prompt = if opts.enable_reasoner {
+            let reasoner = self.reasoner.as_ref().ok_or_else(|| {
+                Error::Msg(
+                    "lens: enable_reasoner set but no reasoner attached (call attach_reasoner)"
+                        .into(),
+                )
+            })?;
+            refined = reasoner.refine(
+                opts.prompt,
+                crate::reasoner::DEFAULT_MAX_NEW_TOKENS,
+                opts.date,
+            )?;
+            &refined
+        } else {
+            opts.prompt
+        };
+
         let (encoder_features, encoder_mask) =
-            self.encode_prompt(opts.prompt, opts.negative_prompt, opts.date)?;
+            self.encode_prompt(prompt, opts.negative_prompt, opts.date)?;
 
         mlx_rs::random::seed(opts.seed)?;
         let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
