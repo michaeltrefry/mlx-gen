@@ -110,6 +110,14 @@ pub struct GenerationRequest {
     /// `export_to_video(fps=…)`). `None` ⇒ the model default (7). Only `svd_xt` reads it (sc-3764).
     pub conditioning_fps: Option<u32>,
 
+    // --- SeedVR2 super-resolution (sc-4816; ignored by other models) ---
+    /// SeedVR2 input **softness** — a pre-blur applied to the bicubic-upscaled low-resolution input
+    /// before VAE encode (reference `SeedVR2.generate_image(softness=…)`). Higher = more smoothing of
+    /// source compression/noise artifacts before the one-step restoration (trades fine detail for
+    /// fewer amplified artifacts on degraded footage). `None`/0.0 ⇒ no pre-blur (the reference
+    /// default). Only the `seedvr2` upscaler reads it; other models ignore it.
+    pub softness: Option<f32>,
+
     // --- Prompt enhancement (LTX-2.3, sc-2845; ignored by other models) ---
     /// Rewrite `prompt` with an autoregressive Gemma-3 LLM before encoding (the reference
     /// `--enhance-prompt`). Default `false` — the diffusion path is unchanged. On any enhancer
@@ -155,6 +163,7 @@ impl Default for GenerationRequest {
             noise_aug_strength: None,
             decode_chunk_size: None,
             conditioning_fps: None,
+            softness: None,
             enhance_prompt: false,
             use_uncensored_enhancer: false,
             enhance_max_tokens: None,
