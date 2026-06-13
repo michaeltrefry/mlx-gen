@@ -261,6 +261,14 @@ fn classify_key(key: &str, kohya_to_dotted: &BTreeMap<String, String>) -> Option
 /// round the result back through the source dtype — MLX's f16 matmul equals `round_f16` of the
 /// f32-accumulated product, so this is bit-identical to the reference without touching the bug.
 pub fn lora_delta(down: &Array, up: &Array, alpha: f32, rank: f32, scale: f32) -> Result<Array> {
+    if rank == 0.0 {
+        // A zero rank (an empty/malformed down|up factor) makes `alpha/rank` non-finite, and the
+        // resulting NaN delta would be merged into the U-Net weights, silently poisoning all
+        // inference. Reject the adapter instead (sc-5252/F-002).
+        return Err(Error::Msg(
+            "lora_delta: zero rank — malformed adapter (empty down/up factor)".into(),
+        ));
+    }
     let src = up.dtype(); // f16 for kohya/community LoRAs; f32 makes the round-trip a no-op.
     let ba = matmul(
         &up.as_dtype(Dtype::Float32)?,

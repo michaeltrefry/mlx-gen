@@ -622,7 +622,10 @@ impl GptOssMoe {
             let s = &data[row * e..row * e + e];
             let mut idx: Vec<usize> = (0..e).collect();
             // descending value, ties broken by lower index (matches torch.topk).
-            idx.sort_by(|&a, &b| s[b].partial_cmp(&s[a]).unwrap().then(a.cmp(&b)));
+            // `total_cmp` is NaN-safe (a NaN router logit from bf16 overflow would panic
+            // `partial_cmp().unwrap()`); identical to the prior order for finite values, so the
+            // descending-value, tie-by-lower-index `torch.topk` semantics are unchanged (sc-5251/F-001).
+            idx.sort_by(|&a, &b| s[b].total_cmp(&s[a]).then(a.cmp(&b)));
             let top = &idx[..k];
             let maxv = top.iter().map(|&i| s[i]).fold(f32::NEG_INFINITY, f32::max);
             let mut denom = 0f32;

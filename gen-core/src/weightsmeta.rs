@@ -225,7 +225,12 @@ pub fn detect_lora_prefix<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option
 /// Parse the PEFT `(rank, alpha)` from safetensors metadata. `rank` defaults to `1.0`; `alpha`
 /// defaults to `rank` (scale 1.0), matching PEFT.
 pub fn parse_rank_alpha(rank: Option<&str>, alpha: Option<&str>) -> (f32, f32) {
-    let rank = rank.and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+    // Treat a parsed rank <= 0 the same as absent (→ 1.0): a zero rank would make the downstream
+    // `alpha/rank` scale non-finite and NaN-poison the adapter merge (sc-5252/F-002).
+    let rank = rank
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|&r| r > 0.0)
+        .unwrap_or(1.0);
     let alpha = alpha.and_then(|s| s.parse::<f32>().ok()).unwrap_or(rank);
     (rank, alpha)
 }
@@ -294,6 +299,11 @@ mod tests {
         assert_eq!(parse_rank_alpha(Some("16"), None), (16.0, 16.0));
         // rank defaults to 1.0.
         assert_eq!(parse_rank_alpha(None, None), (1.0, 1.0));
+        // A parsed rank <= 0 is treated as absent (→ 1.0) so the downstream alpha/rank scale stays
+        // finite rather than NaN-poisoning the merge (sc-5252/F-002). alpha then defaults to 1.0.
+        assert_eq!(parse_rank_alpha(Some("0"), None), (1.0, 1.0));
+        assert_eq!(parse_rank_alpha(Some("0"), Some("8")), (1.0, 8.0));
+        assert_eq!(parse_rank_alpha(Some("-4"), None), (1.0, 1.0));
     }
 
     #[test]

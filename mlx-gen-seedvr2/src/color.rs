@@ -125,9 +125,12 @@ fn lab_to_rgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
 fn hist_match(source: &[f32], reference: &[f32]) -> Vec<f32> {
     let n = source.len();
     let mut src_idx: Vec<usize> = (0..n).collect();
-    src_idx.sort_by(|&i, &j| source[i].partial_cmp(&source[j]).unwrap()); // stable
+    // `total_cmp` is a NaN-safe total order (vs `partial_cmp().unwrap()`, which panics on a NaN
+    // pixel — reachable from a partial Metal compute / bf16 overflow). For finite values it is
+    // identical to the prior comparison, so the stable-argsort behaviour is unchanged (sc-5251/F-001).
+    src_idx.sort_by(|&i, &j| source[i].total_cmp(&source[j])); // stable
     let mut ref_sorted = reference.to_vec();
-    ref_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ref_sorted.sort_by(f32::total_cmp);
     // inv[p] = rank of pixel p in sorted source order
     let mut inv = vec![0usize; n];
     for (rank, &p) in src_idx.iter().enumerate() {

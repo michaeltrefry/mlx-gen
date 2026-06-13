@@ -536,6 +536,14 @@ fn install_lora_groups(
                 let mut b = b_raw.t(); // [out, r] -> [r, out]
                 if let Some(alpha) = parts.alpha {
                     let rank = a.shape()[1] as f32; // r
+                    if rank == 0.0 {
+                        // Zero rank (empty/malformed factor) → non-finite alpha/rank → a NaN residual
+                        // folded into the linear, silently corrupting inference. Reject the adapter
+                        // instead of installing it (sc-5252/F-002).
+                        return Err(Error::Msg(format!(
+                            "lora adapter at '{path}' has zero rank (empty down/up factor)"
+                        )));
+                    }
                     b = b.multiply(Array::from_slice(&[alpha / rank], &[1]))?;
                 }
                 lin.push(Adapter::Lora { a, b, scale });

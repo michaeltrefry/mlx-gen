@@ -56,6 +56,13 @@ pub fn lora_delta(lora: &Weights, target: &str) -> Result<Option<Array>> {
     let up = lora.require(&format!("{target}.lora_up.weight"))?;
     let alpha = scalar_f32(lora.require(&format!("{target}.alpha"))?)?;
     let rank = down.shape()[0] as f32;
+    if rank == 0.0 {
+        // Zero rank (empty/malformed down factor) → non-finite scaling → NaN-poisoned GEN-path
+        // merge that silently corrupts every generation. Reject instead (sc-5252/F-002).
+        return Err(Error::Msg(format!(
+            "distill LoRA: zero-rank factor at '{target}'"
+        )));
+    }
     let scaling = alpha / rank;
     // f32 matmul + scale (reference `scaling_factor * torch.matmul(lora_up, lora_down)`).
     let down = down.as_dtype(Dtype::Float32)?;
