@@ -11,8 +11,9 @@
 
 use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Image, Result};
-use mlx_rs::ops::{concatenate_axis, multiply, subtract};
+use mlx_gen::{Image, Result};
+use mlx_rs::ops::{add, concatenate_axis, divide, multiply, pad, subtract};
+use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
 use crate::config::DitConfig;
@@ -108,6 +109,14 @@ impl Seedvr2Pipeline {
     /// The bundled negative-prompt embedding `(1,58,5120)` (set by [`Self::load`]).
     pub fn neg_embed(&self) -> Option<&Array> {
         self.neg_embed.as_ref()
+    }
+
+    /// Quantize the DiT Linears to `bits` (4 or 8) — group-wise affine, Linear-only (sc-5198). The
+    /// VAE stays dense (conv-dominated; its tiny attention Linears are left at `dtype`). `weights_bytes`
+    /// is intentionally **not** reduced — keeping the dense estimate makes the video chunk-size budget
+    /// conservative (quant shrinks weights, not activations, so the headroom is safe).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.transformer.quantize(bits)
     }
 
     /// Encode the preprocessed image to the conditioning latent `(B,16,T',h,w)` (scaled mean).
@@ -206,6 +215,20 @@ impl Seedvr2Pipeline {
             0.8,
         )?;
         decoded_to_image(&corrected)
+    }
+
+    /// Preprocess one LR `Image` to a single-frame clip `(1,3,1,height,width)` in `[-1,1]` at the model
+    /// dtype (the [`Self::preprocess`] image + a temporal axis). Public for the tiling gate.
+    pub fn preprocess_frame(
+        &self,
+        image: &Image,
+        width: i32,
+        height: i32,
+        softness: f32,
+    ) -> Result<Array> {
+        Ok(self
+            .preprocess(image, width, height, softness)?
+            .expand_dims(2)?)
     }
 
     /// LR `Image` → `(1,3,height,width)` in `[-1,1]` at the model dtype. PIL-exact bicubic resize to
@@ -321,8 +344,8 @@ impl Seedvr2Pipeline {
     /// frames (same count). Sizes the temporal chunk against the memory budget (or `chunk_override`),
     /// processes each chunk through the 5-D model path with one-step Euler, per-frame color-corrects,
     /// and cross-fades chunk overlaps to close the causal-VAE seam ([`crate::video`]). Falls back to
-    /// the per-frame (`T=1`) path under tight memory; refuses (catchably) when even one frame at this
-    /// resolution exceeds the budget.
+    /// the per-frame (`T=1`) path under tight memory, and to per-frame **spatial tiling** when even one
+    /// full-resolution frame exceeds the budget (HD — sc-5201), so peak stays bounded at any resolution.
     pub fn generate_video(
         &self,
         frames: &[Image],
@@ -343,15 +366,10 @@ impl Seedvr2Pipeline {
                 ChunkPlan::PerFrame => {
                     return self.generate_video_per_frame(frames, width, height, seed, softness)
                 }
-                ChunkPlan::OverBudget {
-                    needed_gib,
-                    safe_gib,
-                } => {
-                    return Err(Error::Msg(format!(
-                        "seedvr2: a single {width}x{height} frame needs ~{needed_gib:.0} GB, over \
-                         this machine's ~{safe_gib:.0} GB safe budget. Reduce the output resolution \
-                         (HD spatial tiling is a tracked follow-up)."
-                    )))
+                // Even one full-resolution frame exceeds the budget → spatially tile each frame
+                // (per-frame T=1 + overlap feather blend). Bounds peak at any resolution (sc-5201).
+                ChunkPlan::OverBudget { .. } => {
+                    return self.generate_video_tiled(frames, width, height, seed, softness)
                 }
             },
         };
@@ -401,5 +419,105 @@ impl Seedvr2Pipeline {
             .iter()
             .map(|f| self.generate(f, width, height, seed, softness))
             .collect()
+    }
+
+    /// HD spatial-tiling video path (sc-5201): each frame is upscaled per-frame (`T=1`) but **spatially
+    /// tiled** — the budget sizer picks the largest square tile that fits, and the decoded tiles are
+    /// feather-blended. Used when even one full-resolution frame exceeds the memory budget; bounds peak
+    /// at any resolution. The numeric tiling fidelity is gated in `tests/tiling_parity.rs`.
+    fn generate_video_tiled(
+        &self,
+        frames: &[Image],
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+    ) -> Result<Vec<Image>> {
+        let tile = video::plan_spatial_tile_px(self.weights_bytes, video::safe_budget_gib());
+        let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
+        let neg = self
+            .neg_embed
+            .as_ref()
+            .expect("neg-embed (use Seedvr2Pipeline::load)")
+            .clone();
+        let mut out = Vec::with_capacity(frames.len());
+        for f in frames {
+            let processed = self
+                .preprocess(f, width, height, softness)?
+                .expand_dims(2)?; // (1,3,1,H,W)
+            let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg)?;
+            let imgs = self.frames_from_decoded(&decoded, &processed, 1)?;
+            out.push(imgs.into_iter().next().expect("one frame"));
+        }
+        Ok(out)
+    }
+
+    /// Upscale one preprocessed frame `(1,3,1,H,W)` by spatial tiling: run the full encode → DiT →
+    /// decode path on each overlapping `tile`-px tile (one-step Euler, same-seed noise) and feather-
+    /// blend the decoded tiles into a full `(1,3,1,H,W)` frame. The accumulator is evaluated per tile
+    /// so only one tile's activations are resident at a time (the memory bound). Public for the gate.
+    pub fn run_frame_tiled(
+        &self,
+        processed: &Array,
+        seed: u64,
+        tile: i32,
+        overlap: i32,
+        neg: &Array,
+    ) -> Result<Array> {
+        let sh = processed.shape(); // (1,3,1,H,W)
+        let (height, width) = (sh[3], sh[4]);
+        let plan = video::plan_spatial_tiles(height, width, tile, overlap);
+        let ts = Array::from_f32(TIMESTEP);
+        let mut acc: Option<Array> = None; // (1,3,1,H,W)
+        let mut wsum: Option<Array> = None; // (1,1,1,H,W)
+        for t in &plan {
+            let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
+            let y_idx = Array::from_slice(&(t.y0..t.y1).collect::<Vec<i32>>(), &[th]);
+            let x_idx = Array::from_slice(&(t.x0..t.x1).collect::<Vec<i32>>(), &[tw]);
+            let tile_clip = processed.take_axis(y_idx, 3)?.take_axis(x_idx, 4)?; // (1,3,1,th,tw)
+
+            // full model path on the tile (one-step Euler), same noise key as the other tiles.
+            let latent = self.encode(&tile_clip)?;
+            let sh = latent.shape();
+            let key = random::key(seed)?;
+            let noise =
+                random::normal::<f32>(&[1, 16, sh[2], sh[3], sh[4]], None, None, Some(&key))?
+                    .as_dtype(self.dtype)?;
+            let cond = Self::condition(&latent)?;
+            let latents = self.denoise(&noise, &cond, neg, &ts)?;
+            let decoded = self.decode_crop_5d(&latents, th, tw)?; // (1,3,1,th,tw)
+
+            // feather weight tapering on edges that abut a neighbor; placed at (y0,x0).
+            let wvec = video::feather_weight(
+                th,
+                tw,
+                t.y0 > 0,
+                t.y1 < height,
+                t.x0 > 0,
+                t.x1 < width,
+                overlap,
+            );
+            let weight = Array::from_slice(&wvec, &[1, 1, 1, th, tw]).as_dtype(self.dtype)?;
+            let pad_spec = [
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (t.y0, height - t.y1),
+                (t.x0, width - t.x1),
+            ];
+            let wdec = pad(&multiply(&decoded, &weight)?, &pad_spec[..], None, None)?;
+            let wpad = pad(&weight, &pad_spec[..], None, None)?;
+            acc = Some(match acc {
+                Some(a) => add(&a, &wdec)?,
+                None => wdec,
+            });
+            wsum = Some(match wsum {
+                Some(a) => add(&a, &wpad)?,
+                None => wpad,
+            });
+            // materialize so the just-processed tile's activations (and prior graph) are freed.
+            eval([acc.as_ref().unwrap(), wsum.as_ref().unwrap()])?;
+        }
+        Ok(divide(acc.expect("≥1 tile"), wsum.expect("≥1 tile"))?)
     }
 }

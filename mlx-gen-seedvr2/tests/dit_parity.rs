@@ -65,3 +65,35 @@ fn seedvr2_dit_matches_reference() {
     assert!(cos > 0.999, "dit cosine {cos} too low");
     assert!(pr < 3e-2, "dit peak_rel {pr} too high");
 }
+
+/// 7B parity (sc-5197): the 36-layer pixel-mode-RoPE / GELU-MLP / no-output-ada variant. Exercises
+/// the `rope_pixel` path (normalized `linspace` positions, no temporal offset, `rope_on_text=false`).
+/// Goldens from `--component dit --model 7b` (`dit_7b_*`).
+#[test]
+fn seedvr2_dit_7b_matches_reference() {
+    let dir = golden_dir();
+    if !dir.join("dit_7b_f32.safetensors").exists() {
+        eprintln!(
+            "SKIP: 7B dit goldens absent (run tools/dump_seedvr2_goldens.py --component dit --model 7b)"
+        );
+        return;
+    }
+    let w = Weights::from_file(dir.join("dit_7b_f32.safetensors")).expect("7B dit weights");
+    let io = Weights::from_file(dir.join("dit_7b_io_f32.safetensors")).expect("7B dit io");
+    let dit = Seedvr2Transformer::from_weights(&w, &DitConfig::seedvr2_7b()).expect("build 7B dit");
+
+    let out = dit
+        .forward(
+            io.require("vid").unwrap(),
+            io.require("txt").unwrap(),
+            io.require("timestep").unwrap(),
+        )
+        .expect("forward");
+    let (cos, pr) = metrics(&out, io.require("dit_out").unwrap());
+    eprintln!(
+        "[dit_7b_out] shape={:?} cosine={cos:.6} peak_rel={pr:.3e}",
+        out.shape()
+    );
+    assert!(cos > 0.999, "7B dit cosine {cos} too low");
+    assert!(pr < 3e-2, "7B dit peak_rel {pr} too high");
+}

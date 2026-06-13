@@ -18,7 +18,11 @@ use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, cos, matmul, multiply, sin};
+use mlx_rs::ops::{
+    add, broadcast_to, concatenate_axis, cos, matmul, multiply, quantize as quantize_affine,
+    quantized_matmul, sin,
+};
+use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
 use crate::config::DitConfig;
@@ -27,14 +31,28 @@ use crate::config::DitConfig;
 // small leaves
 // ---------------------------------------------------------------------------
 
+/// A dense or group-wise-affine-quantized `[out,in]` weight (sc-5198). Quantization is **Linear-only**
+/// (the VAE convs stay dense) and skips any Linear whose `in_features` is not a multiple of the group
+/// size — matching the reference predicate (which leaves e.g. `vid_in.proj`, in=132, dense).
+enum LinearWeight {
+    Dense(Array),
+    Quant {
+        wq: Array,
+        scales: Array,
+        biases: Array,
+        group: i32,
+        bits: i32,
+    },
+}
+
 struct Linear {
-    w: Array,
+    w: LinearWeight,
     b: Option<Array>,
 }
 impl Linear {
     fn load(w: &Weights, prefix: &str, bias: bool) -> Result<Self> {
         Ok(Self {
-            w: w.require(&format!("{prefix}.weight"))?.clone(),
+            w: LinearWeight::Dense(w.require(&format!("{prefix}.weight"))?.clone()),
             b: if bias {
                 Some(w.require(&format!("{prefix}.bias"))?.clone())
             } else {
@@ -43,11 +61,42 @@ impl Linear {
         })
     }
     fn forward(&self, x: &Array) -> Result<Array> {
-        let y = matmul(x, self.w.t())?;
+        let y = match &self.w {
+            LinearWeight::Dense(w) => matmul(x, w.t())?,
+            LinearWeight::Quant {
+                wq,
+                scales,
+                biases,
+                group,
+                bits,
+            } => quantized_matmul(x, wq, scales, biases, true, *group, *bits)?,
+        };
         match &self.b {
             Some(b) => Ok(add(&y, b)?),
             None => Ok(y),
         }
+    }
+
+    /// Quantize the dense weight to `bits` (group-wise affine, with the fork's bf16-parity cast).
+    /// No-op when already quantized or when `in_features % group != 0` (the reference predicate
+    /// leaves those dense — group-wise quantization requires the contraction dim divisible by `group`).
+    /// Evals the packed tensors so the dense weight is freed promptly.
+    fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
+        if let LinearWeight::Dense(w) = &self.w {
+            if *w.shape().last().unwrap() % group != 0 {
+                return Ok(());
+            }
+            let (wq, scales, biases) = quantize_affine(&w.as_dtype(Dtype::Bfloat16)?, group, bits)?;
+            eval([&wq, &scales, &biases])?;
+            self.w = LinearWeight::Quant {
+                wq,
+                scales,
+                biases,
+                group,
+                bits,
+            };
+        }
+        Ok(())
     }
 }
 
@@ -105,6 +154,11 @@ impl TimeEmbedding {
         let emb = silu(&self.proj_hid.forward(&emb)?)?;
         self.proj_out.forward(&emb)
     }
+    fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
+        self.proj_in.quantize(bits, group)?;
+        self.proj_hid.quantize(bits, group)?;
+        self.proj_out.quantize(bits, group)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +193,9 @@ impl PatchIn {
         let dim = *x.shape().last().unwrap();
         Ok((x.reshape(&[b, -1, dim])?, (tp, hp, wp)))
     }
+    fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
+        self.proj.quantize(bits, group) // in=patch·channels=132 → left dense by the predicate
+    }
 }
 
 struct PatchOut {
@@ -164,6 +221,9 @@ impl PatchOut {
         Ok(x.reshape(&[b, tp, hp, wp, self.pt, self.ph, self.pw, cc])?
             .transpose_axes(&[0, 7, 1, 4, 2, 5, 3, 6])?
             .reshape(&[b, cc, tp * self.pt, hp * self.ph, wp * self.pw])?)
+    }
+    fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
+        self.proj.quantize(bits, group)
     }
 }
 
@@ -306,20 +366,48 @@ fn axial_1d(freqs: &Array, pos: &Array) -> Result<Array> {
     Ok(dup.reshape(&[len, nf * 2])?)
 }
 
-/// Per-window video freqs `(f*h*w, 126)`; temporal positions offset by `txt_off` (lang mode).
-fn vid_freq_block(freqs: &Array, f: i32, h: i32, w: i32, txt_off: i32) -> Result<Array> {
+/// 1-D axis positions for 3-D RoPE. **lang mode** (3B): integer `arange(n) + offset` (the reference
+/// `_get_axial_freqs` non-pixel branch; vid temporal is offset by `txt_len`). **pixel mode** (7B):
+/// normalized `linspace(-1, 1, n)` (the `freqs_for="pixel"` branch; the offset is unused because the
+/// 7B attention takes the non-mm rope path — `rope_on_text=false` — with no temporal offset). mlx
+/// `linspace(-1,1,1)` returns `[-1]`.
+fn axis_pos(n: i32, pixel: bool, offset: i32) -> Result<Array> {
+    if pixel {
+        let data: Vec<f32> = if n <= 1 {
+            vec![-1.0]
+        } else {
+            let step = 2.0 / (n - 1) as f32;
+            (0..n).map(|i| -1.0 + step * i as f32).collect()
+        };
+        Ok(Array::from_slice(&data, &[n]))
+    } else if offset == 0 {
+        Ok(arange_f32(n)) // bit-identical to the original plain `arange` for the h/w axes
+    } else {
+        Ok(add(arange_f32(n), Array::from_f32(offset as f32))?)
+    }
+}
+
+/// Per-window video freqs `(f*h*w, nf2*3)`; temporal positions offset by `txt_off` (lang mode only —
+/// pixel mode normalizes each window's f/h/w independently with no offset).
+fn vid_freq_block(
+    freqs: &Array,
+    f: i32,
+    h: i32,
+    w: i32,
+    txt_off: i32,
+    pixel: bool,
+) -> Result<Array> {
     let nf2 = freqs.shape()[0] * 2;
-    let t_pos = add(arange_f32(f), Array::from_f32(txt_off as f32))?;
     let axt = broadcast_to(
-        &axial_1d(freqs, &t_pos)?.reshape(&[f, 1, 1, nf2])?,
+        &axial_1d(freqs, &axis_pos(f, pixel, txt_off)?)?.reshape(&[f, 1, 1, nf2])?,
         &[f, h, w, nf2],
     )?;
     let axh = broadcast_to(
-        &axial_1d(freqs, &arange_f32(h))?.reshape(&[1, h, 1, nf2])?,
+        &axial_1d(freqs, &axis_pos(h, pixel, 0)?)?.reshape(&[1, h, 1, nf2])?,
         &[f, h, w, nf2],
     )?;
     let axw = broadcast_to(
-        &axial_1d(freqs, &arange_f32(w))?.reshape(&[1, 1, w, nf2])?,
+        &axial_1d(freqs, &axis_pos(w, pixel, 0)?)?.reshape(&[1, 1, w, nf2])?,
         &[f, h, w, nf2],
     )?;
     Ok(concatenate_axis(&[&axt, &axh, &axw], -1)?.reshape(&[f * h * w, nf2 * 3])?)
@@ -471,6 +559,24 @@ impl Mlp {
             Mlp::Gelu { proj_in, proj_out } => proj_out.forward(&gelu_tanh(&proj_in.forward(x)?)?),
         }
     }
+    fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
+        match self {
+            Mlp::SwiGlu {
+                proj_in,
+                gate,
+                proj_out,
+            } => {
+                proj_in.quantize(bits, group)?;
+                gate.quantize(bits, group)?;
+                proj_out.quantize(bits, group)?;
+            }
+            Mlp::Gelu { proj_in, proj_out } => {
+                proj_in.quantize(bits, group)?;
+                proj_out.quantize(bits, group)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +600,7 @@ struct MMAttention {
     window: (i32, i32, i32),
     shift: bool,
     rope_on_text: bool,
+    rope_pixel: bool,
 }
 impl MMAttention {
     fn load(w: &Weights, prefix: &str, cfg: &DitConfig, shift: bool) -> Result<Self> {
@@ -514,6 +621,7 @@ impl MMAttention {
             window: cfg.window,
             shift,
             rope_on_text: cfg.rope_on_text,
+            rope_pixel: cfg.rope_pixel,
         })
     }
 
@@ -573,10 +681,19 @@ impl MMAttention {
         )?;
         let v_t = qkv_t.take_axis(Array::from_int(2), 1)?;
 
-        // RoPE: vid freqs concatenated per window (relative positions, temporal offset by txt_len)
+        // RoPE: vid freqs concatenated per window. lang mode (3B) offsets the temporal axis by
+        // txt_len; pixel mode (7B, rope_on_text=false → non-mm path) uses no offset.
+        let txt_off = if self.rope_on_text { lt } else { 0 };
         let mut blocks = Vec::with_capacity(plan.window_shapes.len());
         for (f, wh, ww) in &plan.window_shapes {
-            blocks.push(vid_freq_block(&self.freqs, *f, *wh, *ww, lt)?);
+            blocks.push(vid_freq_block(
+                &self.freqs,
+                *f,
+                *wh,
+                *ww,
+                txt_off,
+                self.rope_pixel,
+            )?);
         }
         let refs: Vec<&Array> = blocks.iter().collect();
         let vid_freqs = concatenate_axis(&refs, 0)?; // (L, 126)
@@ -655,6 +772,13 @@ impl MMAttention {
             .reshape(&[1, lt, txt_dim])?;
 
         Ok((vid_out, txt_out))
+    }
+
+    fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
+        self.qkv_vid.quantize(bits, group)?;
+        self.out_vid.quantize(bits, group)?;
+        self.qkv_txt.quantize(bits, group)?;
+        self.out_txt.quantize(bits, group) // norm_q/k are RMSNorm weights, not Linear
     }
 }
 
@@ -823,6 +947,18 @@ impl Block {
         };
         Ok((vid, txt))
     }
+
+    fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
+        self.attn.quantize(bits, group)?;
+        self.mlp_vid.quantize(bits, group)?;
+        if let Some(m) = &mut self.mlp_txt {
+            m.quantize(bits, group)?;
+        }
+        if let Some(m) = &mut self.mlp_all {
+            m.quantize(bits, group)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +1031,20 @@ impl Seedvr2Transformer {
             vid = add(&multiply(&vid, &scale)?, &shift)?;
         }
         self.vid_out.forward(&vid, vid_shape)
+    }
+
+    /// Quantize every Linear to `bits` (group-wise affine, group 64) — sc-5198. Linear-only by
+    /// construction (the DiT has no convs); `vid_in.proj` (in=132) is auto-skipped by the
+    /// in-features-divisibility predicate, matching the reference. Idempotent / safe to call once.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        let group = mlx_gen::quant::DEFAULT_GROUP_SIZE;
+        self.vid_in.quantize(bits, group)?;
+        self.txt_in.quantize(bits, group)?;
+        self.emb_in.quantize(bits, group)?;
+        for block in &mut self.blocks {
+            block.quantize(bits, group)?;
+        }
+        self.vid_out.quantize(bits, group)
     }
 }
 

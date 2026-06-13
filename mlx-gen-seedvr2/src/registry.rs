@@ -12,14 +12,15 @@
 //! load — no Python). Dense bf16 default; `Fp32` honored (the parity path). Video `fps` passes
 //! through `req.fps` (the worker supplies the source cadence; audio mux is the worker's job).
 //!
-//! 7B (needs pixel-mode RoPE) and int8 (Linear-only quant) are tracked follow-ups; only 3B is wired.
+//! 3B (default) + 7B (pixel-mode RoPE — sc-5197) are wired; `spec.quantize` Q4/Q8 quantizes the DiT
+//! Linears at load (sc-5198).
 
 use mlx_rs::Dtype;
 
 use mlx_gen::{
     default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Result, WeightsSource,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::config::DitConfig;
@@ -27,10 +28,22 @@ use crate::pipeline::Seedvr2Pipeline;
 
 pub const MODEL_ID: &str = "seedvr2";
 pub const MODEL_ID_3B: &str = "seedvr2_3b";
+pub const MODEL_ID_7B: &str = "seedvr2_7b";
 const VAE_SCALE: u32 = 16; // VAE /8 · patch /2
 const DIT_FILE_3B: &str = "seedvr2_ema_3b_fp16.safetensors";
+const DIT_FILE_7B: &str = "seedvr2_ema_7b_fp16.safetensors";
 /// Output fps when the request omits one (the worker normally supplies the source cadence).
 const DEFAULT_FPS: u32 = 24;
+
+/// The DiT checkpoint file + transformer config for a registered id (3B default; 7B is the
+/// pixel-mode-RoPE variant — sc-5197). The VAE is shared across both.
+fn variant(id: &str) -> (&'static str, DitConfig) {
+    if id == MODEL_ID_7B {
+        (DIT_FILE_7B, DitConfig::seedvr2_7b())
+    } else {
+        (DIT_FILE_3B, DitConfig::seedvr2_3b())
+    }
+}
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
@@ -52,7 +65,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             max_size: 4096,
             max_count: 8,
             mac_only: true,
-            supported_quants: &[], // int8 (Linear-only) is a follow-up
+            supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5198)
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -64,6 +77,9 @@ pub fn descriptor() -> ModelDescriptor {
 }
 pub fn descriptor_3b() -> ModelDescriptor {
     descriptor_for(MODEL_ID_3B)
+}
+pub fn descriptor_7b() -> ModelDescriptor {
+    descriptor_for(MODEL_ID_7B)
 }
 
 pub struct Seedvr2Generator {
@@ -82,11 +98,6 @@ fn load_with(spec: &LoadSpec, id: &'static str) -> Result<Box<dyn Generator>> {
             "{id}: LoRA/LoKr adapters are not supported"
         )));
     }
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(format!(
-            "{id}: int8/int4 quantization is not yet wired (follow-up)"
-        )));
-    }
     let dtype = match spec.precision {
         Precision::Bf16 => Dtype::Bfloat16,
         Precision::Fp32 => Dtype::Float32,
@@ -99,7 +110,12 @@ fn load_with(spec: &LoadSpec, id: &'static str) -> Result<Box<dyn Generator>> {
             )))
         }
     };
-    let pipe = Seedvr2Pipeline::load(&dir, DIT_FILE_3B, &DitConfig::seedvr2_3b(), dtype)?;
+    let (dit_file, cfg) = variant(id);
+    let mut pipe = Seedvr2Pipeline::load(&dir, dit_file, &cfg, dtype)?;
+    // sc-5198: Q4/Q8 quantize the DiT Linears at load (the VAE stays dense).
+    if let Some(q) = spec.quantize {
+        pipe.quantize(q.bits())?;
+    }
     Ok(Box::new(Seedvr2Generator {
         descriptor: descriptor_for(id),
         pipe,
@@ -210,12 +226,18 @@ fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 fn load_registered_3b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_with(spec, MODEL_ID_3B).map_err(Into::into)
 }
+fn load_registered_7b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_with(spec, MODEL_ID_7B).map_err(Into::into)
+}
 
 inventory::submit! {
     ModelRegistration { descriptor, load: load_registered }
 }
 inventory::submit! {
     ModelRegistration { descriptor: descriptor_3b, load: load_registered_3b }
+}
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_7b, load: load_registered_7b }
 }
 
 #[cfg(test)]
@@ -243,7 +265,7 @@ mod tests {
 
     #[test]
     fn both_ids_resolve_in_registry() {
-        for id in [MODEL_ID, MODEL_ID_3B] {
+        for id in [MODEL_ID, MODEL_ID_3B, MODEL_ID_7B] {
             let spec = LoadSpec {
                 weights: WeightsSource::Dir("/nonexistent/seedvr2".into()),
                 quantize: None,

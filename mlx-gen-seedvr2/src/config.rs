@@ -56,9 +56,12 @@ impl DitConfig {
         }
     }
 
-    /// SeedVR2-7B override set. NOTE: the non-dim overrides (mm_layers / rope / mlp / output-ada)
-    /// are to be confirmed against `ModelConfig.seedvr2_7b` before the 7B parity gate; the 3B path
-    /// is the image-mode-parity target for this story.
+    /// SeedVR2-7B override set (sc-5197). Confirmed against the reference `SeedVR2Transformer`
+    /// constructor + the 7B checkpoint: dim 3072 / 24 heads / 36 layers, `mm_layers=36` (every layer
+    /// dual-stream — no shared `.all`), `rope_dim=64` **pixel-mode** RoPE with `rope_on_text=false`
+    /// (the non-mm rope path, no temporal offset), `mlp_type="normal"` (GELU, `gelu_approx`), and no
+    /// output AdaLN / no last-layer-vid-only. The `freqs` buffer is loaded from the checkpoint (pixel
+    /// `linspace·π`, length `rope_dim/3/2 = 10`).
     pub fn seedvr2_7b() -> Self {
         Self {
             vid_dim: 3072,
