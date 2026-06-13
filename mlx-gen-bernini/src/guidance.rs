@@ -137,6 +137,42 @@ pub fn normalized_guidance_chain(
     Ok(result)
 }
 
+/// `clamp_min` floor for the `apg_delta` reference norm² (the reference's `eps=1e-8`).
+const APG_DELTA_EPS: f32 = 1e-8;
+
+/// The **v-space** APG delta projection used by the full-Bernini ViT-conditioned modes
+/// (`wan_diffusion.py:apg_delta`, "veomni_editing Wan2.2"). Distinct from [`normalize_diff`]: it
+/// projects `delta` onto `reference` over the **whole flattened tensor** (per batch element, not
+/// per-frame) and recombines with fixed parallel/orthogonal scales (∥0.2 / ⊥1.0):
+///
+///   `proj = (delta·ref)/max(‖ref‖², eps)·ref`; `out = parallel_scale·proj + orthogonal_scale·(delta − proj)`.
+///
+/// `delta`/`reference` are `[1, n_target, C]` (the target-sliced packed-token predictions, batch 1);
+/// the reduction is over `n_target·C`.
+pub fn apg_delta(
+    delta: &Array,
+    reference: &Array,
+    parallel_scale: f32,
+    orthogonal_scale: f32,
+) -> Result<Array> {
+    // reshape(b, -1) + reduce dim=1 ≡ reduce over every axis except the batch axis 0.
+    let dims: Vec<i32> = (1..delta.ndim() as i32).collect();
+    let ref_norm_sq = maximum(
+        &multiply(reference, reference)?.sum_axes(&dims, true)?,
+        Array::from_f32(APG_DELTA_EPS),
+    )?;
+    let coeff = divide(
+        &multiply(delta, reference)?.sum_axes(&dims, true)?,
+        &ref_norm_sq,
+    )?;
+    let parallel = multiply(&coeff, reference)?;
+    let orthogonal = subtract(delta, &parallel)?;
+    Ok(add(
+        &multiply(&parallel, Array::from_f32(parallel_scale))?,
+        &multiply(&orthogonal, Array::from_f32(orthogonal_scale))?,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

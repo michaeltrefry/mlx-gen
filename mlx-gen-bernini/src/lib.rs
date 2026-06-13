@@ -36,4 +36,5 @@ pub mod template;
 pub mod vae_features;
 pub mod vae_preprocess;
 pub mod vision;
+pub mod vit_guidance;
 pub mod vit_preprocess;

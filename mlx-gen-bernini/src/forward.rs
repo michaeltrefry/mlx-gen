@@ -20,6 +20,7 @@ use mlx_gen_wan::{RopeTable, WanTransformer};
 
 use crate::guidance::{normalized_guidance, normalized_guidance_chain, MomentumBuffer};
 use crate::rope::{apply_source_id, assign_source_ids};
+use crate::vit_guidance::{rv2v_chain, vae_txt_vit};
 
 /// One renderer guidance mode (the renderer half of `cli.GUIDANCE_MODES`; the two `*_wapg` modes are
 /// full-Bernini ViT-planner only and out of scope here).
@@ -328,6 +329,170 @@ pub fn num_momentum_buffers(mode: Mode) -> usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// sc-5142: the full-Bernini ViT-conditioned per-step velocity (`sample_one_step`).
+// ---------------------------------------------------------------------------
+
+/// One full-Bernini ViT-conditioned guidance mode (`BerniniPipeline`'s `sample_one_step` modes; the
+/// renderer-only [`Mode`] modes are disjoint from these).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VitMode {
+    /// `vae_txt_vit` — plain 4-prediction combine.
+    VaeTxtVit,
+    /// `vae_txt_vit_wapg` — the same combine with `apg_delta` on each delta (the primary t2i/edit).
+    VaeTxtVitWapg,
+    /// `rv2v_wapg` — the 5-prediction vid/img/txt/ViT chain, plain deltas.
+    Rv2vWapg,
+    /// `r2v_wapg` — the same chain with `apg_delta` deltas.
+    R2vWapg,
+    /// `v2v_apg` — x-space [`normalized_guidance`] over (uncond, wtxt_wvit) (the renderer family).
+    V2vApg,
+}
+
+impl VitMode {
+    pub fn from_name(s: &str) -> Option<VitMode> {
+        Some(match s {
+            "vae_txt_vit" => VitMode::VaeTxtVit,
+            "vae_txt_vit_wapg" => VitMode::VaeTxtVitWapg,
+            "rv2v_wapg" => VitMode::Rv2vWapg,
+            "r2v_wapg" => VitMode::R2vWapg,
+            "v2v_apg" => VitMode::V2vApg,
+            _ => return None,
+        })
+    }
+
+    fn apg(self) -> bool {
+        matches!(self, VitMode::VaeTxtVitWapg | VitMode::R2vWapg)
+    }
+}
+
+/// The planner's 4 prepared cross-attn K/V streams, in the reference's naming. Each is the prepared
+/// `(K, V)` list for one prompt-embed stream (`UMT5(prompt)` ⧺ the planner ViT-context, sc-5140's
+/// `concat_with_zero_init`).
+pub struct VitStreams<'a> {
+    pub wtxt_wvit: &'a [(Array, Array)],
+    pub wtxt_wovit: &'a [(Array, Array)],
+    pub wotxt_wvit: &'a [(Array, Array)],
+    pub wotxt_wovit: &'a [(Array, Array)],
+}
+
+/// Per-step ViT-conditioned guidance knobs (already `omega_scale`-rescaled by the caller when the
+/// low-noise expert is active).
+#[derive(Clone)]
+pub struct VitGuidanceParams {
+    pub omega_txt: f32,
+    pub omega_img: f32,
+    pub omega_vid: f32,
+    pub omega_tgt: f32,
+    /// x-space APG knobs for `v2v_apg` (eta, norm_threshold); unused by the v-space modes.
+    pub eta: f32,
+    pub norm_threshold: f32,
+}
+
+/// `sample_one_step` (`wan_diffusion.py` 795-1049): the full-Bernini per-step velocity over the 4
+/// prompt streams × the packed-latent variants. Each prediction is one [`PackedForward::velocity`]
+/// (≡ the reference `shared_step`) over a source subset + a chosen prompt stream:
+///   - `wvae` = image ⧺ video sources; `wimgvae` = image; `wvidvae` = video; `wovae` = target only.
+///   - `images`/`videos` are `(latent, source_id)` source lists (the target is added with id 0 inside
+///     `velocity`).
+///
+/// The combine is the slice-A math ([`vae_txt_vit`] / [`rv2v_chain`]) on the target-sliced spatial
+/// velocities (a leading batch axis is added so `apg_delta` reduces over the whole tensor). `v2v_apg`
+/// routes through the x-space [`normalized_guidance`] (momentum 0). Returns `[16, T, H8, W8]`.
+#[allow(clippy::too_many_arguments)]
+pub fn vit_one_step(
+    pf: &PackedForward,
+    dit: &WanTransformer,
+    mode: VitMode,
+    noisy: &Array,
+    images: &[(Array, f64)],
+    videos: &[(Array, f64)],
+    t: f32,
+    sigma: f32,
+    streams: &VitStreams,
+    g: &VitGuidanceParams,
+) -> Result<Array> {
+    let wvae: Vec<(Array, f64)> = images.iter().chain(videos).cloned().collect();
+    let v =
+        |sources: &[(Array, f64)], kv: &[(Array, Array)]| pf.velocity(dit, noisy, sources, t, kv);
+    let shape = noisy.shape().to_vec();
+    let b = |a: &Array| -> Result<Array> { Ok(a.expand_dims(0)?) }; // [16,T,H8,W8] -> [1,16,...]
+    let unb = |a: Array| -> Result<Array> { Ok(a.reshape(&shape)?) }; // back to [16,T,H8,W8]
+
+    match mode {
+        VitMode::VaeTxtVit | VitMode::VaeTxtVitWapg => {
+            let base = v(&[], streams.wotxt_wovit)?; // wovae · wotxt_wovit
+            let img = v(&wvae, streams.wotxt_wovit)?; // wvae  · wotxt_wovit
+            let txt = v(&wvae, streams.wtxt_wovit)?; // wvae  · wtxt_wovit
+            let vit = v(&wvae, streams.wtxt_wvit)?; // wvae  · wtxt_wvit
+            let out = vae_txt_vit(
+                &b(&base)?,
+                &b(&img)?,
+                &b(&txt)?,
+                &b(&vit)?,
+                g.omega_img,
+                g.omega_txt,
+                g.omega_tgt,
+                mode.apg(),
+            )?;
+            unb(out)
+        }
+        VitMode::Rv2vWapg | VitMode::R2vWapg => {
+            let base = v(&[], streams.wotxt_wovit)?;
+            // `if cur_omega_X > 0` short-circuits (reuse the previous prediction, no extra forward).
+            let eps_v = if g.omega_vid > 0.0 {
+                v(videos, streams.wotxt_wovit)? // wvidvae · wotxt_wovit
+            } else {
+                base.clone()
+            };
+            let eps_vi = if g.omega_img > 0.0 {
+                v(&wvae, streams.wotxt_wovit)? // wvae · wotxt_wovit
+            } else {
+                eps_v.clone()
+            };
+            let eps_vti = if g.omega_txt > 0.0 {
+                v(&wvae, streams.wtxt_wovit)? // wvae · wtxt_wovit
+            } else {
+                eps_vi.clone()
+            };
+            let eps_vtic = if g.omega_tgt > 0.0 {
+                v(&wvae, streams.wtxt_wvit)? // wvae · wtxt_wvit
+            } else {
+                eps_vti.clone()
+            };
+            let out = rv2v_chain(
+                &b(&base)?,
+                &b(&eps_v)?,
+                &b(&eps_vi)?,
+                &b(&eps_vti)?,
+                &b(&eps_vtic)?,
+                g.omega_vid,
+                g.omega_img,
+                g.omega_txt,
+                g.omega_tgt,
+                mode.apg(),
+            )?;
+            unb(out)
+        }
+        VitMode::V2vApg => {
+            let eps_uncond = v(&[], streams.wotxt_wovit)?; // wovae · wotxt_wovit
+            let eps_t = v(&wvae, streams.wtxt_wvit)?; // wvae · wtxt_wvit
+            let x0 = to_x(noisy, sigma, &eps_uncond)?;
+            let xt = to_x(noisy, sigma, &eps_t)?;
+            let mut buf = MomentumBuffer::new(0.0);
+            let xg = normalized_guidance(
+                &xt,
+                &x0,
+                g.omega_txt,
+                Some(&mut buf),
+                g.eta,
+                g.norm_threshold,
+            )?;
+            from_x(noisy, sigma, &xg)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +588,89 @@ mod tests {
         .unwrap();
         assert_eq!(got.shape(), noisy.shape());
         assert_eq!(max_abs(&got, &want), 0.0, "t2v must equal manual CFG");
+    }
+
+    /// `vae_txt_vit` dispatch: [`vit_one_step`] must equal the manual 4-forward combine via
+    /// [`crate::vit_guidance::vae_txt_vit`] over the right (source-subset × prompt-stream) pairs —
+    /// pins the `sample_one_step` stream/source routing to the validated `velocity` seam + the
+    /// (separately torch-validated) combine math. Distinct streams make a wrong routing show up.
+    #[test]
+    fn vae_txt_vit_dispatch_matches_manual() {
+        let w = load("s5_low.safetensors");
+        let cfg = tiny_cfg();
+        let dit = WanTransformer::from_weights(&w, &cfg).expect("DiT");
+        let pf = PackedForward::new(
+            cfg.dim / cfg.num_heads,
+            cfg.out_dim,
+            cfg.patch_size,
+            5.0,
+            true,
+        );
+        let noisy = w.require("init_noise").unwrap(); // [16, 2, 2, 2]
+
+        // Four distinct prompt streams (scale the two fixture contexts to get 4 unique K/V).
+        let mk = |ctx: &Array, s: f32| {
+            let scaled = multiply(ctx, Array::from_f32(s)).unwrap();
+            dit.prepare_cross_kv(&dit.embed_text(&scaled).unwrap())
+                .unwrap()
+        };
+        let cc = w.require("ctx_cond").unwrap();
+        let cu = w.require("ctx_uncond").unwrap();
+        let s = VitStreams {
+            wtxt_wvit: &mk(cc, 1.0),
+            wtxt_wovit: &mk(cu, 1.0),
+            wotxt_wvit: &mk(cc, 0.5),
+            wotxt_wovit: &mk(cu, 0.5),
+        };
+        let img = Array::zeros::<f32>(&[16, 1, 2, 2]).unwrap();
+        let images = [(img, 1.0)];
+        let g = VitGuidanceParams {
+            omega_txt: 4.0,
+            omega_img: 4.5,
+            omega_vid: 1.25,
+            omega_tgt: 3.0,
+            eta: 1.0,
+            norm_threshold: 50.0,
+        };
+        let t = 833.0f32;
+        let got = vit_one_step(
+            &pf,
+            &dit,
+            VitMode::VaeTxtVit,
+            noisy,
+            &images,
+            &[],
+            t,
+            1.0,
+            &s,
+            &g,
+        )
+        .unwrap();
+
+        // Manual: the four shared_step forwards, batched, combined, unbatched.
+        let base = pf.velocity(&dit, noisy, &[], t, s.wotxt_wovit).unwrap();
+        let im = pf.velocity(&dit, noisy, &images, t, s.wotxt_wovit).unwrap();
+        let tx = pf.velocity(&dit, noisy, &images, t, s.wtxt_wovit).unwrap();
+        let vi = pf.velocity(&dit, noisy, &images, t, s.wtxt_wvit).unwrap();
+        let want = vae_txt_vit(
+            &base.expand_dims(0).unwrap(),
+            &im.expand_dims(0).unwrap(),
+            &tx.expand_dims(0).unwrap(),
+            &vi.expand_dims(0).unwrap(),
+            g.omega_img,
+            g.omega_txt,
+            g.omega_tgt,
+            false,
+        )
+        .unwrap()
+        .reshape(noisy.shape())
+        .unwrap();
+        assert_eq!(got.shape(), noisy.shape());
+        assert_eq!(
+            max_abs(&got, &want),
+            0.0,
+            "vae_txt_vit dispatch must equal manual combine"
+        );
     }
 
     /// A conditioning source extends the packed sequence but the sliced target velocity keeps the

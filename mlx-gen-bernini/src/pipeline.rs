@@ -25,7 +25,10 @@ use mlx_gen_wan::text_encoder::{load_tokenizer, Umt5Encoder};
 use mlx_gen_wan::{WanTransformer, WanVae};
 
 use crate::config::{resolve_mode, BerniniKnobs, Defaults};
-use crate::forward::{guided_velocity, num_momentum_buffers, GuidanceParams, Mode, PackedForward};
+use crate::forward::{
+    guided_velocity, num_momentum_buffers, vit_one_step, GuidanceParams, Mode, PackedForward,
+    VitGuidanceParams, VitMode, VitStreams,
+};
 use crate::guidance::MomentumBuffer;
 use crate::preprocess::{encode_image, encode_videoclip};
 
@@ -197,6 +200,108 @@ fn denoise_bernini(
             &expert.cross_kv_uncond,
             &g,
             &mut mbufs,
+        )?;
+        latent = sched.step(&v, &latent)?;
+        eval([&latent])?;
+    }
+    Ok(latent)
+}
+
+/// One expert (high or low) with its prepared cross-attention K/V for the planner's **4** prompt-embed
+/// streams (the full-Bernini ViT-conditioned path). Each stream is `concat_with_zero_init(UMT5(prompt),
+/// planner ViT-context)` (sc-5140), in renderer `text_dim` space, so it goes through the same
+/// `embed_text` → `prepare_cross_kv` as the renderer's text context.
+pub struct BVitExpert<'a> {
+    transformer: &'a WanTransformer,
+    wtxt_wvit: Vec<(Array, Array)>,
+    wtxt_wovit: Vec<(Array, Array)>,
+    wotxt_wvit: Vec<(Array, Array)>,
+    wotxt_wovit: Vec<(Array, Array)>,
+}
+
+impl<'a> BVitExpert<'a> {
+    /// `streams` = `[wtxt_wvit, wtxt_wovit, wotxt_wvit, wotxt_wovit]` prompt-embed contexts.
+    pub fn build(dit: &'a WanTransformer, streams: [&Array; 4]) -> Result<Self> {
+        let prep = |s: &Array| -> Result<Vec<(Array, Array)>> {
+            dit.prepare_cross_kv(&dit.embed_text(s)?)
+        };
+        Ok(Self {
+            transformer: dit,
+            wtxt_wvit: prep(streams[0])?,
+            wtxt_wovit: prep(streams[1])?,
+            wotxt_wvit: prep(streams[2])?,
+            wotxt_wovit: prep(streams[3])?,
+        })
+    }
+
+    fn streams(&self) -> VitStreams<'_> {
+        VitStreams {
+            wtxt_wvit: &self.wtxt_wvit,
+            wtxt_wovit: &self.wtxt_wovit,
+            wotxt_wvit: &self.wotxt_wvit,
+            wotxt_wovit: &self.wotxt_wovit,
+        }
+    }
+}
+
+/// The full-Bernini ViT-conditioned denoise loop (`sample_bernini_wvitcfg`, `wan_diffusion.py`
+/// 571-793) — the renderer-side compute that consumes the planner's 4 prompt streams. The boundary-
+/// switched, [`vit_one_step`]-guided analog of [`denoise_bernini`]: each step picks the expert by the
+/// `switch_dit_boundary`, multiplies **all four** omegas (incl. `omega_tgt`) by `omega_scale` once on
+/// the first low-noise step, and applies the UniPC flow step. Runs in spatial latent space
+/// `[16, T, H8, W8]`. The full end-to-end string-up (planner MAR loop → these 4 streams → here →
+/// decode) is the registered pipeline in sc-5145.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_bernini_wvitcfg(
+    pf: &PackedForward,
+    mode: VitMode,
+    low: &BVitExpert,
+    high: &BVitExpert,
+    boundary: f32,
+    num_train: usize,
+    steps: usize,
+    shift: f32,
+    init_noise: &Array,
+    images: &[(Array, f64)],
+    videos: &[(Array, f64)],
+    base_g: &VitGuidanceParams,
+    omega_scale: f32,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<Array> {
+    let mut sched = make_scheduler(SolverKind::UniPC, num_train);
+    sched.set_timesteps(steps, shift);
+    let timesteps = sched.timesteps().to_vec();
+    let sigmas = sched.sigmas().to_vec();
+
+    let mut latent = init_noise.clone();
+    let mut switched = false;
+    let mut g = base_g.clone();
+
+    for (i, &t) in timesteps.iter().enumerate() {
+        on_step(i);
+        let expert = if t >= boundary {
+            high
+        } else {
+            if !switched {
+                switched = true;
+                g.omega_txt *= omega_scale;
+                g.omega_img *= omega_scale;
+                g.omega_vid *= omega_scale;
+                g.omega_tgt *= omega_scale;
+            }
+            low
+        };
+        let v = vit_one_step(
+            pf,
+            expert.transformer,
+            mode,
+            &latent,
+            images,
+            videos,
+            t,
+            sigmas[i],
+            &expert.streams(),
+            &g,
         )?;
         latent = sched.step(&v, &latent)?;
         eval([&latent])?;
@@ -402,5 +507,99 @@ impl BerniniRenderer {
                 audio: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::ops::multiply;
+
+    fn tiny_cfg() -> WanModelConfig {
+        let mut c = WanModelConfig::wan21_t2v_1_3b();
+        c.dim = 128;
+        c.num_heads = 1;
+        c.num_layers = 2;
+        c.ffn_dim = 256;
+        c.freq_dim = 256;
+        c.text_dim = 32;
+        c.text_len = 8;
+        c.in_dim = 16;
+        c.out_dim = 16;
+        c.vae_z_dim = 16;
+        c.boundary = 0.875;
+        c.num_train_timesteps = 1000;
+        c
+    }
+
+    fn load(name: &str) -> Weights {
+        let path = format!(
+            "{}/../mlx-gen-wan/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        Weights::from_file(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    }
+
+    /// The ViT-conditioned denoise loop runs end-to-end over a tiny dual-expert (crossing the
+    /// boundary so the `omega_scale` switch fires) and preserves the spatial latent shape. Pins the
+    /// loop plumbing (scheduler / expert switch / per-step `vit_one_step` / flow step); the per-step
+    /// math is validated in slices A/B and the e2e coherence in sc-5145.
+    #[test]
+    fn denoise_wvitcfg_runs_and_keeps_shape() {
+        let w = load("s5_low.safetensors");
+        let cfg = tiny_cfg();
+        let dit = WanTransformer::from_weights(&w, &cfg).expect("DiT");
+        let pf = PackedForward::new(
+            cfg.dim / cfg.num_heads,
+            cfg.out_dim,
+            cfg.patch_size,
+            5.0,
+            true,
+        );
+        let noisy = w.require("init_noise").unwrap(); // [16, 2, 2, 2]
+        let cc = w.require("ctx_cond").unwrap();
+        let cu = w.require("ctx_uncond").unwrap();
+        let scale = |a: &Array, s: f32| multiply(a, Array::from_f32(s)).unwrap();
+        // 4 distinct prompt streams.
+        let (s0, s1, s2, s3) = (
+            scale(cc, 1.0),
+            scale(cu, 1.0),
+            scale(cc, 0.5),
+            scale(cu, 0.5),
+        );
+        let streams = [&s0, &s1, &s2, &s3];
+        let low = BVitExpert::build(&dit, streams).expect("low expert");
+        let high = BVitExpert::build(&dit, streams).expect("high expert");
+        let g = VitGuidanceParams {
+            omega_txt: 4.0,
+            omega_img: 4.5,
+            omega_vid: 1.25,
+            omega_tgt: 3.0,
+            eta: 1.0,
+            norm_threshold: 50.0,
+        };
+        let mut on_step = |_i: usize| {};
+        let out = denoise_bernini_wvitcfg(
+            &pf,
+            VitMode::VaeTxtVitWapg,
+            &low,
+            &high,
+            0.875 * cfg.num_train_timesteps as f32, // boundary 875 → crosses with 3 steps
+            cfg.num_train_timesteps,
+            3,
+            5.0,
+            noisy,
+            &[],
+            &[],
+            &g,
+            0.8,
+            &mut on_step,
+        )
+        .expect("denoise");
+        assert_eq!(
+            out.shape(),
+            noisy.shape(),
+            "loop preserves spatial latent shape"
+        );
     }
 }
