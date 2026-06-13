@@ -27,7 +27,9 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 /// A dense Linear `y = x·Wᵀ (+ b)` over a diffusers `[out, in]` weight (+ optional `[out]` bias),
-/// cast to the working `dtype` at load.
+/// cast to the working `dtype` at load. `Clone` is cheap (refcounted `Array`s) and required so a
+/// checkpoint segment can OWN its block copy (sc-5170, mirrors z-image).
+#[derive(Clone)]
 pub(crate) struct Linear {
     w: Array, // [out, in]
     b: Option<Array>,

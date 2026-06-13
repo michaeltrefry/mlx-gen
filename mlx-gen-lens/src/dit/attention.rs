@@ -4,8 +4,10 @@
 //! `_build_joint_attention_mask` which orders image tokens first), split back and projected
 //! (`to_out.0` for image, `to_add_out` for text).
 
+use mlx_rs::error::Result as MlxResult;
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, split_sections, subtract};
+use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
@@ -26,6 +28,7 @@ fn load_adaptable(w: &Weights, prefix: &str, dtype: Dtype) -> Result<AdaptableLi
     Ok(AdaptableLinear::dense(weight, Some(bias)))
 }
 
+#[derive(Clone)]
 pub struct LensJointAttention {
     img_qkv: AdaptableLinear,
     txt_qkv: AdaptableLinear,
@@ -38,6 +41,13 @@ pub struct LensJointAttention {
     num_heads: i32,
     head_dim: i32,
     scale: f32,
+    /// sc-5170 — run the joint SDPA inside an `mlx::checkpoint` so its backward recomputes the
+    /// attention instead of retaining the `[heads, joint, joint]` probability matrix (the grad
+    /// through `fast::scaled_dot_product_attention` decomposes to naive attention — MLX has no fused
+    /// SDPA backward — and that one retained seq² array per block dominates the dense training
+    /// working set). Numerically identical (same math, recomputed); inference never sets it (default
+    /// off, zero cost), the trainer enables it unconditionally (LoRA + LoKr).
+    ckpt_sdpa: bool,
 }
 
 impl LensJointAttention {
@@ -60,7 +70,13 @@ impl LensJointAttention {
             num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
+            ckpt_sdpa: false,
         })
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing (sc-5170). Training-only knob — see `ckpt_sdpa`.
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.ckpt_sdpa = on;
     }
 
     /// Quantize the four projections to Q4/Q8 (sc-3175). Call **after** any adapter merge — the
@@ -120,9 +136,35 @@ impl LensJointAttention {
         let k = concatenate_axis(&[&img_k, &txt_k], 1)?.transpose_axes(&[0, 2, 1, 3])?;
         let v = concatenate_axis(&[&img_v, &txt_v], 1)?.transpose_axes(&[0, 2, 1, 3])?;
 
-        let o = match mask {
-            Some(m) => scaled_dot_product_attention(&q, &k, &v, self.scale, m, None)?,
-            None => scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?,
+        let o = if self.ckpt_sdpa {
+            // sc-5170: checkpoint just the joint SDPA. q/k/v are the threaded inputs (grads to the
+            // QKV projections — and their LoRA — flow back through them); the f32 scale and the
+            // additive mask are captured constants (the mask carries no trainable graph). The
+            // backward recomputes the decomposed attention for THIS block alone, so the
+            // `[heads, joint, joint]` probability matrix is a per-block transient, never 48×
+            // retained.
+            let scale = self.scale;
+            let m = mask.cloned();
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                let o = match m.as_ref() {
+                    Some(mm) => {
+                        scaled_dot_product_attention(&inp[0], &inp[1], &inp[2], scale, mm, None)?
+                    }
+                    None => {
+                        scaled_dot_product_attention(&inp[0], &inp[1], &inp[2], scale, None, None)?
+                    }
+                };
+                Ok(vec![o])
+            });
+            seg(&[q, k, v])?
+                .into_iter()
+                .next()
+                .expect("one sdpa output")
+        } else {
+            match mask {
+                Some(m) => scaled_dot_product_attention(&q, &k, &v, self.scale, m, None)?,
+                None => scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?,
+            }
         };
         let joint = img_seq + txt_seq;
         let o = o

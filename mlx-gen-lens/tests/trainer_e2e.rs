@@ -240,6 +240,95 @@ fn lens_trainer_trains_and_writes_lora() {
 
 #[test]
 #[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
+fn lens_trainer_trains_with_gradient_checkpointing() {
+    // sc-5170 — the same LoRA run as above but with `gradient_checkpointing = true`, driving the
+    // checkpointed DiT forward through the full `train_impl` loop (not just `compute_loss_grads` in
+    // isolation). Because the checkpointed grads are bit-identical to dense (proven in the lib harness
+    // `checkpointed_grads_match_dense`), the run must train, converge, and round-trip exactly like the
+    // dense LoRA run. This is the integration proof of the `train_impl` plumbing + the produced adapter.
+    let root = snapshot();
+    let tmp = std::env::temp_dir().join("lens_trainer_ckpt_e2e");
+    let items = make_dataset(&tmp);
+
+    let mut trainer =
+        mlx_gen::load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
+            .expect("lens trainer should be registered");
+
+    let config = TrainingConfig {
+        rank: 8,
+        alpha: 8.0,
+        learning_rate: 1e-4,
+        steps: 80,
+        resolution: 64,
+        save_every: 0,
+        seed: 7,
+        gradient_checkpointing: true, // <-- sc-5170: checkpointed DiT forward + SDPA-segment ckpt off
+        ..Default::default()
+    };
+    let req = TrainingRequest {
+        items,
+        config,
+        output_dir: tmp.join("out"),
+        file_name: "swatch_ckpt_lora.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut losses: Vec<f32> = Vec::new();
+    let out = trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Training { loss, .. } = p {
+                losses.push(loss);
+            }
+        })
+        .expect("checkpointed training should succeed");
+
+    assert_eq!(
+        out.steps, 80,
+        "all micro-steps should run under checkpointing"
+    );
+    assert!(losses.iter().all(|l| l.is_finite()), "no NaN/Inf losses");
+    let (first_q, last_q) = windowed_means(&losses);
+    println!("[lens-trainer-ckpt] loss-mean first-third {first_q:.5} -> last-third {last_q:.5}");
+    assert!(
+        last_q < first_q * 0.9,
+        "checkpointed windowed loss-mean should fall ≥10%: {first_q:.5} -> {last_q:.5}"
+    );
+
+    // The produced adapter round-trips through the REAL inference path, same as the dense run.
+    let w = Weights::from_file(&out.adapter_path).unwrap();
+    assert_eq!(w.metadata("networkType"), Some("lora"));
+    let n_targets = w.keys().filter(|k| k.ends_with(".lora_A.weight")).count();
+    assert_eq!(n_targets, 192, "48 blocks × 4 joint-attention projections");
+
+    let adapter_path = out.adapter_path.clone();
+    drop(trainer);
+    let mut t = fresh_transformer(&root);
+    let base_out = forward_output(&t);
+    let report = apply_lens_adapters(
+        &mut t,
+        &[AdapterSpec {
+            path: adapter_path,
+            scale: 1.0,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }],
+    )
+    .expect("checkpointed-run LoRA adapter should reload through the inference path");
+    assert_eq!(report.applied, n_targets, "every saved LoRA target reloads");
+    assert!(report.unmatched_paths.is_empty());
+    let adapted_out = forward_output(&t);
+    let shift = relative_l2(&base_out, &adapted_out);
+    println!("[lens-trainer-ckpt] checkpointed e2e OK — {n_targets} targets; output shift (rel-L2) {shift:.4}");
+    assert!(
+        shift > 1e-3,
+        "the checkpointed-trained LoRA must shift the DiT output beyond fp noise (rel-L2 {shift:.5})"
+    );
+}
+
+#[test]
+#[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
 fn lens_trainer_trains_and_reloads_lokr() {
     let root = snapshot();
     let tmp = std::env::temp_dir().join("lens_trainer_lokr_e2e");

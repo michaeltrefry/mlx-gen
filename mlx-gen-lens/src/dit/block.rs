@@ -17,6 +17,7 @@ const NORM_EPS: f32 = 1e-6;
 
 /// SwiGLU MLP (`GateMLP`): `w2(silu(w1(x)) · w3(x))`, all bias-less. Hidden width `dim/3·8`. The
 /// three projections are [`AdaptableLinear`] so they can be Q4/Q8-quantized (sc-3175).
+#[derive(Clone)]
 struct GateMlp {
     w1: AdaptableLinear,
     w2: AdaptableLinear,
@@ -50,6 +51,7 @@ impl GateMlp {
     }
 }
 
+#[derive(Clone)]
 pub struct LensTransformerBlock {
     img_mod: Linear,
     txt_mod: Linear,
@@ -97,6 +99,11 @@ impl LensTransformerBlock {
         self.img_mlp.quantize(bits)?;
         self.txt_mlp.quantize(bits)?;
         Ok(())
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing on this block's joint attention (sc-5170).
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.attn.set_sdpa_checkpoint(on);
     }
 
     /// Returns `(encoder_hidden_states, hidden_states)` (text, image) — the reference block's order.
