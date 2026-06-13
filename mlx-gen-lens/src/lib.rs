@@ -33,10 +33,15 @@
 //!   ([`text_encoder::encoder::LensTextEncoder`]): `embed_tokens` → 24 decoder layers with per-layer
 //!   sliding/full masks → capture the layer outputs at `[5, 11, 17, 23]` → early-exit at the last
 //!   selected layer. Validated end-to-end against the vendor `LensGptOssEncoder` on real bf16 weights.
+//! - **sc-3168** — the **denoising DiT** ([`dit::LensTransformer`]): a 48-layer dual-stream MMDiT
+//!   (multi-layer text front-end + fused-QKV joint attention with complex axial RoPE + AdaLN
+//!   modulation + SwiGLU GateMLP + `AdaLayerNormContinuous`). Validated against the vendor
+//!   `LensTransformer2DModel` on real f32 weights (block-0 peak_rel 1.2e-3, full-forward cosine 0.99998).
 //!
-//! Still to come: the memory-efficient weight conversion / Q4-Q8 re-quant (sc-3172), the DiT
-//! (sc-3168), VAE shim (sc-3169), scheduler (sc-3170), and the generate/e2e integration (sc-3173).
+//! Still to come: the memory-efficient weight conversion / Q4-Q8 re-quant (sc-3172), VAE shim
+//! (sc-3169), scheduler (sc-3170), and the generate/e2e integration (sc-3173).
 
 pub mod config;
+pub mod dit;
 pub mod text;
 pub mod text_encoder;
