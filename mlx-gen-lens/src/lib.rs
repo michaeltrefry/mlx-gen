@@ -67,6 +67,13 @@
 //!   ([`apply_lens_adapters`](adapters::apply_lens_adapters)). Stacked + mixed; the fused QKV merges
 //!   whole (no q/k/v split); a base-`Lens` LoRA applies to `Lens-Turbo` (identical arch). Validated
 //!   vs torch-PEFT (LoRA + LoKr cosine 0.99998, scale-0 bit-exact no-op).
+//! - **sc-3176** — the optional local **PromptReasoner** ([`reasoner`]): turns the encoder-only
+//!   gpt-oss into a *generating* model (full 24-layer stack + final norm + `lm_head`, an incremental
+//!   KV-cache decode [`text_encoder::gpt_oss::GptOssDecoderLayer::forward_cached`], greedy sampling,
+//!   the harmony `reasoning_effort="low"` template, and the `final`-channel output parse) to rewrite
+//!   the prompt before encoding. **Off by default** ([`pipeline::GenerateOptions::enable_reasoner`] +
+//!   [`pipeline::LensPipeline::attach_reasoner`]); the API-based path needs no MLX. Validated vs torch
+//!   `generate` (template byte-exact, greedy prefix match, cache-equivalence bit-exact).
 //!
 //! The Lens-Turbo engine is complete; only the SceneWorks worker cutover (separate repo) remains.
 
@@ -74,6 +81,7 @@ pub mod adapters;
 pub mod config;
 pub mod dit;
 pub mod pipeline;
+pub mod reasoner;
 pub mod registry;
 pub mod resolution;
 pub mod schedule;

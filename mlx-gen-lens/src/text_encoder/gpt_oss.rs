@@ -23,7 +23,8 @@
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{
     add, broadcast_to, concatenate_axis, cos as cos_op, divide, matmul, max_axes, maximum, minimum,
-    multiply, quantize, quantized_matmul, sigmoid, sin as sin_op, split, subtract, sum_axes,
+    multiply, quantize, quantized_matmul, sigmoid, sin as sin_op, split, split_sections, subtract,
+    sum_axes,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -161,14 +162,169 @@ impl GptOssAttention {
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, l, h * d])?;
         self.o_proj.forward(&out)
     }
+
+    /// Incremental (cached) attention for autoregressive generation (sc-3176). Processes the `T` new
+    /// tokens in `x` `[B, T, hidden]` at **absolute** positions `position..position+T`, appends their
+    /// (post-RoPE) K / (pre-repeat) V to `cache`, attends the new queries over the whole cache, then —
+    /// for a sliding-window layer — evicts the cache to the last `window` keys for the next step.
+    /// `mask` is the additive `[1, 1, T, cache_len]` causal(+sliding) mask for the prefill (`T > 1`);
+    /// for a single decode token (`T == 1`) every cached key is valid, so `mask` is `None`.
+    ///
+    /// `position` is the **true** sequence offset of the first new token, passed explicitly because a
+    /// sliding layer's `cache.len()` is capped at `window` and so does *not* track the absolute
+    /// position — the RoPE rotation must use the real position (a bug if derived from `cache.len()`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cached(
+        &self,
+        x: &Array,
+        inv_freq: &Array,
+        attn_scaling: f32,
+        position: i32,
+        cache: &mut KvCache,
+        sliding_window: Option<i32>,
+        mask: Option<&Array>,
+    ) -> Result<Array> {
+        let sh = x.shape();
+        let (b, t) = (sh[0], sh[1]);
+        let (h, kv, d) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let past = position;
+
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape(&[b, t, h, d])?
+            .transpose_axes(&[0, 2, 1, 3])?; // [B,H,T,d]
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape(&[b, t, kv, d])?
+            .transpose_axes(&[0, 2, 1, 3])?; // [B,kv,T,d]
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape(&[b, t, kv, d])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // RoPE the new q/k at their absolute positions; cache the post-RoPE K so relative rotations
+        // stay correct under sliding-window eviction.
+        let (cos, sin) = yarn_cos_sin_at(past, t, inv_freq, attn_scaling, x.dtype())?;
+        let q = apply_half_rope(&q, &cos, &sin)?;
+        let k = apply_half_rope(&k, &cos, &sin)?;
+
+        cache.append(&k, &v)?;
+        // Sliding window: a **decode** query (`T == 1`) attends to exactly the last `window` keys
+        // (positions `p-window+1..=p`), so evict the stale key BEFORE attending — appending the new
+        // key made the cache `window+1`. (A `T > 1` prefill instead carries the sliding **mask** over
+        // the full prompt, so it evicts *after* attending, leaving the window primed for the next
+        // step.) This keeps the cached decode bit-identical to a masked full recompute.
+        let prefill = t > 1;
+        if !prefill {
+            if let Some(w) = sliding_window {
+                cache.truncate_last(w)?;
+            }
+        }
+        let k_all = repeat_kv(cache.k.as_ref().unwrap(), h)?; // [B,H,cache_len,d]
+        let v_all = repeat_kv(cache.v.as_ref().unwrap(), h)?;
+
+        let mut scores = multiply(
+            &matmul(&q, &k_all.transpose_axes(&[0, 1, 3, 2])?)?,
+            scalar(self.scale),
+        )?; // [B,H,T,cache_len]
+        if let Some(m) = mask {
+            scores = add(&scores, m)?;
+        }
+        let sink = broadcast_to(&self.sinks.reshape(&[1, h, 1, 1])?, &[b, h, t, 1])?;
+        let row_max = max_axes(&scores, &[-1], true)?;
+        let m = maximum(&row_max, &sink)?;
+        let exp_scores = subtract(&scores, &m)?.exp()?;
+        let exp_sink = subtract(&sink, &m)?.exp()?;
+        let denom = add(&sum_axes(&exp_scores, &[-1], true)?, &exp_sink)?;
+        let probs = divide(&exp_scores, &denom)?;
+
+        let out = matmul(&probs, &v_all)?; // [B,H,T,d]
+        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, t, h * d])?;
+
+        // Prefill: prime the sliding cache to the last `window` keys for the next (decode) step.
+        if prefill {
+            if let Some(w) = sliding_window {
+                cache.truncate_last(w)?;
+            }
+        }
+        self.o_proj.forward(&out)
+    }
+}
+
+/// A per-layer key/value cache for incremental decode (sc-3176). Stores the **post-RoPE K** and **V**
+/// at `[B, kv_heads, seq, head_dim]` (pre-`repeat_kv`); a sliding-window layer truncates to the last
+/// `window` after each step.
+#[derive(Default)]
+pub struct KvCache {
+    k: Option<Array>,
+    v: Option<Array>,
+}
+
+impl KvCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of cached key positions so far.
+    pub fn len(&self) -> i32 {
+        self.k.as_ref().map(|k| k.shape()[2]).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Append the new `[B, kv, T, d]` K / V and return the full cached `(K, V)`.
+    fn append(&mut self, k: &Array, v: &Array) -> Result<(Array, Array)> {
+        let k_all = match &self.k {
+            Some(prev) => concatenate_axis(&[prev, k], 2)?,
+            None => k.clone(),
+        };
+        let v_all = match &self.v {
+            Some(prev) => concatenate_axis(&[prev, v], 2)?,
+            None => v.clone(),
+        };
+        self.k = Some(k_all.clone());
+        self.v = Some(v_all.clone());
+        Ok((k_all, v_all))
+    }
+
+    /// Keep only the last `max` key positions (sliding-window eviction).
+    fn truncate_last(&mut self, max: i32) -> Result<()> {
+        let len = self.len();
+        if len <= max {
+            return Ok(());
+        }
+        // `[:, :, len-max:, :]` — split at `len-max` along the sequence axis, keep the tail.
+        let tail =
+            |a: &Array| -> Result<Array> { Ok(split_sections(a, &[len - max], 2)?[1].clone()) };
+        self.k = self.k.as_ref().map(tail).transpose()?;
+        self.v = self.v.as_ref().map(tail).transpose()?;
+        Ok(())
+    }
 }
 
 /// Build the YaRN RoPE `cos`/`sin` for positions `0..l`, each `[1, 1, l, head_dim/2]`, with the
 /// `attention_scaling` (mscale) folded in (`cos = cos(p·inv_freq)·scaling`), matching
 /// `GptOssRotaryEmbedding.forward`. Cast to `dtype` so they multiply cleanly against q/k.
 fn yarn_cos_sin(l: i32, inv_freq: &Array, scaling: f32, dtype: Dtype) -> Result<(Array, Array)> {
+    yarn_cos_sin_at(0, l, inv_freq, scaling, dtype)
+}
+
+/// As [`yarn_cos_sin`] but for the absolute positions `start..start+l` — used by the incremental
+/// decode path (sc-3176), where the `l` new tokens sit at positions offset by the cache length.
+fn yarn_cos_sin_at(
+    start: i32,
+    l: i32,
+    inv_freq: &Array,
+    scaling: f32,
+    dtype: Dtype,
+) -> Result<(Array, Array)> {
     let half = inv_freq.shape()[0];
-    let pos: Vec<f32> = (0..l).map(|i| i as f32).collect();
+    let pos: Vec<f32> = (start..start + l).map(|i| i as f32).collect();
     let pos = Array::from_slice(&pos, &[l, 1]);
     let freqs = multiply(&pos, &inv_freq.reshape(&[1, half])?)?; // [l, half]
     let s = scalar(scaling);
@@ -539,6 +695,36 @@ impl GptOssDecoderLayer {
         let h = add(
             x,
             &self.attn.forward(&normed, inv_freq, attn_scaling, mask)?,
+        )?;
+        let normed = rms_norm(&h, &self.post_attn_ln, self.eps)?;
+        Ok(add(&h, &self.moe.forward(&normed)?)?)
+    }
+
+    /// Incremental (cached) decoder layer for generation (sc-3176): the same pre-norm sandwich, with
+    /// the attention sub-block running [`GptOssAttention::forward_cached`] over `cache`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cached(
+        &self,
+        x: &Array,
+        inv_freq: &Array,
+        attn_scaling: f32,
+        position: i32,
+        cache: &mut KvCache,
+        sliding_window: Option<i32>,
+        mask: Option<&Array>,
+    ) -> Result<Array> {
+        let normed = rms_norm(x, &self.input_ln, self.eps)?;
+        let h = add(
+            x,
+            &self.attn.forward_cached(
+                &normed,
+                inv_freq,
+                attn_scaling,
+                position,
+                cache,
+                sliding_window,
+                mask,
+            )?,
         )?;
         let normed = rms_norm(&h, &self.post_attn_ln, self.eps)?;
         Ok(add(&h, &self.moe.forward(&normed)?)?)

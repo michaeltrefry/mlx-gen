@@ -193,6 +193,9 @@ impl LensGenerator {
                 guidance_scale: guidance,
                 seed,
                 date: DEFAULT_DATE,
+                // The local reasoner (sc-3176) is a standalone opt-in; the registry path leaves it off
+                // (matching the vendor default), so no reasoner is attached here.
+                enable_reasoner: false,
             };
             // Re-encode per image is cheap relative to denoise and keeps the RNG order matching the
             // struct API (one noise draw per image, no shared state). Progress is streamed via the
