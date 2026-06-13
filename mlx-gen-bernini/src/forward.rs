@@ -360,7 +360,7 @@ mod tests {
     }
 
     fn max_abs(a: &Array, b: &Array) -> f32 {
-        mlx_rs::ops::max(&subtract(a, b).unwrap().abs().unwrap(), None)
+        mlx_rs::ops::max(subtract(a, b).unwrap().abs().unwrap(), None)
             .unwrap()
             .item::<f32>()
     }
@@ -418,7 +418,7 @@ mod tests {
         let e_c = pf.velocity(&dit, noisy, &[], t, &kv_c).unwrap();
         let want = add(
             &e_u,
-            &multiply(&subtract(&e_c, &e_u).unwrap(), Array::from_f32(omega)).unwrap(),
+            multiply(subtract(&e_c, &e_u).unwrap(), Array::from_f32(omega)).unwrap(),
         )
         .unwrap();
         assert_eq!(got.shape(), noisy.shape());

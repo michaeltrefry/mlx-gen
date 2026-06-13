@@ -105,8 +105,8 @@ mod tests {
         let (cos, sin) = table.precompute_cos_sin((1, 4, 4)).unwrap(); // seq 16
         let (cos3, sin3) = apply_source_id(&cos, &sin, 3.0, 128).unwrap();
         let unit = add(
-            &multiply(&cos3, &cos3).unwrap(),
-            &multiply(&sin3, &sin3).unwrap(),
+            multiply(&cos3, &cos3).unwrap(),
+            multiply(&sin3, &sin3).unwrap(),
         )
         .unwrap();
         let ones = Array::ones::<f32>(unit.shape()).unwrap();
@@ -114,8 +114,8 @@ mod tests {
 
         let x = Array::ones::<f32>(&[1, 16, 2, 128]).unwrap();
         let y = rope_apply(&x, &cos3, &sin3).unwrap();
-        let xn: f32 = sum(&multiply(&x, &x).unwrap(), None).unwrap().item();
-        let yn: f32 = sum(&multiply(&y, &y).unwrap(), None).unwrap().item();
+        let xn: f32 = sum(multiply(&x, &x).unwrap(), None).unwrap().item();
+        let yn: f32 = sum(multiply(&y, &y).unwrap(), None).unwrap().item();
         assert!(
             (xn - yn).abs() / xn < 1e-4,
             "rope changed norm: {xn} vs {yn}"

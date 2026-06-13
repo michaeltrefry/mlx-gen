@@ -142,7 +142,7 @@ mod tests {
     use super::*;
 
     fn max_abs(a: &Array, b: &Array) -> f32 {
-        mlx_rs::ops::max(&subtract(a, b).unwrap().abs().unwrap(), None)
+        mlx_rs::ops::max(subtract(a, b).unwrap().abs().unwrap(), None)
             .unwrap()
             .item::<f32>()
     }
@@ -165,7 +165,7 @@ mod tests {
         // plain CFG: uncond + scale·(cond − uncond)
         let want = add(
             &uncond,
-            &multiply(&subtract(&cond, &uncond).unwrap(), Array::from_f32(scale)).unwrap(),
+            multiply(subtract(&cond, &uncond).unwrap(), Array::from_f32(scale)).unwrap(),
         )
         .unwrap();
         assert!(
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn apg_norm_threshold_clamps_diff() {
         // A large diff with a small threshold is scaled so ‖diff‖ ≤ threshold per frame.
-        let cond = multiply(&randish(5), Array::from_f32(100.0)).unwrap();
+        let cond = multiply(randish(5), Array::from_f32(100.0)).unwrap();
         let uncond = Array::zeros::<f32>(&[4, 2, 2, 2]).unwrap();
         // Inspect the clamp directly via the single-term path with eta=1 (nd == clamped diff).
         let nd = normalize_diff(&subtract(&cond, &uncond).unwrap(), &cond, None, 1.0, 2.0).unwrap();
@@ -209,7 +209,7 @@ mod tests {
         let d2 = randish(7);
         let r2 = buf.update(&d2).unwrap();
         // running = d2 + (-0.5)·d1
-        let want = add(&d2, &multiply(&d1, Array::from_f32(-0.5)).unwrap()).unwrap();
+        let want = add(&d2, multiply(&d1, Array::from_f32(-0.5)).unwrap()).unwrap();
         assert!(max_abs(&r2, &want) < 1e-5, "second update accumulates");
     }
 }
