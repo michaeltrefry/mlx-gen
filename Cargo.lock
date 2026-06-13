@@ -714,6 +714,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-seedvr2"
+version = "0.0.0"
+dependencies = [
+ "inventory",
+ "mlx-gen",
+ "pmetal-mlx-rs",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-gen-sensenova"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,18 @@
+[package]
+name = "mlx-gen-seedvr2"
+version = "0.0.0"
+edition = "2021"
+description = "SeedVR2 provider crate for mlx-gen — native MLX one-step diffusion-transformer + 3D causal video VAE super-resolution upscaler (image + video)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "seedvr2", "upscale", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time generator registration (`inventory::submit!` collected by mlx_gen's `inventory::collect!`).
+inventory = { workspace = true }
+# config parsing (matches the sdxl/wan/ltx/flux2/lens provider convention).
+serde_json = "1"
