@@ -11,13 +11,16 @@
 //! Masks flow as raw 288² logits (the processor sigmoids for display).
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use mlx_rs::ops::sigmoid;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::Result;
 
+use crate::config::Sam3VisionConfig;
 use crate::tracker::TrackerFrameOutput;
+use crate::vision::Backbone;
 use crate::{Sam3ImageSegmenter, Sam3Tracker};
 
 // --- config (Sam3VideoConfig defaults) -----------------------------------------------------------
@@ -98,9 +101,18 @@ pub struct Sam3VideoModel {
 
 impl Sam3VideoModel {
     pub fn from_weights(w: &mlx_gen::weights::Weights) -> Result<Self> {
+        // One PE backbone, shared between the detector segmenter and the tracker. Both load it from
+        // the same `detector_model.vision_encoder.backbone` keys, so loading it twice would carry two
+        // identical ~445M-param copies resident at video time (F-028).
+        let cfg = Sam3VisionConfig::sam3();
+        let backbone = Rc::new(Backbone::from_weights(
+            w,
+            "detector_model.vision_encoder.backbone",
+            &cfg,
+        )?);
         Ok(Self {
-            segmenter: Sam3ImageSegmenter::from_weights(w)?,
-            tracker: Sam3Tracker::from_weights(w)?,
+            segmenter: Sam3ImageSegmenter::from_weights_with_backbone(w, backbone.clone())?,
+            tracker: Sam3Tracker::from_weights_with_backbone(w, backbone)?,
             obj_ids: Vec::new(),
             banks: Vec::new(),
             obj_prompt: Vec::new(),
@@ -115,12 +127,21 @@ impl Sam3VideoModel {
         })
     }
 
-    /// Affine-quantize the whole video model to `bits` (Q8/Q4): both the detector segmenter and the
-    /// tracker (each carries its own copy of the PE backbone + heads). Convs/norms/embeddings stay
-    /// dense (sc-4925).
+    /// Affine-quantize the whole video model to `bits` (Q8/Q4): the single shared PE backbone plus
+    /// the detector segmenter's and the tracker's own heads. Convs/norms/embeddings stay dense
+    /// (sc-4925).
+    ///
+    /// The backbone is shared (one `Rc`) between the segmenter and the tracker (F-028), so it is
+    /// quantized **once** and the same quantized `Rc` reinstalled into both — otherwise each side
+    /// would quantize into a separate copy and re-duplicate the weights we just deduplicated.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.segmenter.quantize(bits)?;
-        self.tracker.quantize(bits)?;
+        let mut backbone = (*self.tracker.backbone_rc()).clone();
+        backbone.quantize(bits)?;
+        let backbone = Rc::new(backbone);
+        self.segmenter.set_vision_backbone(backbone.clone());
+        self.tracker.set_backbone(backbone);
+        self.segmenter.quantize_except_backbone(bits)?;
+        self.tracker.quantize_except_backbone(bits)?;
         Ok(())
     }
 
@@ -788,5 +809,42 @@ fn seq_first(a: &Array, bf16: bool) -> Result<Array> {
         Ok(flat.as_dtype(Dtype::Bfloat16)?.as_dtype(Dtype::Float32)?)
     } else {
         Ok(flat)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::weights::Weights;
+
+    /// F-028: the detector segmenter and the tracker must share **one** PE backbone instance — both
+    /// at load and after quantization — rather than each holding its own ~445M-param copy. Checks
+    /// `Rc` pointer-identity of the two backbones (the cheapest, most direct proof that the weights
+    /// are not duplicated). Weights-gated (no torch fixture needed — only the real `facebook/sam3`
+    /// weights).
+    #[test]
+    #[ignore = "needs SAM3_WEIGHTS=<facebook/sam3 model.safetensors>"]
+    fn backbone_is_shared_not_duplicated() {
+        let weights_path = std::env::var("SAM3_WEIGHTS")
+            .expect("set SAM3_WEIGHTS to facebook/sam3 model.safetensors");
+        let w = Weights::from_file(&weights_path).expect("load sam3 weights");
+
+        let mut model = Sam3VideoModel::from_weights(&w).expect("build video model");
+        assert!(
+            Rc::ptr_eq(
+                &model.segmenter.vision_backbone_rc(),
+                &model.tracker.backbone_rc(),
+            ),
+            "at load: segmenter and tracker must point at one shared PE backbone",
+        );
+
+        model.quantize(8).expect("quantize q8");
+        assert!(
+            Rc::ptr_eq(
+                &model.segmenter.vision_backbone_rc(),
+                &model.tracker.backbone_rc(),
+            ),
+            "after quantize: the shared backbone must stay a single quantized copy",
+        );
     }
 }

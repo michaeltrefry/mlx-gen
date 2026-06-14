@@ -15,6 +15,8 @@
 //! Scope (Phase A): the FPN **feature maps**. The neck's sine position encodings (consumed by the
 //! DETR encoder) land with Phase C (sc-4921).
 
+use std::rc::Rc;
+
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::module::Module;
 use mlx_rs::nn::MaxPool2d;
@@ -77,6 +79,7 @@ fn window_unpartition(
 /// Precomputed 2D-axial RoPE `(cos, sin)`, each `[end·end, head_dim]`, for a fixed feature grid.
 /// `freqs[j] = θ^(-(4j)/head_dim)` over `j∈[0, head_dim/4)`; per position `i` the row is
 /// `[x·freqs, y·freqs]` (x = i%end, y = i/end, both ·`scale`) then `repeat_interleave(2)`.
+#[derive(Clone)]
 struct RopeTable {
     cos: Array,
     sin: Array,
@@ -139,6 +142,7 @@ fn apply_rope(q: &Array, table: &RopeTable) -> Result<Array> {
 }
 
 /// Two-layer GELU MLP (`mlp.fc1` → exact-gelu → `mlp.fc2`).
+#[derive(Clone)]
 struct Mlp {
     fc1: AdaptableLinear,
     fc2: AdaptableLinear,
@@ -166,6 +170,7 @@ impl Mlp {
 
 /// RoPE self-attention (separate q/k/v/o projections). Operates on NHWC `[b, H, W, C]`
 /// (`b = batch·num_windows` for windowed layers).
+#[derive(Clone)]
 struct Attention {
     q: AdaptableLinear,
     k: AdaptableLinear,
@@ -220,6 +225,7 @@ impl Attention {
 }
 
 /// One pre-norm ViT layer: (windowed) RoPE attention + GELU MLP.
+#[derive(Clone)]
 struct ViTLayer {
     norm1_w: Array,
     norm1_b: Array,
@@ -289,6 +295,11 @@ impl ViTLayer {
 }
 
 /// PE ViT backbone: patch-embed → tiled position embedding → front LayerNorm → layers.
+///
+/// Cheap to `Clone` — every field is an `Array`/`AdaptableLinear` reference-counted handle (cloning
+/// duplicates the handle, not the GPU buffer). The video model relies on this to quantize one shared
+/// backbone and reinstall the same `Rc` into both consumers without copying weights (F-028).
+#[derive(Clone)]
 pub(crate) struct Backbone {
     patch_w: Array, // OHWI, no bias
     pos_embed: Array,
@@ -373,6 +384,23 @@ impl Backbone {
     }
 }
 
+/// Quantize a (possibly shared) PE [`Backbone`] in place. If this is the sole owner of the `Rc`
+/// (the standalone segmenter / tracker), quantize the backbone directly; otherwise clone its cheap
+/// `Array` handles, quantize the clone, and swap in a fresh `Rc` (the caller is responsible for
+/// re-sharing if both consumers must point at the same quantized copy — see
+/// [`crate::video::Sam3VideoModel::quantize`]).
+pub(crate) fn quantize_backbone_rc(backbone: &mut Rc<Backbone>, bits: i32) -> Result<()> {
+    match Rc::get_mut(backbone) {
+        Some(bb) => bb.quantize(bits),
+        None => {
+            let mut bb = (**backbone).clone();
+            bb.quantize(bits)?;
+            *backbone = Rc::new(bb);
+            Ok(())
+        }
+    }
+}
+
 /// One FPN branch (`Sam3FPNLayer`): scale the backbone map, then `proj1` (1×1) → `proj2` (3×3).
 pub(crate) struct FpnLayer {
     /// Transposed-conv up-scale stages (OHWI weight + bias), applied in order with exact-gelu
@@ -441,7 +469,7 @@ impl FpnLayer {
 /// SAM3 vision encoder: PE backbone + FPN neck. Produces the multi-scale FPN feature maps the
 /// detector + tracker share.
 pub struct Sam3VisionEncoder {
-    backbone: Backbone,
+    backbone: Rc<Backbone>,
     fpn_layers: Vec<FpnLayer>,
 }
 
@@ -449,7 +477,19 @@ impl Sam3VisionEncoder {
     /// Load from a `facebook/sam3` weight map. `prefix` is typically
     /// `"detector_model.vision_encoder"`.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &Sam3VisionConfig) -> Result<Self> {
-        let backbone = Backbone::from_weights(w, &join(prefix, "backbone"), cfg)?;
+        let backbone = Rc::new(Backbone::from_weights(w, &join(prefix, "backbone"), cfg)?);
+        Self::from_weights_with_backbone(w, prefix, cfg, backbone)
+    }
+
+    /// Load the FPN neck only, reusing an already-loaded (and possibly shared) PE [`Backbone`]. The
+    /// video model uses this so the segmenter and the tracker share **one** backbone instead of each
+    /// loading its own copy (F-028).
+    pub(crate) fn from_weights_with_backbone(
+        w: &Weights,
+        prefix: &str,
+        cfg: &Sam3VisionConfig,
+        backbone: Rc<Backbone>,
+    ) -> Result<Self> {
         let fpn_layers = cfg
             .scale_factors
             .iter()
@@ -464,10 +504,23 @@ impl Sam3VisionEncoder {
         })
     }
 
+    /// The shared PE [`Backbone`] handle (clone of the `Rc`). Used by the F-028 sharing test to
+    /// assert pointer-identity with the tracker's backbone.
+    #[cfg(test)]
+    pub(crate) fn backbone_rc(&self) -> Rc<Backbone> {
+        self.backbone.clone()
+    }
+
+    /// Replace the PE backbone with a (typically pre-quantized, shared) one. Used by the video model
+    /// after quantizing the single shared backbone.
+    pub(crate) fn set_backbone(&mut self, backbone: Rc<Backbone>) {
+        self.backbone = backbone;
+    }
+
     /// Quantize the ViT backbone's attention + MLP projections (Q8/Q4). The patch-embed conv, the
     /// position embedding, and the conv-only FPN neck stay dense (sc-4925).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.backbone.quantize(bits)
+        quantize_backbone_rc(&mut self.backbone, bits)
     }
 
     /// `pixel_values`: NCHW `[1, 3, 1008, 1008]`. Returns the FPN feature maps as **NHWC**

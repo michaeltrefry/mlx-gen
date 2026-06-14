@@ -6,6 +6,8 @@
 //! path ([`Sam3ImageSegmenter::forward_with_boxes`], sc-4923) — the latter prepends geometry prompt
 //! tokens to the text features as the reference's `combined_prompt_features`.
 
+use std::rc::Rc;
+
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
@@ -15,6 +17,7 @@ use mlx_gen::Result;
 use crate::config::{Sam3DetrConfig, Sam3GeometryConfig, Sam3TextConfig, Sam3VisionConfig};
 use crate::detr::sine_position_embedding_flat;
 use crate::mask::{post_process_instances, Instance, Sam3MaskHead};
+use crate::vision::Backbone;
 use crate::{Sam3Detector, Sam3GeometryEncoder, Sam3TextEncoder, Sam3VisionEncoder};
 
 /// Full raw outputs of the image segmenter (pre-post-process).
@@ -43,13 +46,30 @@ pub struct Sam3ImageSegmenter {
 impl Sam3ImageSegmenter {
     /// Load every stage from a `facebook/sam3` weight map.
     pub fn from_weights(w: &Weights) -> Result<Self> {
+        let vision = Sam3VisionEncoder::from_weights(
+            w,
+            "detector_model.vision_encoder",
+            &Sam3VisionConfig::sam3(),
+        )?;
+        Self::from_weights_with_vision(w, vision)
+    }
+
+    /// Load the segmenter reusing an already-loaded (and possibly shared) PE [`Backbone`]. Lets the
+    /// video model share one backbone between this detector segmenter and the tracker (F-028).
+    pub(crate) fn from_weights_with_backbone(w: &Weights, backbone: Rc<Backbone>) -> Result<Self> {
+        let vision = Sam3VisionEncoder::from_weights_with_backbone(
+            w,
+            "detector_model.vision_encoder",
+            &Sam3VisionConfig::sam3(),
+            backbone,
+        )?;
+        Self::from_weights_with_vision(w, vision)
+    }
+
+    fn from_weights_with_vision(w: &Weights, vision: Sam3VisionEncoder) -> Result<Self> {
         let detr_cfg = Sam3DetrConfig::sam3();
         Ok(Self {
-            vision: Sam3VisionEncoder::from_weights(
-                w,
-                "detector_model.vision_encoder",
-                &Sam3VisionConfig::sam3(),
-            )?,
+            vision,
             text: Sam3TextEncoder::from_weights(
                 w,
                 "detector_model.text_encoder.text_model",
@@ -72,11 +92,31 @@ impl Sam3ImageSegmenter {
     /// embeddings, and the small/odd projections stay dense (see [`crate::quantize_linear`]).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.vision.quantize(bits)?;
+        self.quantize_except_backbone(bits)
+    }
+
+    /// Quantize everything **except** the PE backbone (the text tower + projection, geometry encoder,
+    /// DETR detector, and mask head). The video model calls this after quantizing the single shared
+    /// backbone once, so the backbone isn't quantized twice (F-028). (The FPN neck is conv-only and
+    /// stays dense, so the vision encoder has nothing else to quantize here.)
+    pub(crate) fn quantize_except_backbone(&mut self, bits: i32) -> Result<()> {
         self.text.quantize(bits)?;
         self.geometry.quantize(bits)?;
         self.detector.quantize(bits)?;
         self.mask_head.quantize(bits)?;
         Ok(())
+    }
+
+    /// The shared PE [`Backbone`] handle (clone of the `Rc`). Used by the F-028 sharing test to
+    /// assert pointer-identity with the tracker's backbone.
+    #[cfg(test)]
+    pub(crate) fn vision_backbone_rc(&self) -> Rc<Backbone> {
+        self.vision.backbone_rc()
+    }
+
+    /// Replace the vision encoder's PE backbone with a (typically pre-quantized, shared) one.
+    pub(crate) fn set_vision_backbone(&mut self, backbone: Rc<Backbone>) {
+        self.vision.set_backbone(backbone);
     }
 
     /// `pixel_values`: NCHW `[1, 3, 1008, 1008]`; `input_ids`: `[1, 32]`; `text_mask`: per-token

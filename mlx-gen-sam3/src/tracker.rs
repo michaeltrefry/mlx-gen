@@ -28,9 +28,11 @@ use mlx_gen::nn::{conv2d, gelu_exact, linear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
+use std::rc::Rc;
+
 use crate::config::Sam3VisionConfig;
 use crate::util::{conv_transpose_w, conv_w_ohwi, join};
-use crate::vision::{Backbone, FpnLayer};
+use crate::vision::{quantize_backbone_rc, Backbone, FpnLayer};
 
 /// Take a single index `i` along `axis`, dropping that axis.
 fn take1(x: &Array, i: i32, axis: i32) -> Result<Array> {
@@ -1164,7 +1166,7 @@ impl MemoryAttention {
 /// SAM3 single-frame box-prompt tracker (PVS path). Reuses the shared PE [`Backbone`]; loads the
 /// tracker neck + prompt encoder + mask decoder from `tracker_neck.*` / `tracker_model.*`.
 pub struct Sam3Tracker {
-    backbone: Backbone,
+    backbone: Rc<Backbone>,
     neck: TrackerNeck,
     prompt: PromptEncoder,
     decoder: MaskDecoder,
@@ -1239,11 +1241,27 @@ pub struct TrackerMask {
 }
 
 impl Sam3Tracker {
-    /// Load from a `facebook/sam3` weight map (shared PE backbone + `tracker_neck` + `tracker_model`).
+    /// Load from a `facebook/sam3` weight map (PE backbone + `tracker_neck` + `tracker_model`). The
+    /// backbone is loaded from `detector_model.vision_encoder.backbone` — the **same** keys the
+    /// detector's vision encoder uses. In the video pipeline use
+    /// [`Self::from_weights_with_backbone`] to share one backbone with the detector instead of
+    /// loading a second copy (F-028).
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let cfg = Sam3VisionConfig::sam3();
+        let backbone = Rc::new(Backbone::from_weights(
+            w,
+            "detector_model.vision_encoder.backbone",
+            &cfg,
+        )?);
+        Self::from_weights_with_backbone(w, backbone)
+    }
+
+    /// Load the tracker reusing an already-loaded (and possibly shared) PE [`Backbone`]. Lets the
+    /// video model share one backbone between the detector segmenter and the tracker (F-028).
+    pub(crate) fn from_weights_with_backbone(w: &Weights, backbone: Rc<Backbone>) -> Result<Self> {
+        let cfg = Sam3VisionConfig::sam3();
         Ok(Self {
-            backbone: Backbone::from_weights(w, "detector_model.vision_encoder.backbone", &cfg)?,
+            backbone,
             neck: TrackerNeck::from_weights(w, "tracker_neck", "tracker_model.mask_decoder", &cfg)?,
             prompt: PromptEncoder::from_weights(w, "tracker_model.prompt_encoder")?,
             decoder: MaskDecoder::from_weights(w, "tracker_model.mask_decoder")?,
@@ -1289,12 +1307,30 @@ impl Sam3Tracker {
     /// encoder, ConvNeXt pointwise convs, upscale/mask-downsample), GroupNorms, the prompt encoder's
     /// embeddings, and the random-Gaussian position tables stay dense (sc-4925).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.backbone.quantize(bits)?;
+        quantize_backbone_rc(&mut self.backbone, bits)?;
+        self.quantize_except_backbone(bits)
+    }
+
+    /// Quantize everything **except** the shared PE backbone (the mask decoder, memory attention,
+    /// object-pointer projection, and temporal-pos projection). The video model calls this after
+    /// quantizing the single shared backbone once, so the backbone isn't quantized twice (F-028).
+    pub(crate) fn quantize_except_backbone(&mut self, bits: i32) -> Result<()> {
         self.decoder.quantize(bits)?;
         self.memory_attention.quantize(bits)?;
         self.object_pointer_proj.quantize(bits)?;
         crate::quantize_linear(&mut self.tpos_proj, bits)?;
         Ok(())
+    }
+
+    /// The shared PE [`Backbone`] handle (clone of the `Rc`), for the video model to quantize once
+    /// and reinstall into both consumers (F-028).
+    pub(crate) fn backbone_rc(&self) -> Rc<Backbone> {
+        self.backbone.clone()
+    }
+
+    /// Replace the PE backbone with a (typically pre-quantized, shared) one.
+    pub(crate) fn set_backbone(&mut self, backbone: Rc<Backbone>) {
+        self.backbone = backbone;
     }
 
     /// The axial 2-D RoPE `(cos, sin)` tables `[72², 256]` the memory attention uses (exposed for
